@@ -10,10 +10,10 @@ demo 的目的是**先把转发和多端口分流跑通**，所以它**故意不
 
 ```bash
 # 1. 启动几个测试后端（另开终端，或用 & 放后台）
-go run backend.go -port 9001 -name 服务A &
-go run backend.go -port 9002 -name 服务B &
-go run backend.go -port 9003 -name 服务C &
-go run backend.go -port 9004 -name 服务D &
+go run ./backend -port 9001 -name 服务A &
+go run ./backend -port 9002 -name 服务B &
+go run ./backend -port 9003 -name 服务C &
+go run ./backend -port 9004 -name 服务D &
 
 # 2. 启动反代
 go run . -c config.json -text-log
@@ -31,6 +31,9 @@ INFO 管理端口已启动 addr=127.0.0.1:9080
 ---
 
 ## 验证多端口分流
+
+> 没有 `jq` 的环境（比如 Windows）把 `| jq .` 去掉就行，直接看返回的 JSON。
+> 另外如果本机设了 HTTP 代理，curl 访问 127.0.0.1 需要加 `--noproxy '*'`，否则会被代理截走。
 
 ```bash
 # 同一个 IP，四个端口，四个不同后端
