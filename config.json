@@ -1,0 +1,51 @@
+{
+  "default_ports": [8000],
+  "admin_addr": "127.0.0.1:9080",
+  "access_log": true,
+  "trusted_proxies": [],
+
+  "routes": [
+    {
+      "id": "fallback",
+      "name": "兜底路由（挂在所有监听端口）",
+      "listen_port": 0,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9001"
+    },
+    {
+      "id": "svc-a",
+      "name": "服务A —— 8081 整端口独占",
+      "listen_port": 8081,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9001"
+    },
+    {
+      "id": "svc-b",
+      "name": "服务B —— 8082 且限流 10rps",
+      "listen_port": 8082,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9002",
+      "rate_limit": { "rps": 10, "burst": 20, "scope": "ip" }
+    },
+    {
+      "id": "svc-c",
+      "name": "服务C —— 8083 只接 /api，并剥离前缀",
+      "listen_port": 8083,
+      "host": "",
+      "path_prefix": "/api",
+      "target": "http://127.0.0.1:9003",
+      "strip_prefix": true
+    },
+    {
+      "id": "svc-d",
+      "name": "服务D —— 8083 的其余路径走这里",
+      "listen_port": 8083,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9004"
+    }
+  ]
+}

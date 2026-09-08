@@ -1,0 +1,84 @@
+{
+  "_说明": "生产配置示例。与 config.json 的区别：这里用 80 端口 + 域名分流，业务端口单独列出。",
+
+  "default_ports": [80],
+  "admin_addr": "127.0.0.1:9080",
+  "access_log": true,
+
+  "trusted_proxies": ["10.0.0.0/8"],
+
+  "routes": [
+    {
+      "id": "web",
+      "name": "官网（按域名）",
+      "listen_port": 0,
+      "host": "www.example.com",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9001",
+      "preserve_host": true
+    },
+    {
+      "id": "api",
+      "name": "API（按域名 + 路径）",
+      "listen_port": 0,
+      "host": "api.example.com",
+      "path_prefix": "/v1",
+      "target": "http://127.0.0.1:9002",
+      "rate_limit": { "rps": 200, "burst": 400, "scope": "ip" }
+    },
+    {
+      "id": "admin-internal",
+      "name": "后台（带独立超时）",
+      "listen_port": 0,
+      "host": "admin.example.com",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9003",
+      "timeout_ms": 120000
+    },
+
+    {
+      "id": "port-8081",
+      "name": "裸 IP:8081 直接访问",
+      "listen_port": 8081,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9011"
+    },
+    {
+      "id": "port-8082",
+      "name": "裸 IP:8082 直接访问",
+      "listen_port": 8082,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9012",
+      "rate_limit": { "rps": 50, "burst": 100 }
+    },
+    {
+      "id": "port-8083-a",
+      "name": "裸 IP:8083 的 /api 路径",
+      "listen_port": 8083,
+      "host": "",
+      "path_prefix": "/api",
+      "target": "http://127.0.0.1:9013",
+      "strip_prefix": true
+    },
+    {
+      "id": "port-8083-b",
+      "name": "裸 IP:8083 的其余路径",
+      "listen_port": 8083,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9014"
+    },
+
+    {
+      "id": "disabled-demo",
+      "name": "临时停用的路由（enabled=false 不监听其端口）",
+      "enabled": false,
+      "listen_port": 9999,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9099"
+    }
+  ]
+}

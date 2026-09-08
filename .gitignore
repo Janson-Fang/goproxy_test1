@@ -1,0 +1,6 @@
+bin/
+goproxy
+goproxy.exe
+*.exe
+*.log
+data/
