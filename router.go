@@ -1,6 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -25,6 +30,13 @@ type Route struct {
 	targetURL *url.URL
 	proxy     *httputil.ReverseProxy
 	limiter   *IPLimiter
+	cb        *CircuitBreaker
+	acl       *ACL
+	auth      Authenticator
+
+	// 配置指纹：热重载时只有当配置真的变了才重建有状态对象
+	cbFP   string
+	authFP string
 }
 
 // RouteTable 是不可变的路由快照，用 atomic.Pointer 整体替换实现热更新。
@@ -127,12 +139,10 @@ func normalizeHost(h string) string {
 // old 传入是为了复用限流器实例 —— 否则每次改配置都会把限流计数清零，
 // 客户端改一次配置就能绕过限流。
 func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable, error) {
-	oldLimiters := make(map[string]*IPLimiter)
+	oldByID := make(map[string]*Route)
 	if old != nil {
 		for _, r := range old.routes {
-			if r.limiter != nil {
-				oldLimiters[r.ID] = r.limiter
-			}
+			oldByID[r.ID] = r
 		}
 	}
 
@@ -166,16 +176,51 @@ func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable
 		}
 		r.proxy = newReverseProxy(r, tr)
 
+		prev, hadOld := oldByID[r.ID]
+
 		if rl := rc.RateLimit; rl != nil && rl.RPS > 0 {
 			burst := rl.Burst
 			if burst <= 0 {
 				burst = rl.RPS * 2
 			}
-			if l, ok := oldLimiters[r.ID]; ok && l.rate == rl.RPS && l.burst == burst {
-				r.limiter = l // 复用，保留已有计数
+			if hadOld && prev.limiter != nil && prev.limiter.rate == rl.RPS && prev.limiter.burst == burst {
+				r.limiter = prev.limiter // 复用，保留已有计数
 			} else {
 				r.limiter = NewIPLimiter(rl.RPS, burst, rl.Scope == "global")
 			}
+		}
+
+		// 熔断器同理：配置没变就复用，否则一次热重载就把统计窗口清空了
+		if rc.CircuitBreaker != nil {
+			fp := fingerprint(rc.CircuitBreaker)
+			if hadOld && prev.cb != nil && prev.cbFP == fp {
+				r.cb = prev.cb
+			} else {
+				r.cb = NewCircuitBreaker(*rc.CircuitBreaker)
+			}
+			r.cbFP = fp
+		}
+
+		if rc.ACL != nil && !isNoneMode(rc.ACL.Mode) {
+			acl, err := NewACL(rc.ACL.Mode, rc.ACL.CIDRs)
+			if err != nil {
+				return nil, fmt.Errorf("路由 %s: %w", r.ID, err)
+			}
+			r.acl = acl
+		}
+
+		if rc.Auth != nil && !isNoneMode(rc.Auth.Mode) {
+			fp := fingerprint(rc.Auth)
+			if hadOld && prev.auth != nil && prev.authFP == fp {
+				r.auth = prev.auth
+			} else {
+				auth, err := newAuthenticator(*rc.Auth)
+				if err != nil {
+					return nil, fmt.Errorf("路由 %s: %w", r.ID, err)
+				}
+				r.auth = auth
+			}
+			r.authFP = fp
 		}
 
 		routes = append(routes, r)
@@ -266,6 +311,36 @@ func sortRoutes(rs []*Route) {
 	sort.SliceStable(rs, func(i, j int) bool {
 		return len(rs[i].PathPrefix) > len(rs[j].PathPrefix)
 	})
+}
+
+// fingerprint 生成配置指纹，用来判断热重载时有状态对象是否可以复用。
+// 配置里含密码，所以用哈希而不是留原文。
+func fingerprint(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func isNoneMode(mode string) bool {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	return m == "" || m == "none"
+}
+
+func newAuthenticator(cfg RouteAuthConfig) (Authenticator, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+	case "basic":
+		return NewBasicAuthenticator(cfg.Basic, cfg.Realm)
+	case "jwt":
+		if cfg.JWT == nil {
+			return nil, errors.New("auth.mode=jwt 但缺少 jwt 配置段")
+		}
+		return NewJWTAuthenticator(*cfg.JWT)
+	default:
+		return nil, fmt.Errorf("未知的认证模式 %q", cfg.Mode)
+	}
 }
 
 // ListenPorts 返回当前需要监听的端口列表，供 ListenerManager 做 diff。

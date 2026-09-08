@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -127,6 +128,20 @@ func (a *App) handler() http.Handler {
 		}
 
 		ip := clientIP(r, a.trusted)
+
+		// 1) IP 黑白名单
+		if rt.acl != nil && !rt.acl.Allowed(ip) {
+			a.metrics.IncRejected(rt.ID, "acl")
+			a.metrics.IncRequest(rt.ID, http.StatusForbidden)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":  "forbidden",
+				"route":  rt.ID,
+				"reason": "ip_not_allowed",
+			})
+			return
+		}
+
+		// 2) 限流
 		if rt.limiter != nil && !rt.limiter.Allow(ip) {
 			a.metrics.IncRateLimited(rt.ID)
 			a.metrics.IncRequest(rt.ID, http.StatusTooManyRequests)
@@ -138,10 +153,49 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
+		// 3) 熔断：后端已经不行了就别再打了，直接快速失败
+		if rt.cb != nil && !rt.cb.Allow() {
+			a.metrics.IncRejected(rt.ID, "circuit_open")
+			a.metrics.IncRequest(rt.ID, http.StatusServiceUnavailable)
+			retryAfter := rt.cb.cfg.OpenSecs
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error":       "circuit_open",
+				"route":       rt.ID,
+				"retry_after": retryAfter,
+			})
+			return
+		}
+
+		// 4) 认证
+		if rt.auth != nil {
+			claims, ok, reason := rt.auth.Authenticate(r)
+			if !ok {
+				rt.auth.WriteChallenge(w)
+				a.metrics.IncRejected(rt.ID, "auth_"+reason)
+				a.metrics.IncRequest(rt.ID, http.StatusUnauthorized)
+				writeJSON(w, http.StatusUnauthorized, map[string]any{
+					"error":  "unauthorized",
+					"route":  rt.ID,
+					"reason": reason,
+				})
+				return
+			}
+			rt.auth.OnSuccess(r, claims)
+		}
+
+		// 5) 转发
 		a.metrics.IncInFlight(rt.ID)
 		rec := newStatusRecorder(w)
 		rt.proxy.ServeHTTP(rec, r)
 		a.metrics.DecInFlight(rt.ID)
+
+		if rt.cb != nil {
+			rt.cb.Record(isBackendFailure(rec.code))
+		}
 
 		dur := time.Since(start).Seconds()
 		a.metrics.Observe(rt.ID, dur)
@@ -186,13 +240,16 @@ func (a *App) adminHandler() http.Handler {
 	mux.HandleFunc("/_goproxy/routes", func(w http.ResponseWriter, r *http.Request) {
 		tbl := a.table.Load()
 		type item struct {
-			ID         string  `json:"id"`
-			Name       string  `json:"name"`
-			ListenPort int     `json:"listen_port"`
-			Host       string  `json:"host"`
-			PathPrefix string  `json:"path_prefix"`
-			Target     string  `json:"target"`
-			RateRPS    float64 `json:"rate_rps,omitempty"`
+			ID         string      `json:"id"`
+			Name       string      `json:"name"`
+			ListenPort int         `json:"listen_port"`
+			Host       string      `json:"host"`
+			PathPrefix string      `json:"path_prefix"`
+			Target     string      `json:"target"`
+			RateRPS    float64     `json:"rate_rps,omitempty"`
+			Auth       string      `json:"auth,omitempty"`
+			ACL        string      `json:"acl,omitempty"`
+			Circuit    *CBSnapshot `json:"circuit_breaker,omitempty"`
 		}
 		out := []item{}
 		if tbl != nil {
@@ -207,6 +264,16 @@ func (a *App) adminHandler() http.Handler {
 				}
 				if rt.limiter != nil {
 					it.RateRPS = rt.limiter.rate
+				}
+				if rt.auth != nil {
+					it.Auth = rt.auth.Kind()
+				}
+				if rt.acl != nil {
+					it.ACL = string(rt.acl.Mode)
+				}
+				if rt.cb != nil {
+					snap := rt.cb.Snapshot()
+					it.Circuit = &snap
 				}
 				out = append(out, it)
 			}
@@ -268,6 +335,33 @@ func (a *App) watchLoop(ctx context.Context) {
 	}
 }
 
+// statsLoop 定期把熔断器状态同步到指标。
+// 熔断状态是「当前值」而不是累加值，只能采样，不能靠请求触发。
+func (a *App) statsLoop(ctx context.Context) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			tbl := a.table.Load()
+			if tbl == nil {
+				continue
+			}
+			states := make(map[string]int, len(tbl.routes))
+			for _, r := range tbl.routes {
+				if r.cb == nil {
+					continue
+				}
+				states[r.ID] = int(r.cb.State())
+				a.metrics.SetCBStats(r.ID, r.cb.openedTotal.Load(), r.cb.rejectedTotal.Load())
+			}
+			a.metrics.SetCircuitStates(states)
+		}
+	}
+}
+
 func (a *App) Run(ctx context.Context) error {
 	if err := a.reload(); err != nil {
 		return err
@@ -297,6 +391,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	go a.watchLoop(ctx)
+	go a.statsLoop(ctx)
 
 	<-ctx.Done()
 	slog.Info("收到退出信号，开始优雅停机")

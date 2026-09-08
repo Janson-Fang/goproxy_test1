@@ -46,6 +46,62 @@
       "host": "",
       "path_prefix": "/",
       "target": "http://127.0.0.1:9004"
+    },
+
+    {
+      "id": "svc-basic",
+      "name": "服务E —— 8086 需要 Basic 认证（admin / s3cret）",
+      "listen_port": 8086,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9001",
+      "auth": {
+        "mode": "basic",
+        "realm": "goproxy",
+        "basic": [
+          { "username": "admin", "password_hash": "$2a$10$4AxjfRy1cVy.QgboZv1Bv.X8NiWrZOWlHLFB0Dttef13CkywJKCSq" }
+        ]
+      }
+    },
+    {
+      "id": "svc-jwt",
+      "name": "服务F —— 8087 需要 JWT，并把 sub 透传给后端",
+      "listen_port": 8087,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9002",
+      "auth": {
+        "mode": "jwt",
+        "jwt": {
+          "secret": "demo-secret-change-me",
+          "issuer": "goproxy-demo",
+          "forward_claims": { "sub": "X-User-Id" }
+        }
+      }
+    },
+    {
+      "id": "svc-acl",
+      "name": "服务G —— 8088 拒绝黑名单 IP（演示用，把 127.0.0.1 拉黑了）",
+      "listen_port": 8088,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9001",
+      "acl": { "mode": "deny", "cidrs": ["127.0.0.1"] }
+    },
+    {
+      "id": "svc-cb",
+      "name": "服务H —— 8089 后端不可达，用来看熔断",
+      "listen_port": 8089,
+      "host": "",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9099",
+      "circuit_breaker": {
+        "error_rate": 0.5,
+        "min_calls": 3,
+        "open_secs": 10,
+        "half_open_calls": 2,
+        "window_secs": 10
+      }
     }
   ]
 }

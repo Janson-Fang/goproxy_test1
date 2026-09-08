@@ -49,6 +49,27 @@ type RouteConfig struct {
 	TimeoutMs int `json:"timeout_ms"`
 
 	RateLimit *RateLimitConfig `json:"rate_limit"`
+
+	// CircuitBreaker 不配则不启用熔断
+	CircuitBreaker *CBConfig `json:"circuit_breaker"`
+	// Auth 不配或 mode=none 则不做认证
+	Auth *RouteAuthConfig `json:"auth"`
+	// ACL IP 白/黑名单，不配则不限制
+	ACL *ACLConfig `json:"acl"`
+}
+
+type RouteAuthConfig struct {
+	// Mode: none（默认）| basic | jwt
+	Mode  string           `json:"mode"`
+	Realm string           `json:"realm"`
+	Basic []BasicAuthEntry `json:"basic"`
+	JWT   *JWTConfig       `json:"jwt"`
+}
+
+type ACLConfig struct {
+	// Mode: none（默认）| allow（白名单）| deny（黑名单）
+	Mode  string   `json:"mode"`
+	CIDRs []string `json:"cidrs"`
 }
 
 type RateLimitConfig struct {
@@ -118,6 +139,39 @@ func (c *Config) validate() error {
 		}
 		if r.TimeoutMs < 0 {
 			return fmt.Errorf("routes[%d] (%s): timeout_ms 不能为负", i, r.ID)
+		}
+
+		if a := r.Auth; a != nil {
+			switch strings.ToLower(a.Mode) {
+			case "", "none":
+			case "basic":
+				if len(a.Basic) == 0 {
+					return fmt.Errorf("routes[%d] (%s): auth.mode=basic 但没有配置账号", i, r.ID)
+				}
+			case "jwt":
+				if a.JWT == nil {
+					return fmt.Errorf("routes[%d] (%s): auth.mode=jwt 但没有配置 jwt", i, r.ID)
+				}
+			default:
+				return fmt.Errorf("routes[%d] (%s): auth.mode 必须是 none|basic|jwt，当前 %q", i, r.ID, a.Mode)
+			}
+		}
+
+		if cb := r.CircuitBreaker; cb != nil {
+			if cb.ErrorRate < 0 || cb.ErrorRate > 1 {
+				return fmt.Errorf("routes[%d] (%s): circuit_breaker.error_rate 必须在 0~1", i, r.ID)
+			}
+			if cb.WindowSecs > 300 {
+				return fmt.Errorf("routes[%d] (%s): circuit_breaker.window_secs 不能超过 300", i, r.ID)
+			}
+		}
+
+		if acl := r.ACL; acl != nil {
+			switch strings.ToLower(acl.Mode) {
+			case "", "none", "allow", "deny":
+			default:
+				return fmt.Errorf("routes[%d] (%s): acl.mode 必须是 none|allow|deny，当前 %q", i, r.ID, acl.Mode)
+			}
 		}
 	}
 	return nil

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -22,6 +23,16 @@ func main() {
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+		// 回显所有 X- 开头的头，方便验证认证模块有没有正确注入身份信息
+		custom := map[string]string{}
+		for k := range r.Header {
+			upper := strings.ToUpper(k)
+			if strings.HasPrefix(upper, "X-") {
+				custom[upper] = r.Header.Get(k)
+			}
+		}
+
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"service":           *name,
 			"backend_port":      *port,
@@ -33,6 +44,7 @@ func main() {
 			"x_real_ip":         r.Header.Get("X-Real-IP"),
 			"x_forwarded_host":  r.Header.Get("X-Forwarded-Host"),
 			"x_forwarded_proto": r.Header.Get("X-Forwarded-Proto"),
+			"custom_headers":    custom,
 		})
 	})
 
