@@ -340,15 +340,31 @@ func TestBasicAuthCache(t *testing.T) {
 	}
 	req := httptest.NewRequest("GET", "/", nil)
 	req.SetBasicAuth("u", "p")
-	start := time.Now()
 	for i := 0; i < 20; i++ {
 		if _, ok, _ := a.Authenticate(req); !ok {
 			t.Fatal("缓存命中后不应失败")
 		}
 	}
-	// bcrypt 单次约 50ms+，20 次全算要 1 秒以上；有缓存应该很快
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Errorf("20 次认证耗时 %v，缓存似乎没生效", d)
+	// 直接查缓存条目数，而不是测耗时：
+	// bcrypt 单次在慢机器（尤其开 -race）能到上百毫秒，用墙钟阈值判断会误报。
+	if got := len(a.cache); got != 1 {
+		t.Errorf("同一凭据重复认证应只产生 1 条缓存，实际 %d", got)
+	}
+
+	// 换密码应单独缓存一条 —— key 必须包含密码，只按用户名缓存会串号
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.SetBasicAuth("u", "wrong")
+	for i := 0; i < 3; i++ {
+		if _, ok, _ := a.Authenticate(req2); ok {
+			t.Fatal("错误密码不应通过认证")
+		}
+	}
+	if got := len(a.cache); got != 2 {
+		t.Errorf("正确与错误密码应各缓存一条，实际 %d", got)
+	}
+	// 错误密码的结果同样要缓存，否则拿同一错误密码反复打就等于绕过了缓存保护
+	if c := a.cache["u\x00wrong"]; !c.exp.After(time.Now()) {
+		t.Error("错误密码的认证结果也应写入缓存并设置过期时间")
 	}
 }
 
