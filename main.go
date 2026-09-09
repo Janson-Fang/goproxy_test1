@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -406,11 +407,23 @@ func (a *App) Run(ctx context.Context) error {
 	return nil
 }
 
+// 编译时通过 -ldflags "-X main.version=... -X main.commit=..." 注入
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 func main() {
 	cfgPath := flag.String("c", "config.json", "配置文件路径")
 	logLevel := flag.String("log-level", "info", "日志级别: debug|info|warn|error")
 	textLog := flag.Bool("text-log", false, "输出人类可读日志（默认 JSON）")
+	showVer := flag.Bool("version", false, "打印版本信息并退出")
 	flag.Parse()
+
+	if *showVer {
+		fmt.Printf("goproxy %s (commit %s)\n", version, commit)
+		return
+	}
 
 	var lvl slog.Level
 	switch *logLevel {

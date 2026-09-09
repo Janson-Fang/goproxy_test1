@@ -261,6 +261,35 @@ EOF
 
 ---
 
+## 在线编译（GitHub Actions）
+
+仓库里带了 `.github/workflows/ci.yml`，**push 上去就自动编译**，不需要本地装 Go：
+
+| 触发条件 | 做什么 |
+|---|---|
+| push / PR 到 main | gofmt 检查、`go vet`、`go test -race` |
+| 同上 | 交叉编译 **linux/amd64 + linux/arm64** 静态二进制 |
+| 同上 | 构建多架构 Docker 镜像并推到 `ghcr.io/<owner>/<repo>` |
+| 打 tag `v*` | 额外创建 GitHub Release，把两个平台的 tar.gz 挂上去 |
+
+拿编译产物：仓库页面 → **Actions** → 点进最新的 workflow run → 页面底部 **Artifacts** 下载 `goproxy-linux-amd64`。压缩包里除了二进制还有 `config.example.json`。
+
+发版本：
+
+```bash
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+镜像：
+
+```bash
+docker pull ghcr.io/janson-fang/goproxy_test1:main   # 注意镜像名必须全小写
+```
+
+> 公开仓库的 Actions 时长**完全免费且无上限**，只有私有仓库才受每月 2000 分钟限制。
+
+---
+
 ## 部署到 Linux
 
 ```bash
