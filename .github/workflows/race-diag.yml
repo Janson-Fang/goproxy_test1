@@ -19,8 +19,10 @@ jobs:
 
       - name: 跑 race 测试
         run: |
+          set +e
           go test -race -v -count=1 ./... > race-output.txt 2>&1
           echo "=== exit=$? ===" >> race-output.txt
+          set -e
           go env CGO_ENABLED CC >> race-output.txt
       - name: 输出尾部（便于页面查看）
         run: tail -100 race-output.txt
@@ -29,5 +31,5 @@ jobs:
           git config user.name ci-bot
           git config user.email ci-bot@users.noreply.github.com
           git add -f race-output.txt
-          git commit -m "race output $(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "race output $(date -u +%Y%m%dT%H%M%SZ)" || echo "无变化，跳过"
           git push -f origin HEAD:refs/heads/ci-logs
