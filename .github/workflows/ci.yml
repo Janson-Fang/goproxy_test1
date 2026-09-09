@@ -75,11 +75,16 @@ jobs:
           go build -trimpath -o dist/goproxy-backend ./backend
           cp config.example.json README.md LICENSE dist/
           tar -czf goproxy-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist .
+          sha256sum goproxy-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+            > SHA256SUMS-${{ matrix.goarch }}.txt
+          cat SHA256SUMS-${{ matrix.goarch }}.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: goproxy-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: goproxy-*.tar.gz
+          path: |
+            goproxy-*.tar.gz
+            SHA256SUMS-*.txt
           if-no-files-found: error
 
   docker:
@@ -140,5 +145,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-*.txt
           generate_release_notes: true

@@ -290,7 +290,54 @@ docker pull ghcr.io/janson-fang/goproxy_test1:main   # 注意镜像名必须全�
 
 ---
 
-## 部署到 Linux
+## 安装到 Linux
+
+### 一键安装（推荐）
+
+在目标机器上一条命令搞定：下载预编译二进制 → 装到 `/usr/local/bin` → 生成配置 → 注册 systemd 服务。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Janson-Fang/goproxy_test1/main/install.sh | sudo bash
+```
+
+脚本做的事：自动识别 amd64/arm64、校验 sha256（对不上直接中止）、**已存在的 `config.json` 不会被覆盖**、创建 `goproxy` 系统用户并以非 root 运行。装完按提示改配置，然后：
+
+```bash
+sudo systemctl enable --now goproxy
+sudo journalctl -u goproxy -f
+```
+
+常用变体：
+
+```bash
+# 指定版本
+curl -fsSL .../install.sh | sudo VERSION=v0.3.0 bash
+
+# 容器里用：只装二进制，不碰 systemd
+curl -fsSL .../install.sh | sudo bash -s -- --no-service
+
+# 不想用 root：装到家目录
+curl -fsSL .../install.sh | BIN_DIR=$HOME/.local/bin CONFIG_DIR=$HOME/.goproxy bash -s -- --no-service
+```
+
+不想用脚本的话，手动下载 Release 附件也一样：
+
+```bash
+VERSION=v0.3.0
+curl -fsSL -o goproxy.tar.gz \
+  "https://github.com/Janson-Fang/goproxy_test1/releases/download/$VERSION/goproxy-linux-amd64.tar.gz"
+tar -xzf goproxy.tar.gz && sudo install -m 0755 goproxy /usr/local/bin/goproxy
+```
+
+容器镜像（无需安装，两平台自动选）：
+
+```bash
+docker run --rm ghcr.io/janson-fang/goproxy_test1:main -version   # 注意镜像名全小写
+```
+
+---
+
+## 手动编译部署
 
 ```bash
 # 交叉编译（无需 CGO，静态二进制）

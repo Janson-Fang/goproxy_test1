@@ -1,0 +1,8 @@
+# 安装脚本必须在 Linux 上以 LF 运行，CRLF 会导致
+# "bad interpreter: /usr/bin/env^M" 这种莫名其妙的报错
+*.sh text eol=lf
+
+# Go 源码和 YAML 统一 LF，避免 CI 上 gofmt / 解析差异
+*.go text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
