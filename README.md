@@ -297,8 +297,11 @@ docker pull ghcr.io/janson-fang/goproxy_test1:main   # 注意镜像名必须全�
 在目标机器上一条命令搞定：下载预编译二进制 → 装到 `/usr/local/bin` → 生成配置 → 注册 systemd 服务。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Janson-Fang/goproxy_test1/main/install.sh | sudo bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh | sudo bash
 ```
+
+> 用 jsdelivr 取脚本而不是 `raw.githubusercontent.com`，因为后者在国内经常连不上。
+> 脚本内部下载 Release 时也会自动挑加速通道，见下。
 
 脚本做的事：自动识别 amd64/arm64、校验 sha256（对不上直接中止）、**已存在的 `config.json` 不会被覆盖**、创建 `goproxy` 系统用户并以非 root 运行。装完按提示改配置，然后：
 
@@ -307,10 +310,40 @@ sudo systemctl enable --now goproxy
 sudo journalctl -u goproxy -f
 ```
 
-常用变体：
+### 国内网络：脚本会自动走加速镜像
+
+实测国内直连 GitHub 下载 Release **基本下不动**（7MB 的包 35 秒都拉不完），所以脚本内置了加速通道，`MIRROR` 默认 `auto`：
+
+| 取值 | 行为 |
+|---|---|
+| `auto`（默认） | 先试直连，失败或过慢自动切镜像；顺序 gh-proxy.com → ghfast.top → ghproxy.net |
+| `direct` | 强制直连，不碰任何第三方 |
+| `https://你的镜像/` | 只用指定前缀的镜像 |
 
 ```bash
-# 指定版本
+# 什么都不用加，慢了自己切
+curl -fsSL .../install.sh | sudo bash
+
+# 能顺畅访问 GitHub 的机器（如海外 VPS）：强制直连
+curl -fsSL .../install.sh | sudo MIRROR=direct bash
+
+# 指定镜像
+curl -fsSL .../install.sh | sudo MIRROR=https://gh-proxy.com/ bash
+```
+
+脚本的选路逻辑有两处细节，都是为了少让你干等：
+
+- **直连给短超时（35s），镜像给长超时（90s）**。93 字节的校验和文件能秒下，不代表 7MB 的包也下得动 —— 实测就是「小文件通、大文件死」，所以不能因为探测通过就一直等直连。
+- **下载慢于 2KB/s 持续 20 秒直接放弃换通道**，避免卡死在龟速连接上。
+
+**安全性**：镜像是第三方服务，只负责加速传输。下载完会用 Release 里的 `SHA256SUMS` 校验内容，**对不上直接中止安装**，想篡改会被拦住。对第三方有顾虑就用 `MIRROR=direct`。
+
+**已知坑**：镜像有缓存，刚发布的版本可能还没同步过去，表现是「校验和不匹配」。脚本会提示你换直连或换个镜像；要绝对保险就显式指定 `VERSION=`。
+
+### 常用变体
+
+```bash
+# 指定版本（推荐，避免 latest 解析依赖网络）
 curl -fsSL .../install.sh | sudo VERSION=v0.3.0 bash
 
 # 容器里用：只装二进制，不碰 systemd
@@ -320,12 +353,13 @@ curl -fsSL .../install.sh | sudo bash -s -- --no-service
 curl -fsSL .../install.sh | BIN_DIR=$HOME/.local/bin CONFIG_DIR=$HOME/.goproxy bash -s -- --no-service
 ```
 
-不想用脚本的话，手动下载 Release 附件也一样：
+不想用脚本的话，手动下载 Release 附件也一样（国内记得套一层镜像前缀）：
 
 ```bash
 VERSION=v0.3.0
+MIRROR=https://gh-proxy.com/          # 能直连 GitHub 就去掉这个前缀
 curl -fsSL -o goproxy.tar.gz \
-  "https://github.com/Janson-Fang/goproxy_test1/releases/download/$VERSION/goproxy-linux-amd64.tar.gz"
+  "${MIRROR}https://github.com/Janson-Fang/goproxy_test1/releases/download/$VERSION/goproxy-linux-amd64.tar.gz"
 tar -xzf goproxy.tar.gz && sudo install -m 0755 goproxy /usr/local/bin/goproxy
 ```
 

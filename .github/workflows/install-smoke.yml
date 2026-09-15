@@ -1,0 +1,118 @@
+# 在真实 Linux 环境里跑 install.sh，验证下载 / 校验 / 安装 / 幂等性。
+# 本地是 Windows，没法真正执行 ELF 二进制，这个自检必须放在 CI。
+name: install-smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - ".github/workflows/install-smoke.yml"
+  pull_request:
+    paths:
+      - "install.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: 安装自检（${{ matrix.label }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 直连 + 固定版本
+            mirror: direct
+            version: v0.3.0
+          - label: auto 自动选路
+            mirror: auto
+            version: v0.3.0
+          - label: latest 版本解析
+            mirror: auto
+            version: ""
+          # 海外 runner 访问国内镜像站不一定通，失败不代表脚本有问题
+          - label: 强制走镜像（参考项）
+            mirror: https://gh-proxy.com/
+            version: v0.3.0
+            optional: true
+    continue-on-error: ${{ matrix.optional == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 跑安装脚本
+        env:
+          MIRROR: ${{ matrix.mirror }}
+          VERSION: ${{ matrix.version }}
+          BIN_DIR: ${{ runner.temp }}/bin
+          CONFIG_DIR: ${{ runner.temp }}/conf
+        run: |
+          # 先建好目录，验证「不需要 sudo」这条路径
+          mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+          bash install.sh --no-service
+
+      - name: 断言安装结果
+        env:
+          MIRROR: ${{ matrix.mirror }}
+          VERSION: ${{ matrix.version }}
+          BIN_DIR: ${{ runner.temp }}/bin
+          CONFIG_DIR: ${{ runner.temp }}/conf
+        run: |
+          set -e
+          test -x "$BIN_DIR/goproxy" || { echo "二进制没装上"; exit 1; }
+          echo "--- 版本输出 ---"
+          "$BIN_DIR/goproxy" -version
+          "$BIN_DIR/goproxy" -version | grep -qv 'dev' || { echo "版本号没注入"; exit 1; }
+          test -f "$CONFIG_DIR/config.json" || { echo "配置文件没生成"; exit 1; }
+
+          echo "--- 二进制确实是 Linux ELF ---"
+          file "$BIN_DIR/goproxy"
+          file "$BIN_DIR/goproxy" | grep -q ELF || { echo "不是 ELF"; exit 1; }
+
+      - name: 幂等性：重跑不能覆盖已有配置
+        env:
+          MIRROR: ${{ matrix.mirror }}
+          VERSION: ${{ matrix.version }}
+          BIN_DIR: ${{ runner.temp }}/bin
+          CONFIG_DIR: ${{ runner.temp }}/conf
+        run: |
+          set -e
+          printf '{"routes":[{"id":"keep-me"}]}' > "$CONFIG_DIR/config.json"
+          bash install.sh --no-service
+          grep -q 'keep-me' "$CONFIG_DIR/config.json" || { echo "已有配置被覆盖了"; exit 1; }
+          test -f "$CONFIG_DIR/config.json.example" || { echo "新示例没另存"; exit 1; }
+          echo "幂等性 OK"
+
+      - name: 冒烟：二进制能起来并加载配置
+        env:
+          BIN_DIR: ${{ runner.temp }}/bin
+          CONFIG_DIR: ${{ runner.temp }}/conf
+        run: |
+          set -e
+          # 用示例配置起服务，确认能正常监听管理端口
+          cat > "$CONFIG_DIR/smoke.json" <<'CFG'
+          {
+            "admin_addr": "127.0.0.1:19080",
+            "routes": [
+              { "id": "smoke", "listen_port": 18080, "path_prefix": "/",
+                "target": "http://127.0.0.1:19001" }
+            ]
+          }
+          CFG
+          "$BIN_DIR/goproxy" -c "$CONFIG_DIR/smoke.json" -text-log > "$RUNNER_TEMP/gp.log" 2>&1 &
+          GP=$!
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 2 http://127.0.0.1:19080/_goproxy/ports >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          echo "--- 管理端点 ---"
+          curl -fsS --max-time 3 http://127.0.0.1:19080/_goproxy/ports
+          echo
+          curl -fsS --max-time 3 http://127.0.0.1:19080/_goproxy/routes | head -c 300
+          echo
+          kill $GP 2>/dev/null || true
+          echo "--- 启动日志 ---"
+          head -5 "$RUNNER_TEMP/gp.log"
+          echo "冒烟测试 OK"
