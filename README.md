@@ -492,10 +492,15 @@ EOF
 
 | 触发条件 | 做什么 |
 |---|---|
-| push / PR 到 main | gofmt 检查、`go vet`、`go test -race` |
+| push / PR 到 main | 先跑 **管理控制台构建与一致性**：`npm ci` → `npm run typecheck` → `npm run build`，然后校验提交进仓库的 `web/dist` 与重新构建的结果一致 |
+| 同上 | gofmt 检查、`go vet`、`go test -race`（依赖上面的 console 任务先通过） |
 | 同上 | 交叉编译 **linux/amd64 + linux/arm64** 静态二进制 |
 | 同上 | 构建多架构 Docker 镜像并推到 `ghcr.io/<owner>/<repo>` |
 | 打 tag `v*` | 额外创建 GitHub Release，把两个平台的 tar.gz 挂上去 |
+
+> `web/dist` 是提交进仓库的（`go:embed` 要求它必须存在，否则别人 clone 下来直接 `go build` 会失败）。
+> 那道一致性校验就是为了挡住「改了前端却忘了重新构建」——否则仓库里的产物会悄悄过期。
+> 本地改完前端记得 `cd web && npm run build` 再提交。
 
 拿编译产物：仓库页面 → **Actions** → 点进最新的 workflow run → 页面底部 **Artifacts** 下载 `goproxy-linux-amd64`。压缩包里除了二进制还有 `config.example.json`。
 
@@ -669,10 +674,17 @@ docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:
 | `admin_api_test.go` | 管理接口单测：CRUD、并发写冲突、认证、坏配置不落盘 |
 | `stats_test.go` | 环形缓冲、采样序列、SSE、并发重载单测 |
 | `webui_test.go` | 控制台托管单测：内嵌资源、缓存头、SPA 回落、静态壳免鉴权但接口仍鉴权 |
+| `scripts/e2e_console.py` | 端到端自检：真实后端 + 真实反代，69 项断言 |
 
 ```bash
 go test ./...   # 跑测试
 go vet ./...    # 静态检查
+
+# 端到端自检：会用真实二进制起 4 个测试后端 + 反代，
+# 覆盖控制台依赖的全部接口（静态资源、根路径分流、限流/认证真实流量、
+# stats/logs、SSE、路由 CRUD + ETag 并发、全局配置、Prometheus 指标）。
+# 需要 PATH 里有 go 和 python3；产物都落在临时目录，不污染工作区。
+python scripts/e2e_console.py
 ```
 
 ---
