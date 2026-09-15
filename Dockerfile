@@ -10,6 +10,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# 管理控制台的资源来自 web/dist（由 web/ 下的 React+Vite 工程构建）。
+# 它随仓库一起提交，所以这个镜像不需要 Node —— go:embed 在编译期直接把它打进二进制。
+# 改了前端记得先在本地 `cd web && npm run build`，CI 里有一步专门挡这个。
+#
 # CGO 关闭 + 静态链接：得到的二进制可以直接扔进 scratch/alpine，不依赖 glibc
 ARG VERSION=dev
 ARG COMMIT=none

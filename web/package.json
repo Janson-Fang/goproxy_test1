@@ -1,0 +1,25 @@
+{
+  "name": "goproxy-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "goproxy 管理控制台（React + Vite，构建产物由 Go 二进制内嵌托管）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.0"
+  }
+}

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <title>goproxy 控制台</title>
+    <script>
+      // 在首屏渲染前定好主题，避免浅色用户看到一瞬白→黑的闪烁
+      try {
+        var t = localStorage.getItem('goproxy.theme')
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+        }
+        document.documentElement.dataset.theme = t
+      } catch (e) {}
+    </script>
+    <script type="module" crossorigin src="/_goproxy/ui/assets/index-CPHRp7mE.js"></script>
+    <link rel="stylesheet" crossorigin href="/_goproxy/ui/assets/index-B3BKbkZM.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

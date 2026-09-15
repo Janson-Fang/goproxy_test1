@@ -290,8 +290,34 @@ func (a *App) logAccess(r *http.Request, port int, rt *Route, blocked, ip string
 	)
 }
 
-// adminHandler 管理端口：健康检查、指标、路由查看、手动重载。
+// adminHandler 管理端口的总入口。
+//
+// 分成两层是有意为之：
+//
+//	/_goproxy/ui/  控制台静态资源，不鉴权（理由见 webui.go 的 uiHandler）
+//	其余全部       健康检查、指标、管理接口，一律走 adminGuard
+//
+// 顶层的 "/" 只做一件事：浏览器访问管理端口根路径时 302 到控制台。
+// curl / 监控探针不带 Accept: text/html，拿到的仍是原来的纯文本接口清单。
 func (a *App) adminHandler() http.Handler {
+	guarded := a.adminGuard(a.adminMux())
+
+	root := http.NewServeMux()
+	root.Handle(uiPrefix, a.uiHandler())
+	root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && wantsHTML(r) {
+			if _, ok := uiFS(); ok {
+				http.Redirect(w, r, uiPrefix, http.StatusFound)
+				return
+			}
+		}
+		guarded.ServeHTTP(w, r)
+	})
+	return root
+}
+
+// adminMux 是真正的管理接口集合，整体由 adminGuard 保护。
+func (a *App) adminMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -340,6 +366,7 @@ func (a *App) adminHandler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		io.WriteString(w, "goproxy admin\n"+
+			"  浏览器访问 /            → 管理控制台（"+uiPrefix+"）\n"+
 			"  /healthz  /readyz  /metrics\n"+
 			"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
 			"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
@@ -350,8 +377,7 @@ func (a *App) adminHandler() http.Handler {
 			"  /_goproxy/events          实时访问日志（SSE）\n"+
 			"  /_goproxy/reload          POST 手动重载配置\n")
 	})
-	// 非回环访问必须带 admin_token，见 admin_api.go 的 adminGuard
-	return a.adminGuard(mux)
+	return mux
 }
 
 // watchLoop 轮询配置文件 mtime，变了就热重载。

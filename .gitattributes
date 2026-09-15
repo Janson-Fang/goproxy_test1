@@ -6,3 +6,8 @@
 *.go text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# web/dist 是提交进仓库的构建产物，CI 会用 Linux 上重新构建的结果跟它逐字节比对。
+# 如果本地是 Windows（core.autocrlf=false）把 CRLF 提上去，CI 会误判成「产物过期」，
+# 所以这里强制按 LF 存储，保证不同平台提交/检出后字节一致。
+web/dist/** text eol=lf

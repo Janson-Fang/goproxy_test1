@@ -1,0 +1,7 @@
+node_modules/
+*.local
+.vite/
+
+# dist/ 是有意提交的：Go 侧的 //go:embed all:web/dist 要求它必须存在，
+# 否则别人 clone 下来直接 go build 会编译失败。CI 会在构建前重新生成一遍，
+# 确保提交的产物和源码一致（详见 .github/workflows/ci.yml）。

@@ -16,8 +16,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  console:
+    name: 管理控制台构建与一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: 类型检查
+        working-directory: web
+        run: npm run typecheck
+
+      - name: 构建
+        working-directory: web
+        run: npm run build
+
+      # web/dist 是提交进仓库的（go:embed 要求它必须存在，否则别人 clone 下来
+      # 直接 go build 会编译失败）。所以必须挡住「改了前端却忘了重新构建」——
+      # 否则仓库里的产物会悄悄过期，不跑 Node 的构建流程会嵌进旧界面。
+      - name: 检查提交的 web/dist 是否与源码一致
+        run: |
+          if ! git diff --quiet -- web/dist; then
+            echo "::error::web/dist 与源码不一致。请在本地执行 cd web && npm run build 后提交产物。"
+            git --no-pager diff --stat -- web/dist
+            exit 1
+          fi
+          echo "web/dist 与源码一致"
+
   test:
     name: 测试与静态检查
+    needs: console
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +84,7 @@ jobs:
 
   build:
     name: 交叉编译 ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: test
+    needs: console
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -61,6 +98,20 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 即使 web/dist 是提交好的，这里也重新构建一遍：
+      # 保证发布出去的控制台一定和源码对应，而不是依赖某次本地构建的产物。
+      - name: 构建管理控制台
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
 
       - name: 编译
         env:
@@ -89,7 +140,7 @@ jobs:
 
   docker:
     name: 构建镜像
-    needs: test
+    needs: console
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -117,6 +168,8 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
 
+      # 镜像里的前端资源来自提交好的 web/dist（.dockerignore 特意保留了它），
+      # 所以 Docker 构建不需要 Node，上面那个 console 任务已经保证产物是最新的。
       - uses: docker/build-push-action@v6
         with:
           context: .

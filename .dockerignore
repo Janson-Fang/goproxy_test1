@@ -1,0 +1,35 @@
+# 构建上下文瘦身。
+#
+# 关键约束：**不能**排除 web/dist —— Go 侧的 //go:embed all:web/dist
+# 要在编译期读它，排除掉就直接编译失败。
+#
+# 这里刻意不写裸的 "dist"：doris/gitignore 风格的通配很容易连带把
+# web/dist 也排掉，而那是构建必须的。只排除确定无关的路径。
+
+.git
+.gitignore
+.github
+
+# 前端依赖（几百 MB，镜像构建用不到；web/dist 才是要的）
+web/node_modules
+
+# 本地构建产物
+bin
+goproxy
+goproxy.exe
+goproxy-backend
+goproxy-backend.exe
+goproxy-test.exe
+backend-test.exe
+
+# 运行期数据与文档
+data
+docs
+*.log
+*.bak
+*.tmp
+.goproxy
+
+# 保险：万一以后有人加了宽泛的排除规则，这里显式把内嵌资源要回来
+!web/dist
+!web/dist/**
