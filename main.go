@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -292,28 +293,86 @@ func (a *App) logAccess(r *http.Request, port int, rt *Route, blocked, ip string
 
 // adminHandler 管理端口的总入口。
 //
-// 分成两层是有意为之：
+// 分成三层是有意为之：
 //
 //	/_goproxy/ui/  控制台静态资源，不鉴权（理由见 webui.go 的 uiHandler）
-//	其余全部       健康检查、指标、管理接口，一律走 adminGuard
+//	接口路径        健康检查、指标、管理接口，一律走 adminGuard
+//	其余路径        按「人还是机器」分流 —— 人送控制台，机器给纯文本清单
 //
-// 顶层的 "/" 只做一件事：浏览器访问管理端口根路径时 302 到控制台。
-// curl / 监控探针不带 Accept: text/html，拿到的仍是原来的纯文本接口清单。
+// 第三层不能省。早期版本只把精确的 "/" 重定向到控制台，其余全交给管理接口
+// 那个兜底的 "/"，结果是：用户在浏览器里手写 /_goproxy/（最容易猜的地址）
+// 看到的是纯文本接口清单，而 / 才进控制台 —— 表现得像「控制台没生效」。
 func (a *App) adminHandler() http.Handler {
 	guarded := a.adminGuard(a.adminMux())
 
 	root := http.NewServeMux()
 	root.Handle(uiPrefix, a.uiHandler())
 	root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" && wantsHTML(r) {
+		if isAdminAPIPath(r.URL.Path) {
+			guarded.ServeHTTP(w, r)
+			return
+		}
+
+		// 到这里的都不是接口路径：根路径、只写了前缀的 /_goproxy、以及写错的地址。
+		// 浏览器（Accept 含 text/html）一律送控制台，不管它敲的是哪一个 ——
+		// 人在地址栏里试地址时不该被一本纯文本清单接住。
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && wantsHTML(r) {
 			if _, ok := uiFS(); ok {
 				http.Redirect(w, r, uiPrefix, http.StatusFound)
 				return
 			}
 		}
-		guarded.ServeHTTP(w, r)
+
+		if isAdminLandingPath(r.URL.Path) {
+			serveAdminIndex(w)
+			return
+		}
+
+		// 写错的地址老实报 404。以前所有未知路径都回 200 + 接口清单，
+		// 于是 `curl -f /_goproxy/statss` 这种拼写错误看着像成功。
+		http.NotFound(w, r)
 	})
 	return root
+}
+
+// isAdminAPIPath 判断路径是不是管理端接口。
+//
+// 必须在交给 adminGuard 之前判断，不能指望「先转发、mux 兜底了再说」：
+// 浏览器直接打开 /_goproxy/routes 也要拿到 JSON，不能因为带了
+// Accept: text/html 就被重定向到控制台。
+func isAdminAPIPath(p string) bool {
+	switch p {
+	case "/healthz", "/readyz", "/metrics":
+		return true
+	}
+	// /_goproxy/ui/ 开头的属于控制台自己的资源；
+	// 光秃秃的 /_goproxy 和 /_goproxy/ 是「人在找控制台」，都不算接口。
+	return strings.HasPrefix(p, "/_goproxy/") &&
+		p != "/_goproxy/" &&
+		!strings.HasPrefix(p, uiPrefix)
+}
+
+// isAdminLandingPath 保留几个「人在找管理端」的地址给纯文本清单，
+// 让 curl 用户仍然能一眼看到接口列表和真正的控制台地址。
+func isAdminLandingPath(p string) bool {
+	return p == "/" || p == "/_goproxy" || p == "/_goproxy/"
+}
+
+// serveAdminIndex 输出纯文本接口清单。给不带 Accept: text/html 的调用方
+// （curl、监控探针、脚本）看，所以刻意不做成网页。
+func serveAdminIndex(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	io.WriteString(w, "goproxy admin\n"+
+		"  管理控制台（浏览器打开）  "+uiPrefix+"\n"+
+		"  /healthz  /readyz  /metrics\n"+
+		"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
+		"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
+		"  /_goproxy/config          GET / PATCH 全局配置\n"+
+		"  /_goproxy/ports           当前监听端口\n"+
+		"  /_goproxy/stats           聚合状态（指标 + 采样曲线 + 熔断计数）\n"+
+		"  /_goproxy/logs            最近访问记录  ?limit=N\n"+
+		"  /_goproxy/events          实时访问日志（SSE）\n"+
+		"  /_goproxy/reload          POST 手动重载配置\n")
 }
 
 // adminMux 是真正的管理接口集合，整体由 adminGuard 保护。
@@ -363,20 +422,8 @@ func (a *App) adminMux() *http.ServeMux {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ports": a.listeners.Ports()})
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "goproxy admin\n"+
-			"  浏览器访问 /            → 管理控制台（"+uiPrefix+"）\n"+
-			"  /healthz  /readyz  /metrics\n"+
-			"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
-			"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
-			"  /_goproxy/config          GET / PATCH 全局配置\n"+
-			"  /_goproxy/ports           当前监听端口\n"+
-			"  /_goproxy/stats           聚合状态（指标 + 采样曲线 + 熔断计数）\n"+
-			"  /_goproxy/logs            最近访问记录  ?limit=N\n"+
-			"  /_goproxy/events          实时访问日志（SSE）\n"+
-			"  /_goproxy/reload          POST 手动重载配置\n")
-	})
+	// 这里刻意**不注册** "/" 兜底。兜底一旦放在 mux 里，它就会替所有拼错的
+	// 接口地址回 200，把 404 变成「看起来成功」。未知路径由 adminHandler 统一处置。
 	return mux
 }
 

@@ -195,6 +195,91 @@ func TestRootPlainTextListsUIPath(t *testing.T) {
 	}
 }
 
+// 管理端上任何「人在找控制台」的地址都要进控制台，而不只是根路径。
+//
+// 这里每一条都是真实踩过的：/_goproxy/ 是最容易手写的猜测，
+// /index.html 和 /dashboard 是顺手敲的，以前全部落进纯文本接口清单，
+// 表现就是「控制台明明做好了，直接访问却没有」。
+func TestAdminPrefixPathsSendBrowserToConsole(t *testing.T) {
+	env := newTestEnv(t, "", "")
+	const html = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+	for _, p := range []string{"/_goproxy/", "/_goproxy", "/index.html", "/dashboard", "/anything"} {
+		rec := doAdmin(t, env, http.MethodGet, p, html, "", "")
+		if rec.Code != http.StatusFound {
+			t.Errorf("浏览器访问 %s 期望 302 到控制台，实际 %d", p, rec.Code)
+			continue
+		}
+		if loc := rec.Header().Get("Location"); loc != uiPrefix {
+			t.Errorf("浏览器访问 %s 应重定向到 %s，实际 %q", p, uiPrefix, loc)
+		}
+	}
+
+	// 落地页：curl（不带 text/html）要拿到纯文本清单，
+	// 这样运维不用翻文档也知道接口长什么样、真正的控制台在哪个地址。
+	for _, p := range []string{"/", "/_goproxy", "/_goproxy/"} {
+		rec := doAdmin(t, env, http.MethodGet, p, "*/*", "", "")
+		if rec.Code != http.StatusOK {
+			t.Errorf("curl 访问 %s 期望 200 纯文本清单，实际 %d", p, rec.Code)
+			continue
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+			t.Errorf("curl 访问 %s 应拿到纯文本，实际 Content-Type=%q", p, ct)
+		}
+		if !strings.Contains(rec.Body.String(), uiPrefix) {
+			t.Errorf("curl 访问 %s 的清单里应写出控制台地址 %s", p, uiPrefix)
+		}
+	}
+
+	// 其余非落地页的地址对 curl 就是 404，不再伪装成「成功」。
+	for _, p := range []string{"/index.html", "/dashboard", "/anything"} {
+		rec := doAdmin(t, env, http.MethodGet, p, "*/*", "", "")
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("curl 访问非落地页 %s 期望 404，实际 %d", p, rec.Code)
+		}
+	}
+}
+
+// 反过来钉住：接口路径**不能**因为带 text/html 就被重定向。
+// 浏览器直接打开 /_goproxy/routes 就是要看到 JSON。
+func TestAdminAPIsAreNotRedirectedForBrowserAccept(t *testing.T) {
+	env := newTestEnv(t, "", "")
+	const html = "text/html,application/xhtml+xml"
+
+	for _, p := range []string{"/_goproxy/routes", "/_goproxy/ports", "/_goproxy/stats", "/_goproxy/config", "/healthz", "/readyz", "/metrics"} {
+		rec := doAdmin(t, env, http.MethodGet, p, html, "", "")
+		if rec.Code == http.StatusFound && rec.Header().Get("Location") == uiPrefix {
+			t.Errorf("接口 %s 被重定向到控制台了，浏览器将拿不到数据", p)
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("接口 %s 期望 200，实际 %d", p, rec.Code)
+		}
+	}
+}
+
+// 拼错的接口地址必须响亮地 404。兜底的 "/" 曾经让所有未知路径回 200 + 清单，
+// 于是 `curl -f /_goproxy/statss` 看着像成功。
+func TestUnknownAdminPathIsNotFoundForNonHTML(t *testing.T) {
+	env := newTestEnv(t, "", "")
+
+	rec := doAdmin(t, env, http.MethodGet, "/_goproxy/statss", "*/*", "", "")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("写错的接口路径对 curl 应返回 404，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+
+	// 位置参数写法漏掉后半个括号 / 多带了斜杠也一样
+	rec = doAdmin(t, env, http.MethodGet, "/_goproxy/routes/", "*/*", "", "")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("/_goproxy/routes/ 应返回 404（精确匹配）, 实际 %d", rec.Code)
+	}
+
+	// 但 /healthz 这类前缀相同的合法接口不能被误伤
+	rec = doAdmin(t, env, http.MethodGet, "/healthz", "*/*", "", "")
+	if rec.Code != http.StatusOK {
+		t.Errorf("/healthz 应正常返回 200，实际 %d", rec.Code)
+	}
+}
+
 // 保证 fs.FS 的路径清洗没被绕过：embed FS 本身拒绝含 .. 的路径，
 // 这里再确认一次请求不会穿透到别的目录。
 func TestUIPathTraversalIsContained(t *testing.T) {

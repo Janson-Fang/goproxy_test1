@@ -16,6 +16,9 @@
 
 脚本会自己 go build 出两个临时二进制，并把 config.json 复制到临时目录再跑，
 所以不会污染工作区。需要 PATH 里有 go。
+
+自检需要**独占** config.json 里涉及的全部端口（含管理端口 9080）。若本机已经跑着
+一份实例，脚本会直接报错退出 —— 而不是连上那个实例、把它的响应当成自己的来断言。
 """
 import json
 import os
@@ -110,15 +113,45 @@ def post(path, body, method="POST", headers=None):
         return e.code, dict(e.headers), e.read()
 
 
-def wait_port(port, timeout=20):
+def wait_port(port, timeout=20, proc=None):
     end = time.time() + timeout
     while time.time() < end:
+        # 自己起的进程都退出了就别白等 —— 否则会一直等到超时，
+        # 然后「端口通」这件事被别人占着的端口满足了，测的是别人的进程。
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             with socket.create_connection(("127.0.0.1", port), 0.4):
                 return True
         except OSError:
             time.sleep(0.2)
     return False
+
+
+def port_in_use(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), 0.3):
+            return True
+    except OSError:
+        return False
+
+
+def config_listen_ports(cfg):
+    """配置里要求监听的端口：default_ports 加上每条路由自己指定的 listen_port。"""
+    ports = {int(p) for p in (cfg.get("default_ports") or [])}
+    for r in cfg.get("routes") or []:
+        lp = int(r.get("listen_port") or 0)
+        if lp:
+            ports.add(lp)
+    return sorted(ports)
+
+
+def required_ports(cfg, admin_port):
+    """自检要独占的端口：测试后端 + 管理端口 + 配置里所有监听端口 + CRUD 用的 8099。
+
+    从临时配置里算出来，而不是写死一份清单 —— 配置改了清单就跟着改，不会漏。
+    """
+    return sorted({9001, 9002, 9003, 9004, 8099, admin_port} | set(config_listen_ports(cfg)))
 
 
 def build_binaries(outdir):
@@ -158,6 +191,26 @@ def main():
         cfg = os.path.join(tmp, "config.json")
         shutil.copyfile(os.path.join(ROOT, "config.json"), cfg)
 
+        # 管理地址以临时配置为准，别写死 9080。
+        global ADMIN
+        cfg_data = json.load(open(cfg, encoding="utf-8"))
+        admin_addr = cfg_data.get("admin_addr") or "127.0.0.1:9080"
+        ADMIN = "http://" + admin_addr
+        admin_port = int(admin_addr.rsplit(":", 1)[1])
+
+        # 端口预检。这一步不能省：如果 9080 上已经跑着一个实例（本机开发时很常见），
+        # 自检自己起的那份会因端口被占而退出，而 wait_port 却立刻成功，
+        # 于是所有断言都打在**别人那个进程**上 —— 全绿，但什么也没验证到，
+        # 还会把仓库里的 config.json 改脏（CRUD 落盘的正是那个实例的配置）。
+        busy = [p for p in required_ports(cfg_data, admin_port) if port_in_use(p)]
+        if busy:
+            print("以下端口已被占用: %s" % ", ".join(str(p) for p in busy))
+            print("端到端自检需要独占这些端口，先把占用它们的进程停掉：")
+            print("  Windows:  taskkill /F /IM goproxy-demo.exe /IM backend-demo.exe")
+            print("            taskkill /F /IM goproxy.exe /IM goproxy-test.exe")
+            print("  Linux:    pkill -f goproxy")
+            return 1
+
         print("== 启动测试后端 ==")
         for port, name in ((9001, "svcA"), (9002, "svcB"), (9003, "svcC"), (9004, "svcD")):
             spawn([bins["backend-test"], "-port", str(port), "-name", name])
@@ -167,11 +220,16 @@ def main():
                 return 1
 
         print("== 启动 goproxy ==")
-        spawn([bins["goproxy-test"], "-c", cfg, "-text-log"])
-        if not wait_port(9080):
-            print("管理端口 9080 没起来")
+        proxy = spawn([bins["goproxy-test"], "-c", cfg, "-text-log"])
+        if not wait_port(admin_port, proc=proxy):
+            print(
+                "管理端口 %d 没起来（进程存活=%s，退出码=%s）"
+                % (admin_port, proxy.poll() is None, proxy.returncode)
+            )
             return 1
-        for port in (8000, 8081, 8082, 8083, 8086, 8087, 8088, 8089):
+
+        # 配置里写着要监听的端口必须真的起来，少了就是监听失败。
+        for port in config_listen_ports(cfg_data):
             if not wait_port(port, 10):
                 print("业务端口 %d 没起来" % port)
 
@@ -201,15 +259,39 @@ def main():
         st, h, b = get("/_goproxy/ui/routes/deep/link")
         check("SPA 深链接回落 -> 200", st == 200 and b'id="root"' in b, "实际 %s" % st)
 
-        print("\n== 2. 根路径分流 ==")
-        st, h, b = get_noredirect("/", accept="text/html,application/xhtml+xml")
-        check("浏览器访问 / 返回跳转", st in (301, 302), "实际 %s" % st)
-        check("跳转目标是控制台", h.get("Location") == "/_goproxy/ui/", str(h.get("Location")))
+        print("\n== 2. 根路径与「找控制台」的地址分流 ==")
 
-        st, h, b = get("/")
-        check("curl 访问 / 拿到 200", st == 200, "实际 %s" % st)
-        check("curl 拿到纯文本清单", "text/plain" in h.get("Content-Type", ""), h.get("Content-Type"))
-        check("清单里提示了控制台地址", b"/_goproxy/ui/" in b)
+        # 这些都是人在地址栏里会敲的地址：根路径、只写了 /_goproxy 前缀的、
+        # 顺手敲成 /index.html 的。浏览器来一律进控制台 —— 以前只有精确的 /
+        # 会重定向，其余全落进纯文本接口清单，看着像「控制台没生效」。
+        for p in ("/", "/_goproxy", "/_goproxy/", "/index.html", "/dashboard"):
+            st, h, b = get_noredirect(p, accept="text/html,application/xhtml+xml")
+            check(
+                "浏览器访问 %s 跳转到控制台" % p,
+                st in (301, 302, 307) and h.get("Location") == "/_goproxy/ui/",
+                "实际 %s -> %s" % (st, h.get("Location")),
+            )
+
+        # 同一批地址换成 curl（不带 text/html）：落地页给纯文本清单，
+        # 其余老实 404，不把拼错的地址伪装成成功。
+        for p in ("/", "/_goproxy", "/_goproxy/"):
+            st, h, b = get(p)
+            check("curl 访问 %s 拿到 200" % p, st == 200, "实际 %s" % st)
+            check("  是纯文本清单", "text/plain" in h.get("Content-Type", ""), h.get("Content-Type"))
+            check("  清单里提示了控制台地址", b"/_goproxy/ui/" in b)
+        for p in ("/index.html", "/dashboard"):
+            st, h, b = get(p)
+            check("curl 访问 %s -> 404" % p, st == 404, "实际 %s" % st)
+
+        # 反向约束：接口不能因为带了 text/html 就被重定向，
+        # 否则浏览器里直接打开 /_goproxy/routes 会拿不到 JSON。
+        st, h, b = get_noredirect("/_goproxy/routes", accept="text/html,application/xhtml+xml")
+        check("接口对浏览器请求不重定向", st == 200, "实际 %s" % st)
+        check("  仍返回 JSON", "application/json" in h.get("Content-Type", ""), h.get("Content-Type"))
+
+        # 拼错的接口地址要响亮地 404
+        st, h, b = get("/_goproxy/statss")
+        check("拼错的接口路径 -> 404", st == 404, "实际 %s" % st)
 
         print("\n== 3. 制造真实流量 ==")
         traffic = [
