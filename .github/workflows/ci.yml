@@ -92,7 +92,11 @@ jobs:
         goos: [linux]
         goarch: [amd64, arm64]
     steps:
+      # fetch-depth: 0 —— 版本号改用 `git describe` 推导，需要完整的 tag 与历史。
+      # 浅克隆下拿不到 tag，会退化成裸的 commit sha。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -113,15 +117,26 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+      # 版本串一律由 git 推导，不要用 github.ref_name：
+      # 分支构建时它是分支名，二进制会显示成 `goproxy main`，看不出对应哪段代码；
+      # tag 构建时两者恰好一致（都是 v0.4.0）。
+      #   tag 上          → v0.4.0
+      #   tag 之后有提交  → v0.3.0-9-gef38364   ← 分支构建的实际形态
+      - name: 计算版本号
+        id: ver
+        run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+
       - name: 编译
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          VERSION: ${{ steps.ver.outputs.version }}
+          COMMIT: ${{ github.sha }}
         run: |
           mkdir -p dist
           go build -trimpath \
-            -ldflags="-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA::7}" \
+            -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT:0:7}" \
             -o dist/goproxy .
           go build -trimpath -o dist/goproxy-backend ./backend
           cp config.example.json README.md LICENSE dist/
@@ -147,6 +162,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 计算版本号
+        id: ver
+        run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -178,7 +199,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ steps.ver.outputs.version }}
             COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -658,16 +658,57 @@ systemctl show -p ExecMainStartTimestamp goproxy   # 重启时间应该是刚刚
 | `SYSTEMD_DIR` | `/etc/systemd/system` | 单元文件放哪 |
 | `STATE_DIR` | `/var/lib/goproxy` | 单元里的 `WorkingDirectory` / `ReadWritePaths` |
 
+### 版本号从哪来
+
+版本号不在源码里写死，编译时由 git 推导（`Makefile` 与 CI 用同一套规则）：
+
+| 构建时机 | 版本串 |
+|---|---|
+| 正好打在 tag 上（发版） | `v0.4.0` |
+| tag 之后又有新提交 | `v0.4.0-9-gef38364` —— 9 表示距该 tag 有 9 个提交 |
+| 有未提交的改动 | 末尾再追加 `-dirty` |
+| 没传 `-X main.version`（裸 `go build`） | `dev` |
+
+能查到的位置：`goproxy -version`、启动日志第一行、`/_goproxy/stats` 的 `version` 字段，
+以及控制台顶栏和「仪表盘 → 运行时信息」。
+
+> **装出来的版本一直是旧版？** `install.sh` 默认装的是「最新 Release」——
+> `VERSION=latest` 会去查 `/releases/latest`。所以只要这个仓库还没打新 tag，
+> 无论 `main` 上有多少新提交，一键安装拿到的都还是上一个 tag 的内容。
+> 这不是脚本的问题，是确实没发版。想用 `main` 上的最新代码，自己编译（见下节），
+> 或者先发一版：
+>
+> ```bash
+> git tag -a v0.4.0 -m "v0.4.0" && git push origin v0.4.0
+> ```
+>
+> 推送后 CI 会自动交叉编译、创建 Release 并挂上 `SHA256SUMS-*`，之后再跑
+> `install.sh` 拿到的就是新版本（升级路径见上一节）。
+
 ---
 
 ## 手动编译部署
 
 ```bash
 # 交叉编译（无需 CGO，静态二进制）
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o goproxy .
+# 这两行 -X 别省 —— 少了它二进制只会自报 "dev"，线上分不清跑的是哪一版
+VERSION=$(git describe --tags --always --dirty)
+COMMIT=$(git rev-parse --short=7 HEAD)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+  -ldflags="-s -w -X main.version=$VERSION -X main.commit=$COMMIT" \
+  -o goproxy .
+./goproxy -version        # goproxy v0.4.0-9-gabc1234 (commit abc1234)
 
 # 放到服务器
 scp goproxy config.json user@server:/opt/goproxy/
+```
+
+装了 `make` 的机器（Linux / macOS）上面这串可以省掉：
+
+```bash
+make build      # 编译，版本号自动带上
+make release    # 先重建控制台再编译
+make version    # 只看当前会用什么版本串
 ```
 
 systemd unit（`/etc/systemd/system/goproxy.service`）：

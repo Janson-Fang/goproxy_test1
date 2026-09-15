@@ -503,6 +503,10 @@ func (a *App) sampleLoop(ctx context.Context) {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	// 启动第一行就报版本：线上排查「到底跑的是哪一版」时，
+	// journalctl 的头几行就能回答，不用去翻二进制。
+	slog.Info("goproxy 启动", "version", version, "commit", commit)
+
 	if err := a.reload(); err != nil {
 		return err
 	}
