@@ -90,14 +90,25 @@ if [ "$(id -u)" -ne 0 ] && [ ! -w "$BIN_DIR" ]; then
 fi
 
 # ---------- 2. 下载通道：直连优先，不通再走加速镜像 ----------
-# 空串代表直连。之所以直连优先，是因为镜像有缓存，
-# 刚发布的版本可能还拉不到，会静默装成旧的。
-CANDIDATES=("")
+# 直连优先是因为镜像有缓存，刚发布的版本可能还拉不到，会静默装成旧的。
+#
+# 用字面量 "direct" 而不是空串表示直连：空串会和「还没探到可用通道」撞车，
+# 使 [ -n "$CH" ] 把直连误判成无通道 —— MIRROR=direct 时表现为必定失败。
+CANDIDATES=("direct")
 case "$MIRROR" in
     auto)            for m in $MIRROR_LIST; do CANDIDATES+=("$m"); done ;;
     direct|none|off) ;;
     *)               CANDIDATES+=("$MIRROR") ;;
 esac
+
+chan_prefix() { [ "$1" = "direct" ] && printf '' || printf '%s' "$1"; }
+chan_label() {
+    case "$1" in
+        direct) printf '直连' ;;
+        "")     printf '未探到可用通道' ;;
+        *)      printf '%s' "$1" ;;
+    esac
+}
 
 # ---------- 3. 解析版本号 ----------
 # 走 /releases/latest 的 302 跳转拿 tag，而不是 GitHub API：
@@ -110,18 +121,18 @@ resolve_latest() {
     for m in "${CANDIDATES[@]}"; do
         if [ "$DL" = "curl" ]; then
             out=$(curl -fsSLI -o /dev/null --max-time 15 -w '%{url_effective}' \
-                "${m}https://github.com/$REPO/releases/latest" 2>/dev/null || true)
+                "$(chan_prefix "$m")https://github.com/$REPO/releases/latest" 2>/dev/null || true)
             out=$(printf '%s' "$out" | sed -n 's|.*/tag/||p' | head -1)
         else
             out=$(wget -qS --spider --max-redirect=10 \
-                "${m}https://github.com/$REPO/releases/latest" 2>&1 |
+                "$(chan_prefix "$m")https://github.com/$REPO/releases/latest" 2>&1 |
                 sed -n 's|.*[Ll]ocation: .*/tag/\([^[:space:]]*\).*|\1|p' | tail -1 || true)
         fi
         if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
     done
     # 退回 API（有些环境 HEAD 被拦，但 GET 正常）
     for m in "${CANDIDATES[@]}"; do
-        if dl "${m}https://api.github.com/repos/$REPO/releases/latest" "$TMPTAG/rel" 15; then
+        if dl "$(chan_prefix "$m")https://api.github.com/repos/$REPO/releases/latest" "$TMPTAG/rel" 15; then
             out=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMPTAG/rel" | head -1)
             if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
         fi
@@ -150,11 +161,10 @@ SUMS="SHA256SUMS-$ARCH.txt"
 # 拿校验和文件做探针：只有几十字节，秒级就能判断这条路通不通。
 CH=""
 for m in "${CANDIDATES[@]}"; do
-    if dl "${m}${BASE}/${SUMS}" "$TMP/SHA256SUMS.txt" 8 \
+    if dl "$(chan_prefix "$m")${BASE}/${SUMS}" "$TMP/SHA256SUMS.txt" 8 \
         && grep -qE '^[0-9a-f]{64}' "$TMP/SHA256SUMS.txt" 2>/dev/null; then
         CH="$m"
-        if [ -z "$m" ]; then ok "下载通道：直连 GitHub"
-        else ok "下载通道：加速镜像 $m"; fi
+        ok "下载通道：$(chan_label "$m")"
         break
     fi
 done
@@ -165,19 +175,19 @@ fi
 # ---------- 5. 下载主包 ----------
 # 直连给短超时：93 字节的校验和能秒下，不代表 7MB 的包也下得动。
 # 与其让用户干等一分半再回退镜像，不如 35 秒就切过去。
-pkg_timeout() { if [ -z "$1" ]; then echo 35; else echo 90; fi; }
+pkg_timeout() { if [ "$1" = "direct" ]; then echo 35; else echo 90; fi; }
 
-info "下载 $PKG（通道：${CH:-直连}）"
-if [ -n "$CH" ] && dl "${CH}${BASE}/${PKG}" "$TMP/$PKG" "$(pkg_timeout "$CH")" && [ -s "$TMP/$PKG" ]; then
+info "下载 $PKG（通道：$(chan_label "$CH")）"
+if [ -n "$CH" ] && dl "$(chan_prefix "$CH")${BASE}/${PKG}" "$TMP/$PKG" "$(pkg_timeout "$CH")" \
+    && [ -s "$TMP/$PKG" ]; then
     :
 else
-    warn "通道 ${CH:-直连} 下载失败或过慢，换下一个通道重试"
+    if [ -n "$CH" ]; then warn "通道 $(chan_label "$CH") 下载失败或过慢，换下一个通道重试"; fi
     GOT=0
     for m in "${CANDIDATES[@]}"; do
-        [ "$m" = "$CH" ] && continue
-        label="${m:-直连}"
-        if dl "${m}${BASE}/${PKG}" "$TMP/$PKG" "$(pkg_timeout "$m")" && [ -s "$TMP/$PKG" ]; then
-            CH="$m"; GOT=1; ok "改用 $label 成功"; break
+        if [ "$m" = "$CH" ]; then continue; fi
+        if dl "$(chan_prefix "$m")${BASE}/${PKG}" "$TMP/$PKG" "$(pkg_timeout "$m")" && [ -s "$TMP/$PKG" ]; then
+            CH="$m"; GOT=1; ok "改用 $(chan_label "$m") 成功"; break
         fi
     done
     [ "$GOT" = "1" ] || die "所有通道都下载失败。检查版本号是否存在，或手动指定 MIRROR=..."
@@ -188,15 +198,14 @@ ok "下载完成（$(du -h "$TMP/$PKG" 2>/dev/null | cut -f1)）"
 if [ -n "$CH" ] && [ -f "$TMP/SHA256SUMS.txt" ] && command -v sha256sum >/dev/null 2>&1; then
     if (cd "$TMP" && sha256sum -c --ignore-missing SHA256SUMS.txt) >/dev/null 2>&1; then
         ok "校验和匹配"
+    elif [ "$CH" = "direct" ]; then
+        die "校验和不匹配（直连获取）。文件可能在传输中损坏，重跑一次；若仍失败请提 issue"
     else
-        # 镜像缓存了旧版本时哈希会对不上，这是最容易被误判成「文件损坏」的情况
-        if [ -n "$CH" ]; then
-            die "校验和不匹配。当前走的是加速镜像 ${CH}，多半是它还缓存着旧版本（或下载被截断）：
+        # 镜像缓存了旧版本时哈希会对不上，最容易被误判成「文件损坏」，所以单列一条
+        die "校验和不匹配。当前走的是加速镜像 $(chan_label "$CH")，多半是它缓存着旧版本（或下载被截断）：
      换直连重试：curl -fsSL .../install.sh | sudo MIRROR=direct bash
      换个镜像：  curl -fsSL .../install.sh | sudo MIRROR=https://gh-proxy.com/ bash
      指定版本：  curl -fsSL .../install.sh | sudo VERSION=$VERSION bash"
-        fi
-        die "校验和不匹配，文件可能已被替换，已中止安装"
     fi
 else
     warn "没有校验和文件，跳过完整性校验"
