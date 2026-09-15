@@ -105,14 +105,111 @@ curl -X POST http://127.0.0.1:9080/_goproxy/reload
 
 ## 管理端点
 
-| 路径 | 说明 |
+默认只监听 `127.0.0.1:9080`（`admin_addr` 可改），**只有 API，没有界面**，
+所以直接浏览器打开根路径只会看到几行纯文本。
+
+| 路径 | 方法 | 说明 |
+|---|---|---|
+| `/healthz` | GET | 存活探针 |
+| `/readyz` | GET | 就绪探针（路由表未加载时 503） |
+| `/metrics` | GET | Prometheus 文本格式指标 |
+| `/_goproxy/routes` | GET | 路由列表，带实时观测值；响应带 `ETag` |
+| `/_goproxy/routes` | POST | 新建路由，`id` 可省略（自动生成 `rt-xxxxxx`） |
+| `/_goproxy/routes/{id}` | GET | 单条路由 |
+| `/_goproxy/routes/{id}` | PUT | 全量替换（未提到的字段回默认值） |
+| `/_goproxy/routes/{id}` | PATCH | 局部更新，启停路由就用它 |
+| `/_goproxy/routes/{id}` | DELETE | 删除 |
+| `/_goproxy/ports` | GET | 当前实际监听的端口 |
+| `/_goproxy/config` | GET | 全局配置（**不回传 `admin_token` 明文**） |
+| `/_goproxy/config` | PATCH | 改 `default_ports` / `access_log` / `trusted_proxies` / `admin_token` |
+| `/_goproxy/reload` | POST | 手动触发重载 |
+
+### 认证
+
+管理接口能改路由，等于能改流量走向，**不能裸奔**。
+
+| 来源 | 要求 |
 |---|---|
-| `GET /healthz` | 存活探针 |
-| `GET /readyz` | 就绪探针（路由表未加载时返回 503） |
-| `GET /metrics` | Prometheus 文本格式指标 |
-| `GET /_goproxy/routes` | 当前生效的路由表 |
-| `GET /_goproxy/ports` | 当前实际监听的端口 |
-| `POST /_goproxy/reload` | 手动触发重载 |
+| 回环地址（`127.0.0.1` / `::1`） | 免认证 |
+| 其它地址 | 必须 `Authorization: Bearer <admin_token>` |
+
+`admin_addr` 监听了非回环地址但没配 `admin_token` 时，**所有外部请求一律 403** ——
+宁可打不开，也不能让人随便改配置。
+
+> 判断来源只认 `RemoteAddr`。`X-Forwarded-For` 是客户端随手就能写的头，
+> 拿它判断「是不是本机」等于把认证决定权交给攻击者。这条有单测和端到端验证盯着。
+
+### 用法
+
+```bash
+A=http://127.0.0.1:9080
+
+# 看路由（含熔断状态、请求数、在途数等实时值）
+curl -s $A/_goproxy/routes | jq .
+
+# 新建：同一个 IP 再开一个端口指向别的后端
+curl -s -X POST $A/_goproxy/routes -d '{
+  "id": "svc-e", "name": "服务E",
+  "listen_port": 8090, "path_prefix": "/",
+  "target": "http://127.0.0.1:9005"
+}'
+# → 端口 8090 立刻开始监听，不用重启也不用改启动参数
+
+# 停用 / 启用（PATCH 只覆盖你写了的字段）
+curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"enabled": false}'
+curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"enabled": true}'
+
+# 改限流，其它字段原样保留
+curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"rate_limit": {"rps": 20, "burst": 40}}'
+
+# 清掉某项嵌套配置：显式传 null
+curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"rate_limit": null}'
+
+# 删除
+curl -s -X DELETE $A/_goproxy/routes/svc-e
+```
+
+管理端口开到外网时：
+
+```bash
+# config.json 里设置 admin_token 后
+curl -s -H "Authorization: Bearer $TOKEN" http://10.0.0.5:9080/_goproxy/routes
+```
+
+### 并发安全：ETag / If-Match
+
+两个浏览器标签同时编辑时，后保存的会覆盖前一个的改动（lost update）。
+`GET /_goproxy/routes` 和 `GET /_goproxy/config` 都会返回 `ETag`，
+写请求带上 `If-Match` 即可让服务端把过期写拒掉：
+
+```bash
+ETAG=$(curl -sI $A/_goproxy/routes | tr -d '\r' | awk '/^Etag:/ {print $2}')
+
+curl -s -X POST $A/_goproxy/routes \
+  -H "If-Match: $ETAG" \
+  -d '{"id":"new","listen_port":8091,"target":"http://127.0.0.1:9006"}'
+# 若期间已有别人改过配置 → 409 revision_mismatch
+```
+
+不传 `If-Match` 就退化成「后写覆盖」（单向覆盖，仍是原子的，不会写出半个文件）。
+
+### 写接口的几个行为约定
+
+- **磁盘上的 `config.json` 是唯一真源**。每次写都是「读文件 → 改 → 校验 → 原子写回 → 热重载」，
+  所以手工编辑过的配置不会被界面的一次保存悄悄覆盖。
+- **校验不过就不落盘**。非法 `target`、端口与管理端口冲突这类错误一律 400，
+  文件一个字节都不会动。
+- **写回是原子的**：先写 `<path>.tmp` 并 `fsync`，再 `rename` 覆盖；旧内容备份到 `<path>.bak`。
+  直接截断重写的话，写到一半断电就会留下一个解析不了的配置。
+- **热重载失败会自动回滚**，不会把进程留在一个读不了配置的状态。
+- **不写「默认值」**：配置里没写 `admin_addr` 时，写回也不会替它填上默认地址 ——
+  否则一次保存就会把原本关闭的管理端口悄悄打开。
+- **`admin_addr` 不能通过接口改**（启动期就绑定了套接字，改了不生效），改它请编辑文件后重启；
+  显式返回 400 而不是假装成功。
+- **`admin_addr` 写 `off` / `none` / `disabled` 可彻底关闭管理端口**；留空表示用默认值。
+
+> **破坏性变更**：`GET /_goproxy/routes` 现在返回**完整路由配置**（加上 `live` 实时字段），
+> 不再是早先那个只有几个计算字段的精简形状。编辑界面需要拿到可回写的完整字段。
 
 ```bash
 curl -s http://127.0.0.1:9080/_goproxy/routes | jq .
@@ -255,9 +352,11 @@ EOF
 | 不做 | 原因 / 何时做 |
 |---|---|
 | TLS / ACME 证书 | M4。且自定义端口拿不到自动证书（HTTP-01 固定走 80），只能跑明文或挂手动证书 |
-| Web 管理界面 | M6。现在只有管理 API |
+| Web 管理界面 | 接口已经齐了（含写接口），前端在做。现在只能用 curl / 脚本操作 |
+| 聚合统计接口、SSE 实时日志 | 待做。当前 `/metrics` 是 Prometheus 文本，前端要自己解析；访问日志只写 slog，内存里不留存 |
 | SQLite | M1 正式版。现在用 JSON 文件，`loadConfig` 换掉即可，下游不动 |
-| 多实例共享状态 | 限流和熔断都是进程内内存，多副本各算各的。预留了接口，后续换 Redis |
+| 路由变更审计 | 写接口目前不记录「谁在什么时候改了哪条路由」。多人共用管理端时会需要 |
+| 多实例共享状态 | 限流和熔断都是进程内内存，多副本各算各的。另外**写配置也是单机行为**，两个实例各写各的会互相覆盖，多副本场景需要换成共享存储 + 一致性协议。预留了接口，后续换 Redis / SQLite |
 
 ---
 
@@ -419,8 +518,9 @@ docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:
 
 | 文件 | 职责 |
 |---|---|
-| `main.go` | 组装、请求入口、管理 API、配置热重载、优雅停机 |
-| `config.go` | 配置结构与校验 |
+| `main.go` | 组装、请求入口、管理端点注册、配置热重载、优雅停机 |
+| `config.go` | 配置结构与校验、配置文件的原子写入与 revision |
+| `admin_api.go` | 管理接口：认证闸门、路由 CRUD、全局配置读写 |
 | `router.go` | 三级匹配表（端口 → host → path），不可变快照 |
 | `proxy.go` | ReverseProxy 封装：连接池、超时、XFF、真实 IP 解析 |
 | `listener.go` | 多端口监听管理，按路由表变化自动增删 |
@@ -429,9 +529,10 @@ docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:
 | `acl.go` | IP 黑白名单（CIDR） |
 | `auth.go` | Basic（bcrypt + 校验缓存）与 JWT 认证器 |
 | `jwt.go` | JWT 校验：HS256/384/512、RS256，带算法白名单 |
-| `metrics.go` | Prometheus 指标 |
+| `metrics.go` | Prometheus 指标 + 按路由的实时观测值 |
 | `router_test.go` | 路由匹配单测 |
 | `governance_test.go` | 熔断、ACL、JWT、Basic 单测 |
+| `admin_api_test.go` | 管理接口单测：CRUD、并发写冲突、认证、坏配置不落盘 |
 
 ```bash
 go test ./...   # 跑测试
@@ -442,7 +543,8 @@ go vet ./...    # 静态检查
 
 ## 下一步
 
-demo 已完成到 M3。接下来按 M4 → M7 推进：TLS/ACME → 可观测性补全 → SQLite + Web 管理界面。
+已完成到 M3，外加管理写接口（原本属于 M6 的后端部分）。
+接下来：**React 管理台前端**（消费这些接口）→ 聚合统计接口与 SSE 实时日志 → TLS/ACME。
 
 > 完整的架构方案、数据模型与里程碑计划不在这个仓库里。
 

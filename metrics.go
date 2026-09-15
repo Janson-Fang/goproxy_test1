@@ -132,6 +132,47 @@ func (m *Metrics) IncReload() {
 	m.reloadTotal++
 }
 
+// RouteLive 是单条路由的实时观测值快照。
+type RouteLive struct {
+	Requests    int64            `json:"requests_total"`
+	ByStatus    map[string]int64 `json:"by_status,omitempty"`
+	RateLimited int64            `json:"rate_limited_total"`
+	Rejected    int64            `json:"rejected_total"`
+	InFlight    int64            `json:"in_flight"`
+	AvgMs       float64          `json:"avg_ms"`
+}
+
+// Live 汇总单条路由的观测值。route 传空串拿到的是「未匹配任何路由」的汇总。
+func (m *Metrics) Live(route string) RouteLive {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	lv := RouteLive{
+		InFlight:    m.inFly[route],
+		RateLimited: m.limited[route],
+	}
+	for k, v := range m.reqs {
+		if k.route != route {
+			continue
+		}
+		lv.Requests += v
+		if lv.ByStatus == nil {
+			lv.ByStatus = make(map[string]int64, 4)
+		}
+		lv.ByStatus[strconv.Itoa(k.status)] = v
+	}
+	prefix := route + "|"
+	for k, v := range m.rejected {
+		if strings.HasPrefix(k, prefix) {
+			lv.Rejected += v
+		}
+	}
+	if n := m.count[route]; n > 0 {
+		lv.AvgMs = m.sum[route] / float64(n) * 1000
+	}
+	return lv
+}
+
 // Render 输出 Prometheus 文本格式（可被直接抓取）。
 func (m *Metrics) Render() string {
 	m.mu.Lock()

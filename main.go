@@ -30,6 +30,15 @@ type App struct {
 	lastMod   time.Time
 	lastSize  int64
 
+	// adminToken 管理接口令牌。只从回环访问时不需要，非回环必须带。
+	adminToken string
+
+	// writeMu 串行化「读配置 → 改 → 写回 → 热重载」这一个事务，
+	// 防止两个并发写各自读到旧文件、互相覆盖（经典 lost update）。
+	// 单独一把锁而不复用 mu：写事务会先拿 writeMu，再在 reload() 里拿 mu,
+	// 加锁顺序固定单向，不会成环。
+	writeMu sync.Mutex
+
 	accessLog atomic.Bool
 }
 
@@ -83,7 +92,13 @@ func (a *App) reload() error {
 	}
 
 	a.trusted = nets
-	a.adminAddr = cfg.AdminAddr
+	// 显式关掉管理端口时存空串，Run() 里判空即可，不用再判断一次哨兵
+	if cfg.adminEnabled() {
+		a.adminAddr = cfg.AdminAddr
+	} else {
+		a.adminAddr = ""
+	}
+	a.adminToken = cfg.AdminToken
 	a.accessLog.Store(cfg.AccessLog)
 	a.table.Store(tbl)
 
@@ -93,10 +108,14 @@ func (a *App) reload() error {
 	}
 	a.metrics.SetRouteCount(len(tbl.routes))
 	a.metrics.IncReload()
+	adminShown := a.adminAddr
+	if adminShown == "" {
+		adminShown = "(已关闭)"
+	}
 	slog.Info("配置已生效",
 		"routes", len(tbl.routes),
 		"ports", tbl.ListenPorts(),
-		"admin", cfg.AdminAddr)
+		"admin", adminShown)
 	return nil
 }
 
@@ -238,49 +257,15 @@ func (a *App) adminHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		io.WriteString(w, a.metrics.Render())
 	})
-	mux.HandleFunc("/_goproxy/routes", func(w http.ResponseWriter, r *http.Request) {
-		tbl := a.table.Load()
-		type item struct {
-			ID         string      `json:"id"`
-			Name       string      `json:"name"`
-			ListenPort int         `json:"listen_port"`
-			Host       string      `json:"host"`
-			PathPrefix string      `json:"path_prefix"`
-			Target     string      `json:"target"`
-			RateRPS    float64     `json:"rate_rps,omitempty"`
-			Auth       string      `json:"auth,omitempty"`
-			ACL        string      `json:"acl,omitempty"`
-			Circuit    *CBSnapshot `json:"circuit_breaker,omitempty"`
-		}
-		out := []item{}
-		if tbl != nil {
-			for _, rt := range tbl.routes {
-				it := item{
-					ID:         rt.ID,
-					Name:       rt.Name,
-					ListenPort: rt.ListenPort,
-					Host:       rt.Host,
-					PathPrefix: rt.PathPrefix,
-					Target:     rt.Target,
-				}
-				if rt.limiter != nil {
-					it.RateRPS = rt.limiter.rate
-				}
-				if rt.auth != nil {
-					it.Auth = rt.auth.Kind()
-				}
-				if rt.acl != nil {
-					it.ACL = string(rt.acl.Mode)
-				}
-				if rt.cb != nil {
-					snap := rt.cb.Snapshot()
-					it.Circuit = &snap
-				}
-				out = append(out, it)
-			}
-		}
-		writeJSON(w, http.StatusOK, out)
-	})
+	// 路由与全局配置的读写接口（实现见 admin_api.go）
+	mux.HandleFunc("GET /_goproxy/routes", a.handleListRoutes)
+	mux.HandleFunc("POST /_goproxy/routes", a.handleCreateRoute)
+	mux.HandleFunc("GET /_goproxy/routes/{id}", a.handleGetRoute)
+	mux.HandleFunc("PUT /_goproxy/routes/{id}", a.handleReplaceRoute)
+	mux.HandleFunc("PATCH /_goproxy/routes/{id}", a.handlePatchRoute)
+	mux.HandleFunc("DELETE /_goproxy/routes/{id}", a.handleDeleteRoute)
+	mux.HandleFunc("GET /_goproxy/config", a.handleGetConfig)
+	mux.HandleFunc("PATCH /_goproxy/config", a.handlePatchConfig)
 	mux.HandleFunc("/_goproxy/ports", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.listeners.Ports())
 	})
@@ -297,12 +282,16 @@ func (a *App) adminHandler() http.Handler {
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "goproxy admin\n  /healthz  /readyz  /metrics\n"+
-			"  /_goproxy/routes  当前路由表\n"+
-			"  /_goproxy/ports   当前监听端口\n"+
-			"  /_goproxy/reload  POST 手动重载配置\n")
+		io.WriteString(w, "goproxy admin\n"+
+			"  /healthz  /readyz  /metrics\n"+
+			"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
+			"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
+			"  /_goproxy/config          GET / PATCH 全局配置\n"+
+			"  /_goproxy/ports           当前监听端口\n"+
+			"  /_goproxy/reload          POST 手动重载配置\n")
 	})
-	return mux
+	// 非回环访问必须带 admin_token，见 admin_api.go 的 adminGuard
+	return a.adminGuard(mux)
 }
 
 // watchLoop 轮询配置文件 mtime，变了就热重载。
