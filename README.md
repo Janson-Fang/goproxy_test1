@@ -603,6 +603,50 @@ tar -xzf goproxy.tar.gz && sudo install -m 0755 goproxy /usr/local/bin/goproxy
 docker run --rm ghcr.io/janson-fang/goproxy_test1:main -version   # 注意镜像名全小写
 ```
 
+### 升级
+
+**再跑一遍同一条命令就是升级**，没有单独的 upgrade 子命令：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh | sudo bash
+```
+
+脚本会识别出「已经装过」，然后按下面的规则处理：
+
+| 东西 | 升级时怎么处理 |
+|---|---|
+| `$BIN_DIR/goproxy` | **就地替换**。先写成 `goproxy.new` 再 `mv` 覆盖（rename 是原子的），所以不会出现「路径短暂不存在」的窗口；服务正在运行也没问题 —— 运行中的进程继续持有旧 inode 跑完，新起的进程才拿到新文件，不会 `Text file busy` |
+| `$BIN_DIR/goproxy.old` | **新增**。升级前的二进制自动留一份，出问题能一键回滚 |
+| `config.json` | **不动**。新版本的示例另存为 `config.json.example`，方便对照新增字段 |
+| systemd 单元 | **先备份再重写**（`goproxy.service.bak`）。因为 `ExecStart` 里带着本次的 `BIN_DIR` / `CONFIG_DIR`，必须跟着更新；但你手动加过的 `Environment=`、`LimitNOFILE=` 之类会从 `.bak` 里找回来 |
+| 服务 | **原来在跑就自动重启**，并轮询确认真的起来了；原来没跑就保持不启动（可能是你自己停的） |
+
+> 最后一条是最容易踩的：**光替换文件不重启，进程还在跑旧代码**，看着升级成功了其实没生效。
+> 脚本默认会自动重启，不想让它动服务就加 `--no-restart`。
+
+回滚到上一个版本：
+
+```bash
+sudo cp -p /usr/local/bin/goproxy.old /usr/local/bin/goproxy
+sudo systemctl restart goproxy
+```
+
+确认升级后的版本：
+
+```bash
+/usr/local/bin/goproxy -version
+systemctl show -p ExecMainStartTimestamp goproxy   # 重启时间应该是刚刚
+```
+
+如果服务重启后没起来，脚本会**以非 0 退出**并直接把回滚命令和 `journalctl` 查看方式打出来。
+
+可覆盖的环境变量（除 `MIRROR` / `VERSION` / `BIN_DIR` / `CONFIG_DIR` 外）：
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `SYSTEMD_DIR` | `/etc/systemd/system` | 单元文件放哪 |
+| `STATE_DIR` | `/var/lib/goproxy` | 单元里的 `WorkingDirectory` / `ReadWritePaths` |
+
 ---
 
 ## 手动编译部署

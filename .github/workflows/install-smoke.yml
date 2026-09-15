@@ -116,3 +116,149 @@ jobs:
           echo "--- 启动日志 ---"
           head -5 "$RUNNER_TEMP/gp.log"
           echo "冒烟测试 OK"
+
+  # 「重跑 install.sh 能不能直接升级」这件事必须真在 Linux 上验，
+  # 因为要覆盖一个**正在运行**的 ELF 二进制 —— 这是 ETXTBSY 的高发场景。
+  upgrade:
+    name: 升级自检（就地覆盖运行中的二进制）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 首次安装
+        env:
+          MIRROR: direct
+          VERSION: v0.3.0
+          BIN_DIR: ${{ runner.temp }}/ubin
+          CONFIG_DIR: ${{ runner.temp }}/uconf
+        run: |
+          set -e
+          mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+          bash install.sh --no-service
+          test -x "$BIN_DIR/goproxy"
+
+      - name: 备份基线，并把二进制跑起来
+        env:
+          BIN_DIR: ${{ runner.temp }}/ubin
+          CONFIG_DIR: ${{ runner.temp }}/uconf
+        run: |
+          set -e
+          # 用自己的配置，稍后要断言升级一个字都没动它
+          cat > "$CONFIG_DIR/config.json" <<'CFG'
+          {
+            "admin_addr": "127.0.0.1:19080",
+            "routes": [
+              { "id": "upgrade", "listen_port": 18080, "path_prefix": "/",
+                "target": "http://127.0.0.1:19001" }
+            ]
+          }
+          CFG
+          sha256sum "$CONFIG_DIR/config.json" > "$RUNNER_TEMP/cfg.sha"
+          cp "$BIN_DIR/goproxy" "$RUNNER_TEMP/before.bin"
+
+          # 关键：让这个二进制真的处于「正在执行」状态。
+          nohup "$BIN_DIR/goproxy" -c "$CONFIG_DIR/config.json" -text-log \
+                > "$RUNNER_TEMP/up.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/up.pid"
+          for _ in $(seq 1 20); do
+            curl -fsS --max-time 2 http://127.0.0.1:19080/_goproxy/ports >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          ps -p "$(cat "$RUNNER_TEMP/up.pid")" -o pid,cmd
+          echo "旧版本已经跑起来了"
+
+      - name: 重跑安装脚本完成升级
+        env:
+          MIRROR: direct
+          VERSION: v0.3.0
+          BIN_DIR: ${{ runner.temp }}/ubin
+          CONFIG_DIR: ${{ runner.temp }}/uconf
+        run: |
+          # 这里唯一的硬断言就是「退出码为 0」。
+          # 如果替换运行中的二进制踩到 Text file busy，脚本会在这里直接挂掉。
+          bash install.sh --no-service
+          echo "重跑退出码 0 —— 覆盖运行中的二进制没有 ETXTBSY"
+
+      - name: 断言升级结果
+        env:
+          BIN_DIR: ${{ runner.temp }}/ubin
+          CONFIG_DIR: ${{ runner.temp }}/uconf
+        run: |
+          set -e
+
+          echo "--- 旧二进制已备份，可用于回滚 ---"
+          test -x "$BIN_DIR/goproxy.old" || { echo "没有生成 goproxy.old"; exit 1; }
+          cmp "$BIN_DIR/goproxy.old" "$RUNNER_TEMP/before.bin" \
+            || { echo "goproxy.old 与升级前的二进制不一致"; exit 1; }
+
+          echo "--- 已有 config.json 字节级未变 ---"
+          sha256sum -c "$RUNNER_TEMP/cfg.sha"
+          grep -q upgrade "$CONFIG_DIR/config.json"
+
+          echo "--- 新示例另存为 .example，没有顶掉用户配置 ---"
+          test -f "$CONFIG_DIR/config.json.example"
+
+          echo "--- 升级前启动的进程仍然活着（rename 不影响运行中的旧 inode）---"
+          ps -p "$(cat "$RUNNER_TEMP/up.pid")" >/dev/null \
+            || { echo "升级过程把运行中的进程弄死了"; exit 1; }
+
+          kill "$(cat "$RUNNER_TEMP/up.pid")" 2>/dev/null || true
+          echo "升级自检 OK"
+
+  # 单元文件在升级时是会被覆盖的，用户往里加的自定义项必须先备份下来。
+  # 这里把 SYSTEMD_DIR / STATE_DIR 指到临时目录，就能在没有 root 的 runner 上验这条路径。
+  unit-file:
+    name: 升级自检（systemd 单元先备份再重写）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 预置一份被用户改过的单元文件
+        env:
+          SYSTEMD_DIR: ${{ runner.temp }}/units
+        run: |
+          set -e
+          mkdir -p "$SYSTEMD_DIR"
+          cat > "$SYSTEMD_DIR/goproxy.service" <<'UNIT'
+          [Service]
+          Environment=GOPROXY_EXTRA=1
+          LimitNOFILE=65535
+          UNIT
+          grep -q LimitNOFILE "$SYSTEMD_DIR/goproxy.service"
+
+      - name: 跑安装脚本（走 systemd 分支）
+        env:
+          MIRROR: direct
+          VERSION: v0.3.0
+          BIN_DIR: ${{ runner.temp }}/sbin
+          CONFIG_DIR: ${{ runner.temp }}/sconf
+          SYSTEMD_DIR: ${{ runner.temp }}/units
+          STATE_DIR: ${{ runner.temp }}/sstate
+        run: |
+          set -e
+          mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+          # 不带 --no-service，让脚本去写单元文件
+          bash install.sh
+
+      - name: 断言自定义项被备份、新单元指向本次路径
+        env:
+          SYSTEMD_DIR: ${{ runner.temp }}/units
+          BIN_DIR: ${{ runner.temp }}/sbin
+        run: |
+          set -e
+          test -x "$BIN_DIR/goproxy"
+
+          echo "--- 备份里保住了用户自定义项 ---"
+          test -f "$SYSTEMD_DIR/goproxy.service.bak" || { echo "单元文件没有被备份"; exit 1; }
+          grep -q LimitNOFILE "$SYSTEMD_DIR/goproxy.service.bak"
+          grep -q GOPROXY_EXTRA "$SYSTEMD_DIR/goproxy.service.bak"
+
+          echo "--- 新单元指向本次的 BIN_DIR ---"
+          grep -q "$BIN_DIR/goproxy" "$SYSTEMD_DIR/goproxy.service"
+
+          if grep -q LimitNOFILE "$SYSTEMD_DIR/goproxy.service"; then
+            echo "新单元里残留了旧自定义项，不符合预期"; exit 1
+          fi
+
+          echo "--- 新单元内容 ---"
+          cat "$SYSTEMD_DIR/goproxy.service"

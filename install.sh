@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# goproxy 一键安装脚本（Linux）
+# goproxy 一键安装 / 升级脚本（Linux）
 #
 # 最简用法（装 systemd 服务）：
 #   curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh | sudo bash
+#
+# 升级：重跑同一条命令即可 —— 二进制就地替换（服务正在跑也安全），
+#       config.json 保持不动，systemd 单元先备份再重写，
+#       原本在运行的服务会自动重启，并确认真的起来了。
 #
 # 指定版本：
 #   curl -fsSL .../install.sh | sudo VERSION=v0.3.0 bash
@@ -24,20 +28,31 @@ REPO="${REPO:-Janson-Fang/goproxy_test1}"
 VERSION="${VERSION:-latest}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/goproxy}"
+# 单元文件目录做成可覆盖的：一来某些发行版不放在这里，
+# 二来 CI 里要能指到临时目录去验证「先备份再重写」这条路径。
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+# 运行态目录（systemd 单元里的 WorkingDirectory / ReadWritePaths）。
+# 同样可覆盖，否则非 root 环境跑服务分支时会卡在 mkdir /var/lib/goproxy。
+STATE_DIR="${STATE_DIR:-/var/lib/goproxy}"
 MIRROR="${MIRROR:-auto}"
 # 实测（2026-09，国内直连 GitHub 下不动 7MB 包的环境）：
 #   gh-proxy.com  4.7s  ✓   ghfast.top  12.0s  ✓   ghproxy.net  大文件不可用
 # 顺序按实测速度排，全部只做传输加速，内容仍以官方 sha256 校验为准。
 MIRROR_LIST="${MIRROR_LIST:-https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/}"
 WITH_SERVICE=1
+RESTART=1
 
+# 只取脚本头部的注释块当帮助信息。
+# 之前写的是 2,24p —— 会把 set / REPO= / VERSION= 这些内部语句一起打出来。
 usage() {
-    sed -n '2,24p' "${BASH_SOURCE[0]:-}" 2>/dev/null || echo "用法: install.sh [--no-service] [--version vX.Y.Z]"
+    sed -n '2,23p' "${BASH_SOURCE[0]:-}" 2>/dev/null ||
+        echo "用法: install.sh [--no-service] [--no-restart] [--version vX.Y.Z]"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-service) WITH_SERVICE=0 ;;
+        --no-restart) RESTART=0 ;;
         --version)    VERSION="${2:?--version 后面要跟版本号}"; shift ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "未知参数: $1（--help 看用法）" >&2; exit 1 ;;
@@ -214,11 +229,54 @@ fi
 tar -xzf "$TMP/$PKG" -C "$TMP" || die "解压失败"
 [ -f "$TMP/goproxy" ] || die "包里没有 goproxy 二进制"
 
-# ---------- 7. 装二进制 ----------
+# ---------- 7. 装二进制（支持原地升级） ----------
 $SUDO install -d "$BIN_DIR"
-$SUDO install -m 0755 "$TMP/goproxy" "$BIN_DIR/goproxy"
+
+# -version 打印的是 "goproxy <version> (commit <commit>)"，取第二个字段
+OLD_VER=""
+if [ -x "$BIN_DIR/goproxy" ]; then
+    OLD_VER=$("$BIN_DIR/goproxy" -version 2>/dev/null | sed -n 's/^goproxy \([^ ]*\).*/\1/p' | head -1)
+    [ -n "$OLD_VER" ] || OLD_VER="unknown"
+    if [ "$OLD_VER" = "$VERSION" ]; then
+        info "已安装 $OLD_VER，重装同一版本"
+    else
+        info "已安装 $OLD_VER，升级到 $VERSION"
+    fi
+    # 留一份旧二进制以便回滚。config.json 一直有 .bak，二进制以前没有，
+    # 新版本起不来就只能重新下载，有个落点会舒服很多。
+    if $SUDO cp -p "$BIN_DIR/goproxy" "$BIN_DIR/goproxy.old" 2>/dev/null; then
+        ok "旧二进制已备份到 $BIN_DIR/goproxy.old"
+    else
+        warn "旧二进制备份失败（不影响本次升级，只是没法一键回滚）"
+    fi
+else
+    info "全新安装 $VERSION"
+fi
+
+# 先装成临时名、再 rename 覆盖：
+#   · rename 是原子的，不会出现「路径短暂不存在」的窗口 —— 这个窗口里
+#     如果服务刚好重启，systemd 会报 203/EXEC 找不到文件。
+#   · 服务正在运行时替换也不会 Text file busy：install 本身就会先 unlink 目标，
+#     加上 rename 之后，运行中的进程继续持有旧 inode 照常跑完，
+#     新起的进程才拿到新文件。
+$SUDO install -m 0755 "$TMP/goproxy" "$BIN_DIR/goproxy.new"
+$SUDO mv -f "$BIN_DIR/goproxy.new" "$BIN_DIR/goproxy"
 ok "已安装到 $BIN_DIR/goproxy"
-"$BIN_DIR/goproxy" -version
+
+# 装完立刻验一下新二进制跑不跑得起来。放到这里是为了在重启服务之前
+# 就暴露问题 —— 否则要等 systemd 重启失败才回头查，回滚窗口也更大。
+if ! VER_OUT=$("$BIN_DIR/goproxy" -version 2>&1); then
+    warn "新二进制执行失败：$VER_OUT"
+    if [ -x "$BIN_DIR/goproxy.old" ]; then
+        warn "回滚到上一个版本："
+        warn "  sudo cp -p $BIN_DIR/goproxy.old $BIN_DIR/goproxy"
+    else
+        warn "没有可回滚的备份（本次是全新安装）"
+    fi
+    exit 1
+fi
+printf '%s\n' "$VER_OUT"
+NEW_VER=$(printf '%s\n' "$VER_OUT" | sed -n 's/^goproxy \([^ ]*\).*/\1/p' | head -1)
 
 # ---------- 8. 配置文件 ----------
 $SUDO install -d "$CONFIG_DIR"
@@ -232,14 +290,36 @@ else
 fi
 
 # ---------- 9. systemd 服务 ----------
+SVC_WAS_ACTIVE=0
+SVC_RESTARTED=0
+UNIT="$SYSTEMD_DIR/goproxy.service"
+
 if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+    # 先记下服务当前是不是在跑，决定第 10 步要不要重启它。
+    # 不在跑就不去启动 —— 用户可能是特意停的（比如还在改配置）。
+    if systemctl is-active --quiet goproxy 2>/dev/null; then
+        SVC_WAS_ACTIVE=1
+    fi
+
     if ! id -u goproxy >/dev/null 2>&1; then
         $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin goproxy 2>/dev/null || true
     fi
-    $SUDO install -d /var/lib/goproxy
-    $SUDO chown goproxy:goproxy /var/lib/goproxy 2>/dev/null || true
+    $SUDO install -d "$STATE_DIR"
+    $SUDO chown goproxy:goproxy "$STATE_DIR" 2>/dev/null || true
+    $SUDO install -d "$SYSTEMD_DIR"
 
-    $SUDO tee /etc/systemd/system/goproxy.service >/dev/null <<EOF
+    # 单元文件是要覆盖的（ExecStart 里带着本次的 BIN_DIR / CONFIG_DIR）。
+    # 但有人会往里加 Environment=、LimitNOFILE= 之类的东西，
+    # 所以先备份一份，覆盖后还能对照把自定义项找回来。
+    if [ -f "$UNIT" ]; then
+        if $SUDO cp -p "$UNIT" "$UNIT.bak" 2>/dev/null; then
+            warn "$UNIT 已存在，已备份为 $UNIT.bak（有自定义项请从这里取回）"
+        else
+            warn "$UNIT 已存在但备份失败，覆盖后原有自定义项会丢"
+        fi
+    fi
+
+    $SUDO tee "$UNIT" >/dev/null <<EOF
 [Unit]
 Description=goproxy reverse proxy
 After=network.target
@@ -248,7 +328,7 @@ After=network.target
 Type=simple
 User=goproxy
 ExecStart=$BIN_DIR/goproxy -c $CONFIG_DIR/config.json
-WorkingDirectory=/var/lib/goproxy
+WorkingDirectory=$STATE_DIR
 Restart=always
 RestartSec=3
 
@@ -257,32 +337,81 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/goproxy
+ReadWritePaths=$STATE_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    $SUDO systemctl daemon-reload
-    ok "已写入 /etc/systemd/system/goproxy.service"
+
+    # 容器 / 非 systemd 环境里 daemon-reload 会失败，不该因此中断安装
+    $SUDO systemctl daemon-reload 2>/dev/null ||
+        warn "systemctl daemon-reload 失败（可能不在 systemd 环境），需要时请手动执行"
+    ok "已写入 $UNIT"
 fi
 
-# ---------- 10. 收尾 ----------
+# ---------- 10. 升级后重启 ----------
+# 这一步不做事的话，「重跑 install.sh」就只是把磁盘上的文件换了 ——
+# 运行中的进程继续跑旧代码，看起来升级成功其实没生效。
+if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1 && [ "$SVC_WAS_ACTIVE" = "1" ]; then
+    if [ "$RESTART" = "1" ]; then
+        info "服务原本在运行，重启以加载新版本"
+        $SUDO systemctl restart goproxy || true
+
+        # 等它真的起来。restart 返回 0 不等于进程活着：
+        # Type=simple 下进程起来后立刻挂掉，restart 一样算成功。
+        ST=0
+        i=0
+        while [ "$i" -lt 20 ]; do
+            if systemctl is-active --quiet goproxy 2>/dev/null; then ST=1; break; fi
+            i=$((i + 1))
+            sleep 0.5
+        done
+
+        if [ "$ST" = "1" ]; then
+            ok "服务已重启，确认正在运行"
+            SVC_RESTARTED=1
+        else
+            warn "服务重启后没能起来。回滚到上一个版本："
+            warn "  sudo cp -p $BIN_DIR/goproxy.old $BIN_DIR/goproxy && sudo systemctl restart goproxy"
+            warn "看日志定位： sudo journalctl -u goproxy -n 50 --no-pager"
+            exit 1
+        fi
+    else
+        warn "按要求跳过了重启（--no-restart）。服务仍在跑旧版本，记得手动执行："
+        warn "  sudo systemctl restart goproxy"
+    fi
+fi
+
+# ---------- 11. 收尾 ----------
 echo
-echo "安装完成。"
+if [ "$SVC_RESTARTED" = "1" ]; then
+    echo "升级完成：$OLD_VER -> $NEW_VER，服务已重启生效。"
+    echo "  回滚    sudo cp -p $BIN_DIR/goproxy.old $BIN_DIR/goproxy && sudo systemctl restart goproxy"
+else
+    echo "安装完成。"
+fi
 echo "  二进制    $BIN_DIR/goproxy"
 echo "  配置文件  $CONFIG_DIR/config.json"
+if [ -n "$OLD_VER" ]; then
+    echo "  旧二进制  $BIN_DIR/goproxy.old（回滚用）"
+fi
 echo
-echo "下一步："
-echo "  1. 改配置：把每条路由的 target 指向你自己的后端"
-echo "  2. 前台试跑：$BIN_DIR/goproxy -c $CONFIG_DIR/config.json（看有没有报错）"
-if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+if [ "$SVC_RESTARTED" = "1" ]; then
+    echo "看日志：sudo journalctl -u goproxy -f"
+    echo "看版本：$BIN_DIR/goproxy -version"
+elif [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+    echo "下一步："
+    echo "  1. 改配置：把每条路由的 target 指向你自己的后端"
+    echo "  2. 前台试跑：$BIN_DIR/goproxy -c $CONFIG_DIR/config.json（看有没有报错）"
     echo "  3. 正式启动：sudo systemctl enable --now goproxy"
     echo "     看日志：sudo journalctl -u goproxy -f"
 else
-    echo "  3. 后台运行：nohup $BIN_DIR/goproxy -c $CONFIG_DIR/config.json &"
+    echo "下一步："
+    echo "  1. 改配置：把每条路由的 target 指向你自己的后端"
+    echo "  2. 后台运行：nohup $BIN_DIR/goproxy -c $CONFIG_DIR/config.json &"
 fi
 echo
 echo "卸载："
 echo "  sudo systemctl disable --now goproxy 2>/dev/null"
-echo "  sudo rm -f $BIN_DIR/goproxy /etc/systemd/system/goproxy.service"
+echo "  sudo rm -f $BIN_DIR/goproxy $BIN_DIR/goproxy.old $UNIT"
 echo "  sudo rm -rf $CONFIG_DIR"
