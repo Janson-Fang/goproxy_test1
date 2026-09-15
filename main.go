@@ -24,8 +24,10 @@ type App struct {
 	metrics   *Metrics
 	table     atomic.Pointer[RouteTable]
 
+	// logs 是访问记录的内存环形缓冲，管理台的实时日志与 SSE 都读它。
+	logs *logBuffer
+
 	mu        sync.Mutex
-	trusted   []*net.IPNet
 	adminAddr string
 	lastMod   time.Time
 	lastSize  int64
@@ -52,6 +54,7 @@ func NewApp(cfgPath string) (*App, error) {
 		transport: newTransport(),
 		listeners: NewListenerManager(),
 		metrics:   NewMetrics(),
+		logs:      newLogBuffer(logRingSize),
 		lastMod:   st.ModTime(),
 		lastSize:  st.Size(),
 	}, nil
@@ -77,6 +80,8 @@ func (a *App) reload() error {
 	if err != nil {
 		return err
 	}
+	// 可信代理网段挂进快照。这里还没 Store，没有并发读者，不需要额外同步。
+	tbl.trusted = nets
 
 	// 释放已经不存在的路由上的限流器（它们各自跑着清理 goroutine）
 	if old != nil {
@@ -91,7 +96,6 @@ func (a *App) reload() error {
 		}
 	}
 
-	a.trusted = nets
 	// 显式关掉管理端口时存空串，Run() 里判空即可，不用再判断一次哨兵
 	if cfg.adminEnabled() {
 		a.adminAddr = cfg.AdminAddr
@@ -128,16 +132,36 @@ func (a *App) handler() http.Handler {
 			port = v
 		}
 
+		// 状态码在这一层统一记录：转发分支之外的 ACL / 限流 / 熔断 / 认证
+		// 也会提前返回，只有包住整个 handler 才能把它们的状态码一起拿到。
+		rec := newStatusRecorder(w)
+
 		tbl := a.table.Load()
+		var trusted []*net.IPNet
+		if tbl != nil {
+			trusted = tbl.trusted
+		}
+		ip := clientIP(r, trusted)
+
+		// 每次请求只记一条访问日志，所以收口在 defer 里，
+		// 而不是在下面 5 个 return 分支各写一遍（漏一处就少一类日志）。
+		var (
+			rt      *Route
+			blocked string
+		)
+		defer func() {
+			a.logAccess(r, port, rt, blocked, ip, rec.code, start)
+		}()
+
 		if tbl == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "路由表尚未就绪"})
+			writeJSON(rec, http.StatusServiceUnavailable, map[string]string{"error": "路由表尚未就绪"})
 			return
 		}
 
-		rt := tbl.Match(port, r.Host, r.URL.Path)
+		rt = tbl.Match(port, r.Host, r.URL.Path)
 		if rt == nil {
 			a.metrics.IncRequest("", http.StatusNotFound)
-			writeJSON(w, http.StatusNotFound, map[string]any{
+			writeJSON(rec, http.StatusNotFound, map[string]any{
 				"error": "no_route_matched",
 				"port":  port,
 				"host":  r.Host,
@@ -147,13 +171,12 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
-		ip := clientIP(r, a.trusted)
-
 		// 1) IP 黑白名单
 		if rt.acl != nil && !rt.acl.Allowed(ip) {
+			blocked = "acl"
 			a.metrics.IncRejected(rt.ID, "acl")
 			a.metrics.IncRequest(rt.ID, http.StatusForbidden)
-			writeJSON(w, http.StatusForbidden, map[string]any{
+			writeJSON(rec, http.StatusForbidden, map[string]any{
 				"error":  "forbidden",
 				"route":  rt.ID,
 				"reason": "ip_not_allowed",
@@ -163,10 +186,11 @@ func (a *App) handler() http.Handler {
 
 		// 2) 限流
 		if rt.limiter != nil && !rt.limiter.Allow(ip) {
+			blocked = "rate_limited"
 			a.metrics.IncRateLimited(rt.ID)
 			a.metrics.IncRequest(rt.ID, http.StatusTooManyRequests)
-			w.Header().Set("Retry-After", "1")
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			rec.Header().Set("Retry-After", "1")
+			writeJSON(rec, http.StatusTooManyRequests, map[string]any{
 				"error": "rate_limited",
 				"route": rt.ID,
 			})
@@ -175,14 +199,15 @@ func (a *App) handler() http.Handler {
 
 		// 3) 熔断：后端已经不行了就别再打了，直接快速失败
 		if rt.cb != nil && !rt.cb.Allow() {
+			blocked = "circuit_open"
 			a.metrics.IncRejected(rt.ID, "circuit_open")
 			a.metrics.IncRequest(rt.ID, http.StatusServiceUnavailable)
 			retryAfter := rt.cb.cfg.OpenSecs
 			if retryAfter < 1 {
 				retryAfter = 1
 			}
-			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			rec.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeJSON(rec, http.StatusServiceUnavailable, map[string]any{
 				"error":       "circuit_open",
 				"route":       rt.ID,
 				"retry_after": retryAfter,
@@ -194,10 +219,11 @@ func (a *App) handler() http.Handler {
 		if rt.auth != nil {
 			claims, ok, reason := rt.auth.Authenticate(r)
 			if !ok {
-				rt.auth.WriteChallenge(w)
+				blocked = "auth_" + reason
+				rt.auth.WriteChallenge(rec)
 				a.metrics.IncRejected(rt.ID, "auth_"+reason)
 				a.metrics.IncRequest(rt.ID, http.StatusUnauthorized)
-				writeJSON(w, http.StatusUnauthorized, map[string]any{
+				writeJSON(rec, http.StatusUnauthorized, map[string]any{
 					"error":  "unauthorized",
 					"route":  rt.ID,
 					"reason": reason,
@@ -209,7 +235,6 @@ func (a *App) handler() http.Handler {
 
 		// 5) 转发
 		a.metrics.IncInFlight(rt.ID)
-		rec := newStatusRecorder(w)
 		rt.proxy.ServeHTTP(rec, r)
 		a.metrics.DecInFlight(rt.ID)
 
@@ -217,24 +242,52 @@ func (a *App) handler() http.Handler {
 			rt.cb.Record(isBackendFailure(rec.code))
 		}
 
-		dur := time.Since(start).Seconds()
-		a.metrics.Observe(rt.ID, dur)
+		a.metrics.Observe(rt.ID, time.Since(start).Seconds())
 		a.metrics.IncRequest(rt.ID, rec.code)
-
-		if a.accessLog.Load() {
-			slog.Info("access",
-				"route", rt.ID,
-				"port", port,
-				"host", r.Host,
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", rec.code,
-				"dur_ms", int(dur*1000),
-				"client_ip", ip,
-				"ua", r.UserAgent(),
-			)
-		}
 	})
+}
+
+// logAccess 把一条访问记录同时送进内存环形缓冲和结构化日志。
+//
+// 两者的开关是分开的，这是有意的：
+//   - 环形缓冲始终记录（定长 500 条、只占内存、不落盘），管理台的实时日志靠它，
+//     关掉的话界面直接空掉；
+//   - access_log 控制的是标准输出那条日志，量大了或者要接日志系统时由它决定。
+func (a *App) logAccess(r *http.Request, port int, rt *Route, blocked, ip string, status int, start time.Time) {
+	e := LogEntry{
+		Time:     formatLogTime(start),
+		Port:     port,
+		Host:     r.Host,
+		Method:   r.Method,
+		Path:     r.URL.Path,
+		Query:    r.URL.RawQuery,
+		Status:   status,
+		DurMs:    float64(time.Since(start).Microseconds()) / 1000,
+		ClientIP: ip,
+		UA:       r.UserAgent(),
+		Blocked:  blocked,
+	}
+	if rt != nil {
+		e.Route = rt.ID
+		e.RouteName = rt.Name
+	}
+	a.logs.Add(e)
+
+	if !a.accessLog.Load() {
+		return
+	}
+	slog.Info("access",
+		"route", e.Route,
+		"port", port,
+		"host", r.Host,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", status,
+		"dur_ms", int(e.DurMs),
+		"client_ip", ip,
+		"blocked", blocked,
+		"ua", r.UserAgent(),
+	)
 }
 
 // adminHandler 管理端口：健康检查、指标、路由查看、手动重载。
@@ -266,6 +319,10 @@ func (a *App) adminHandler() http.Handler {
 	mux.HandleFunc("DELETE /_goproxy/routes/{id}", a.handleDeleteRoute)
 	mux.HandleFunc("GET /_goproxy/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /_goproxy/config", a.handlePatchConfig)
+	// 管理台的数据源（实现见 stats.go）
+	mux.HandleFunc("GET /_goproxy/stats", a.handleStats)
+	mux.HandleFunc("GET /_goproxy/logs", a.handleLogs)
+	mux.HandleFunc("GET /_goproxy/events", a.handleEvents)
 	mux.HandleFunc("/_goproxy/ports", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.listeners.Ports())
 	})
@@ -288,6 +345,9 @@ func (a *App) adminHandler() http.Handler {
 			"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
 			"  /_goproxy/config          GET / PATCH 全局配置\n"+
 			"  /_goproxy/ports           当前监听端口\n"+
+			"  /_goproxy/stats           聚合状态（指标 + 采样曲线 + 熔断计数）\n"+
+			"  /_goproxy/logs            最近访问记录  ?limit=N\n"+
+			"  /_goproxy/events          实时访问日志（SSE）\n"+
 			"  /_goproxy/reload          POST 手动重载配置\n")
 	})
 	// 非回环访问必须带 admin_token，见 admin_api.go 的 adminGuard
@@ -352,6 +412,23 @@ func (a *App) statsLoop(ctx context.Context) {
 	}
 }
 
+// sampleLoop 每秒采一个点，保留最近 5 分钟的 QPS / 错误率曲线。
+//
+// 采样放在服务端而不是让前端攒：界面一打开就该有历史曲线，
+// 否则刷新一次页面曲线就从头开始长，没法判断「刚才那波错误还在不在」。
+func (a *App) sampleLoop(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			a.metrics.Sample(now)
+		}
+	}
+}
+
 func (a *App) Run(ctx context.Context) error {
 	if err := a.reload(); err != nil {
 		return err
@@ -382,6 +459,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	go a.watchLoop(ctx)
 	go a.statsLoop(ctx)
+	go a.sampleLoop(ctx)
 
 	<-ctx.Done()
 	slog.Info("收到退出信号，开始优雅停机")

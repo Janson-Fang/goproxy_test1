@@ -46,6 +46,14 @@ type RouteTable struct {
 	// byPort 每个监听端口一份索引。构建时已经把 listen_port=0 的
 	// 全局路由合并进每个端口的 global 桶，所以这里一定能查到。
 	byPort map[int]*portIndex
+
+	// trusted 是可信代理网段，用于决定要不要采信 X-Forwarded-For。
+	//
+	// 它必须是快照的一部分，不能单独存在 App 上：请求路径读、reload 写，
+	// 单独放就得加锁（或原子指针），而放进快照后天然随表一起原子换掉。
+	// 之前就是放在 App 上无锁读取的 —— 真跑起来 reload 与请求并发时是 data race，
+	// 只是单测没覆盖到并发才一直没炸。
+	trusted []*net.IPNet
 }
 
 type portIndex struct {

@@ -11,9 +11,31 @@ import (
 
 var durBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
+// seriesSize 是每秒采样保留的点数（300 点 = 最近 5 分钟）。
+//
+// 为什么在服务端存历史，而不是让前端每次刷新自己攒：
+// 管理台一打开就该有曲线，而不是空白五分钟慢慢长出来。
+// 300 个点不到 10KB，代价可以忽略。
+const seriesSize = 300
+
 type reqKey struct {
 	route  string
 	status int
+}
+
+// seriesPoint 是某一秒的增量，前端直接拿来画 QPS / 错误率曲线。
+type seriesPoint struct {
+	T        int64 `json:"t"` // Unix 秒
+	Requests int64 `json:"requests"`
+	Errors   int64 `json:"errors"`  // 5xx
+	Blocked  int64 `json:"blocked"` // 被限流 + 被拒绝（ACL/熔断/认证）
+}
+
+// totals 是累计值的原始快照，用于算相邻两次采样之间的增量。
+type totals struct {
+	requests int64
+	errors   int64
+	blocked  int64
 }
 
 // Metrics 用一把互斥锁保护的内存计数器，按 Prometheus 文本格式导出。
@@ -33,6 +55,12 @@ type Metrics struct {
 
 	reloadTotal int64
 	routeCount  int64
+
+	// series 是每秒采样环，seriesAt 是下一个写入位置，seriesN 是已填充点数
+	series   []seriesPoint
+	seriesAt int
+	seriesN  int
+	last     totals
 }
 
 func NewMetrics() *Metrics {
@@ -48,7 +76,28 @@ func NewMetrics() *Metrics {
 		cbState:  make(map[string]int),
 		cbOpened: make(map[string]int64),
 		cbReject: make(map[string]int64),
+		series:   make([]seriesPoint, seriesSize),
 	}
+}
+
+// StartedAt 返回进程启动（准确说是指标对象创建）时间。
+func (m *Metrics) StartedAt() time.Time { return m.start }
+
+// UptimeSeconds 返回运行时长。start 构造后不再改动，不需要加锁。
+func (m *Metrics) UptimeSeconds() int64 { return int64(time.Since(m.start).Seconds()) }
+
+// ReloadTotal 返回累计配置重载次数。
+func (m *Metrics) ReloadTotal() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.reloadTotal
+}
+
+// RouteCount 返回当前生效的路由数。
+func (m *Metrics) RouteCount() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.routeCount
 }
 
 func (m *Metrics) IncRequest(route string, status int) {
@@ -171,6 +220,150 @@ func (m *Metrics) Live(route string) RouteLive {
 		lv.AvgMs = m.sum[route] / float64(n) * 1000
 	}
 	return lv
+}
+
+// Summary 是全局累计值的汇总，管理台的指标卡片直接用。
+type Summary struct {
+	Requests    int64            `json:"requests_total"`
+	ByStatus    map[string]int64 `json:"by_status"`
+	Unmatched   int64            `json:"unmatched_total"`
+	InFlight    int64            `json:"in_flight"`
+	RateLimited int64            `json:"rate_limited_total"`
+	Rejected    int64            `json:"rejected_total"`
+	AvgMs       float64          `json:"avg_ms"`
+	P95Ms       float64          `json:"p95_ms"`
+	ErrorRate   float64          `json:"error_rate"`
+}
+
+// Global 汇总所有路由的观测值。
+//
+// 单条路由的 Live() 不够用：管理台要的是「整个代理现在什么状况」，
+// 而全局视图没法靠前端把几十条路由的 Live 加起来 —— 未匹配路由的请求
+// （route=""）不在任何一条路由里，会被漏掉，而那恰恰是最该看到的信号。
+func (m *Metrics) Global() Summary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s := Summary{ByStatus: make(map[string]int64, 8)}
+	for k, v := range m.reqs {
+		s.Requests += v
+		s.ByStatus[strconv.Itoa(k.status)] += v
+		if k.route == "" {
+			s.Unmatched += v
+		}
+	}
+	for _, v := range m.limited {
+		s.RateLimited += v
+	}
+	for _, v := range m.rejected {
+		s.Rejected += v
+	}
+	for _, v := range m.inFly {
+		s.InFlight += v
+	}
+
+	// 直方图桶在 Observe 里是累计计数的（dur <= ub 就 +1），
+	// 所以跨路由合并只需要逐位相加，不必再算前缀和。
+	var merged []int64
+	var sum float64
+	var n int64
+	for r, c := range m.count {
+		sum += m.sum[r]
+		n += c
+		b := m.buckets[r]
+		if merged == nil {
+			merged = make([]int64, len(durBuckets))
+		}
+		for i := range merged {
+			if i < len(b) {
+				merged[i] += b[i]
+			}
+		}
+	}
+	if n > 0 {
+		s.AvgMs = sum / float64(n) * 1000
+		s.P95Ms = quantileFromBuckets(merged, n, 95)
+	}
+	if s.Requests > 0 {
+		var errs int64
+		for code, v := range s.ByStatus {
+			if len(code) == 3 && code[0] == '5' {
+				errs += v
+			}
+		}
+		s.ErrorRate = float64(errs) / float64(s.Requests)
+	}
+	return s
+}
+
+// quantileFromBuckets 从直方图里取分位数的上界（单位毫秒）。
+//
+// buckets[i] 已经是累计值（「耗时 <= durBuckets[i] 的请求数」），
+// 所以这里**只能直接比较，不能再累加** —— 累加一次就把两个桶的空隙
+// 算成了样本，p95 会系统性偏小（实测 25ms 被算成 10ms）。
+func quantileFromBuckets(buckets []int64, total int64, pct int) float64 {
+	if total <= 0 || len(buckets) == 0 {
+		return 0
+	}
+	// 向上取整，避免整除后落到前一个桶
+	target := (total*int64(pct) + 99) / 100
+	for i, c := range buckets {
+		if c >= target {
+			return durBuckets[i] * 1000
+		}
+	}
+	// 最后一个桶都没凑够（样本统计与实际不一致），报最大桶上界即「>10s」
+	return durBuckets[len(durBuckets)-1] * 1000
+}
+
+// Sample 记录一个采样点。由 sampleLoop 每秒调用一次。
+func (m *Metrics) Sample(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cur := m.totalsLocked()
+	m.series[m.seriesAt] = seriesPoint{
+		T:        now.Unix(),
+		Requests: cur.requests - m.last.requests,
+		Errors:   cur.errors - m.last.errors,
+		Blocked:  cur.blocked - m.last.blocked,
+	}
+	m.last = cur
+	m.seriesAt = (m.seriesAt + 1) % len(m.series)
+	if m.seriesN < len(m.series) {
+		m.seriesN++
+	}
+}
+
+// SeriesPoints 按时间从旧到新返回已采集的采样点。
+func (m *Metrics) SeriesPoints() []seriesPoint {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]seriesPoint, 0, m.seriesN)
+	start := (m.seriesAt - m.seriesN + len(m.series)) % len(m.series)
+	for i := 0; i < m.seriesN; i++ {
+		out = append(out, m.series[(start+i)%len(m.series)])
+	}
+	return out
+}
+
+// totalsLocked 汇总累计值。调用方必须已持有 m.mu。
+func (m *Metrics) totalsLocked() totals {
+	var t totals
+	for k, v := range m.reqs {
+		t.requests += v
+		if k.status >= 500 {
+			t.errors += v
+		}
+	}
+	for _, v := range m.limited {
+		t.blocked += v
+	}
+	for _, v := range m.rejected {
+		t.blocked += v
+	}
+	return t
 }
 
 // Render 输出 Prometheus 文本格式（可被直接抓取）。

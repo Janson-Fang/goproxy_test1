@@ -122,6 +122,9 @@ curl -X POST http://127.0.0.1:9080/_goproxy/reload
 | `/_goproxy/ports` | GET | 当前实际监听的端口 |
 | `/_goproxy/config` | GET | 全局配置（**不回传 `admin_token` 明文**） |
 | `/_goproxy/config` | PATCH | 改 `default_ports` / `access_log` / `trusted_proxies` / `admin_token` |
+| `/_goproxy/stats` | GET | 聚合状态：版本、uptime、指标汇总、熔断计数、采样曲线 |
+| `/_goproxy/logs` | GET | 最近 N 条访问记录，`?limit=200`（上限 1000） |
+| `/_goproxy/events` | GET | 实时访问日志，SSE 推送 |
 | `/_goproxy/reload` | POST | 手动触发重载 |
 
 ### 认证
@@ -215,6 +218,70 @@ curl -s -X POST $A/_goproxy/routes \
 curl -s http://127.0.0.1:9080/_goproxy/routes | jq .
 curl -s http://127.0.0.1:9080/metrics | grep goproxy_requests_total
 ```
+
+---
+
+## 监控数据源（前端就靠这三个）
+
+管理台需要的数据在这一层就取全了，前端不必去解析 Prometheus 文本。
+
+### `GET /_goproxy/stats` —— 一次拿全所有看板数字
+
+```bash
+curl -s http://127.0.0.1:9080/_goproxy/stats | jq '{uptime_seconds, routes_active, ports, summary, circuit}'
+```
+
+关键字段：
+
+| 字段 | 说明 |
+|---|---|
+| `summary.requests_total` | 全部请求数 |
+| `summary.by_status` | 按状态码分桶，如 `{"200": 120, "404": 3}` |
+| `summary.unmatched_total` | **没匹配到任何路由**的请求数，配置写歪了就看它 |
+| `summary.error_rate` / `p95_ms` / `avg_ms` | 错误率与耗时（p95 由直方图桶估算） |
+| `circuit` | 熔断器按状态计数 + 累计跳闸/快速失败次数 |
+| `series` | 最近 5 分钟的**每秒增量**（`requests` / `errors` / `blocked`），直接画曲线 |
+| `logs` | 缓冲条数、SSE 订阅者数、因订阅者太慢而丢弃的条数 |
+
+`series` 由服务端每秒采样，**界面一打开就有历史曲线**，不用等前端自己攒。
+`circuit` 读的是熔断器当前真实状态，不走那个 5 秒同步一次的指标缓存 ——
+跳闸了却要等 5 秒才在界面上看见，排查时会以为熔断没生效。
+
+### `GET /_goproxy/logs` —— 最近 N 条
+
+```bash
+curl -s "http://127.0.0.1:9080/_goproxy/logs?limit=20" | jq '.entries[] | {seq, status, path, blocked}'
+```
+
+返回结构化字段（不是格式化好的日志文本，省得前端再解析一遍）。`blocked` 非空表示
+这条请求**没有被转发出去**，值是拦截原因：`acl` / `rate_limited` / `circuit_open` / `auth_*`。
+被拦掉的请求也会进日志 —— 排查限流误伤、ACL 配错时全靠它。
+
+### `GET /_goproxy/events` —— SSE 实时推送
+
+```bash
+curl -N http://127.0.0.1:9080/_goproxy/events
+```
+
+```
+event: hello
+data: {"latest_seq":128,"buffered":42}
+
+id: 129
+event: access
+data: {"seq":129,"time":"2026-09-15T22:44:49.284+08:00","route":"r1","port":8081,...}
+```
+
+- 连上先发一个 `hello`，带上当前 `latest_seq`，前端拿它和 `/logs` 的历史做去重
+- 每 20 秒一个 `: ping` 注释行做保活，免得被中间代理掐掉空闲连接
+- 响应带 `X-Accel-Buffering: no` —— 不加这个头，走 nginx 时事件会被缓冲，
+  表现为「日志延迟几十秒甚至完全不动」
+
+> **访问日志缓冲始终在记录**（定长 500 条，只在内存、不落盘），它和管理台的实时日志是同一个东西，
+> 关掉界面就空了。`access_log` 控制的是**标准输出**那条结构化日志，量大了或者接了日志系统就关它。
+>
+> 订阅者慢（标签页切到后台、网络卡住）时消息**直接丢**并计数，不会阻塞请求路径 ——
+> 访问日志这种顺手做的事，绝不该有能力把整个代理拖死。
 
 ---
 
@@ -352,8 +419,8 @@ EOF
 | 不做 | 原因 / 何时做 |
 |---|---|
 | TLS / ACME 证书 | M4。且自定义端口拿不到自动证书（HTTP-01 固定走 80），只能跑明文或挂手动证书 |
-| Web 管理界面 | 接口已经齐了（含写接口），前端在做。现在只能用 curl / 脚本操作 |
-| 聚合统计接口、SSE 实时日志 | 待做。当前 `/metrics` 是 Prometheus 文本，前端要自己解析；访问日志只写 slog，内存里不留存 |
+| Web 管理界面 | **后端接口已全部就绪**（路由 CRUD + `stats` + `logs` + SSE `events`），前端待做。现在只能用 curl / 脚本操作 |
+| 访问日志落盘 | 只往标准输出写，没有内置文件轮转。需要留存就接 `systemd` 的 journal 或外部 logrotate |
 | SQLite | M1 正式版。现在用 JSON 文件，`loadConfig` 换掉即可，下游不动 |
 | 路由变更审计 | 写接口目前不记录「谁在什么时候改了哪条路由」。多人共用管理端时会需要 |
 | 多实例共享状态 | 限流和熔断都是进程内内存，多副本各算各的。另外**写配置也是单机行为**，两个实例各写各的会互相覆盖，多副本场景需要换成共享存储 + 一致性协议。预留了接口，后续换 Redis / SQLite |
@@ -529,10 +596,13 @@ docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:
 | `acl.go` | IP 黑白名单（CIDR） |
 | `auth.go` | Basic（bcrypt + 校验缓存）与 JWT 认证器 |
 | `jwt.go` | JWT 校验：HS256/384/512、RS256，带算法白名单 |
-| `metrics.go` | Prometheus 指标 + 按路由的实时观测值 |
+| `metrics.go` | Prometheus 指标 + 实时观测值 + 每秒采样曲线 |
+| `accesslog.go` | 访问记录的定长环形缓冲，兼作 SSE 广播源 |
+| `stats.go` | `stats` / `logs` / `events` 三个监控接口 |
 | `router_test.go` | 路由匹配单测 |
 | `governance_test.go` | 熔断、ACL、JWT、Basic 单测 |
 | `admin_api_test.go` | 管理接口单测：CRUD、并发写冲突、认证、坏配置不落盘 |
+| `stats_test.go` | 环形缓冲、采样序列、SSE、并发重载单测 |
 
 ```bash
 go test ./...   # 跑测试
@@ -543,8 +613,8 @@ go vet ./...    # 静态检查
 
 ## 下一步
 
-已完成到 M3，外加管理写接口（原本属于 M6 的后端部分）。
-接下来：**React 管理台前端**（消费这些接口）→ 聚合统计接口与 SSE 实时日志 → TLS/ACME。
+已完成到 M3，外加管理写接口与监控数据源（原本属于 M6 的后端部分）。
+接下来：**React 管理台前端**（消费这些接口）→ TLS/ACME。
 
 > 完整的架构方案、数据模型与里程碑计划不在这个仓库里。
 
