@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,29 +37,247 @@ func notFound(id string) *apiError {
 	return &apiError{http.StatusNotFound, "route_not_found", fmt.Sprintf("路由 %q 不存在", id)}
 }
 
+// ---------- 登录 / 登出 / 会话状态 ----------
+//
+// 这三个接口都挂在 adminMux 上，也就是**在 adminGuard 之内**。
+// 看起来有点绕（登录接口本身要鉴权？），但这是有意的：
+//
+//   - POST /_goproxy/login 需要先通过 adminGuard，而 Guard 现在把
+//     「登录中」也当作放行条件之一（见 trySessionLogin）。这样登录请求
+//     本身也能拿到限流与 CSRF 保护，且不用在 Guard 外面开一个特例路径。
+//   - 回环免认证的本机用户也能直接创建会话，不用先去翻 config.json 抄令牌。
+
+// sessionLoginRequest 是登录请求体。字段名刻意不叫 token，避免被日志采集
+// 误当成通用凭据字段；但仍然必须保证它不会被回显。
+type sessionLoginRequest struct {
+	Token string `json:"token"`
+}
+
+// handleLogin 用 admin_token 换取一个会话 Cookie。
+//
+// 防爆破的三层：
+//   - 单个 IP 失败 5 次封 10 分钟
+//   - 全局失败 50 次短暂封禁（挡换 IP 池）
+//   - 响应时间恒定 ~400ms（抹平时序侧信道）
+func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	// 登录接口的响应绝不能被缓存，否则可能把一个成功响应缓存给另一个用户
+	w.Header().Set("Cache-Control", "no-store")
+
+	// 这条路径在 adminGuard 之外（否则未登录根本到不了这里），
+	// 所以同源校验得自己兜 —— 不能让一个第三方站点替用户登成别的账号，
+	// 那会变成「登录 CSRF」。
+	//
+	// 用 requireCrossSiteNotClaimed 而不是 requireSameOrigin：
+	// 登录请求本来就不带 Cookie，curl/脚本也不发 Origin，
+	// 一律 fail-closed 会把非浏览器的登录入口直接堵死。理由详见该函数注释。
+	if isStateChanging(r.Method) && !requireCrossSiteNotClaimed(r) {
+		slog.Warn("拒绝来源不明的登录请求",
+			"method", r.Method,
+			"origin", r.Header.Get("Origin"),
+			"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"))
+		sleepConstant(start)
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "cross_origin_rejected",
+			"message": "登录请求的来源与控制台不同源，已拒绝。",
+		})
+		return
+	}
+
+	ip := clientIP(r, a.trustedNets())
+	ua := r.UserAgent()
+
+	if blocked, wait := a.sessions.loginBlocked(ip); blocked {
+		w.Header().Set("Retry-After", strconv.Itoa(jitterSeconds(wait)))
+		sleepConstant(start)
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error":   "too_many_attempts",
+			"message": "登录失败次数过多，请稍后再试。",
+		})
+		return
+	}
+
+	var req sessionLoginRequest
+	// 限制体积：登录体只有几十字节，不需要 1MiB 的宽容度
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil &&
+		err != io.EOF {
+		sleepConstant(start)
+		writeJSON(w, http.StatusBadRequest, loginFailureBody())
+		return
+	}
+
+	a.mu.Lock()
+	token := a.adminToken
+	a.mu.Unlock()
+
+	// 常量时间比对。注意这里对「令牌为空」和「令牌错误」走同一条路径 ——
+	// 区分开来等于告诉攻击者服务端到底有没有配置令牌。
+	ok := token != "" &&
+		subtle.ConstantTimeCompare([]byte(req.Token), []byte(token)) == 1
+
+	if !ok {
+		a.sessions.recordLoginFailure(ip)
+		slog.Warn("管理端登录失败", "ip", ip, "ua", ua, "token_set", token != "")
+		sleepConstant(start)
+		writeJSON(w, http.StatusUnauthorized, loginFailureBody())
+		return
+	}
+
+	handle, expires, err := a.sessions.create(token, ip, ua)
+	if err != nil {
+		slog.Error("创建会话失败", "err", err)
+		sleepConstant(start)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error":   "session_unavailable",
+			"message": "会话创建失败，请稍后重试。",
+		})
+		return
+	}
+
+	a.sessions.recordLoginSuccess(ip)
+	setSessionCookie(w, r, handle, expires)
+	slog.Info("管理端登录成功", "ip", ip, "active_sessions", a.sessions.count())
+
+	sleepConstant(start)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"expires":  expires.UTC().Format(time.RFC3339),
+		"secure":   requestIsTLS(r),
+		"idle_sec": int(sessionIdleTimeout.Seconds()),
+		"abs_sec":  int(sessionAbsoluteTimeout.Seconds()),
+	})
+}
+
+// handleSession 查询当前会话状态（GET）或登出（DELETE）。
+//
+// 放在同一个路径上是因为它们表达的是同一件事的状态迁移，
+// 前端也只需要记一个地址。
+//
+// 这条路径在 adminGuard 之外（见 main.go 的 isAuthPath），所以它必须**自己**
+// 判断凭据是否有效，不能假设「能走到这里就是已认证」。
+func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+
+	handle := sessionHandleFrom(r)
+
+	a.mu.Lock()
+	token := a.adminToken
+	a.mu.Unlock()
+
+	// 三种凭据来源，与 adminGuard 保持一致。这里只是「如实汇报」，不做放行决定。
+	hasSession := handle != "" && a.sessions.lookup(handle, token)
+	loopback := !viaOwnProxy(r) && a.trustsLoopback() && isLoopbackAddr(r.RemoteAddr)
+	_, hasBearer := bearerToken(r)
+	// Bearer 只有在令牌确实配置了、且请求确实带了 Authorization 头时才算数。
+	// 光有头不算：令牌没配时任何 Bearer 都是无效的。
+	hasBearerOK := hasBearer && token != ""
+
+	authenticated := hasSession || loopback || hasBearerOK
+	via := "none"
+	switch {
+	case hasSession:
+		via = "session"
+	case loopback:
+		via = "loopback"
+	case hasBearerOK:
+		via = "bearer"
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		// 未认证时明确回 401，前端据此切到登录页。
+		//
+		// 注意这里**不能**沿用 adminGuard 里那句 "需要登录，或带 Bearer" ——
+		// 前端判断「要不要显示登录页」看的是状态码和 error 字段，
+		// 给 200 + authenticated:false 会让控制台一直转圈。
+		if !authenticated {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="goproxy admin"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error":   "unauthorized",
+				"message": "尚未登录。",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authenticated": true,
+			"via":           via,
+			"has_session":   hasSession,
+			"token_set":     token != "",
+		})
+
+	case http.MethodDelete, http.MethodPost:
+		// DELETE 是登出；POST 也接受（部分客户端不方便发 DELETE）
+		if !requireSameOrigin(r) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "cross_origin_rejected",
+				"message": "登出请求的来源与控制台不同源，已拒绝。",
+			})
+			return
+		}
+		if hasSession {
+			a.sessions.revoke(handle)
+		}
+		clearSessionCookie(w, r)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+
+	default:
+		w.Header().Set("Allow", "GET, DELETE, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // writeErr 把错误翻译成响应。
+//
+// 500 的响应体**不回显 err.Error()**：那里面常常带着绝对路径、
+// 「permission denied」、甚至配置文件内容片段，等于免费给攻击者做信息收集。
+// 详情只进服务端日志，客户端拿到一个短错误码 + 一句笼统说明。
+// 排查时按 error id 去日志里搜（id 也回给客户端，便于对账）。
 func writeErr(w http.ResponseWriter, err error) {
 	var ae *apiError
 	if errors.As(err, &ae) {
 		writeJSON(w, ae.status, map[string]string{"error": ae.code, "message": ae.msg})
 		return
 	}
-	slog.Error("管理接口内部错误", "err", err)
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "message": err.Error()})
+	id := newErrorID()
+	slog.Error("管理接口内部错误", "error_id", id, "err", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{
+		"error":   "internal",
+		"message": "服务端内部错误，详情见服务端日志（错误编号 " + id + "）。",
+	})
+}
+
+// newErrorID 生成一个短错误编号，用来把客户端看到的 500 和服务端日志对上。
+// 只需要「短时间内可区分」，不要求全局唯一，所以取 8 字节十六进制足够。
+func newErrorID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// 随机源不可用时退化成固定值，不能因为这个就把请求搞挂
+		return "unknown"
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // ---------- 认证 ----------
 
-// adminGuard 包住整个管理端 mux。
+// adminGuard 包住整个管理端 mux。三条鉴权路径，任一通过即放行：
 //
-//   - 来自回环地址的请求直接放行（默认 admin_addr 就是 127.0.0.1，行为不变）
-//   - 其余请求必须带 Authorization: Bearer <admin_token>
+//  1. 来自回环地址、且**不是经本进程代理转发**进来的请求（本机运维习惯）
+//  2. Authorization: Bearer <admin_token>（curl / 脚本 / Prometheus）
+//  3. 会话 Cookie（控制台登录后拿到；HttpOnly，脚本读不到）
 //
 // 判断来源只用 RemoteAddr，绝不用 X-Forwarded-For —— XFF 是客户端随手就能写的头，
 // 拿它判断「是不是本机」等于把认证决定权交给攻击者。
+//
+// 关键：光看 RemoteAddr 是不够的。代理转发到管理端口时源地址就是 127.0.0.1，
+// 所以「来源是回环」在**本进程自己转发**的情形下毫无保证 —— 只要存在一条
+// target 指向管理端口的代理路由，外部客户端就能白拿免认证的管理权限。
+// 因此这里额外要求「不带代理标记头」才认回环，见 internalViaHeader。
 func (a *App) adminGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isLoopbackAddr(r.RemoteAddr) {
+		viaOwnProxy := viaOwnProxy(r)
+
+		if !viaOwnProxy && a.trustsLoopback() && isLoopbackAddr(r.RemoteAddr) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -67,12 +286,38 @@ func (a *App) adminGuard(next http.Handler) http.Handler {
 		token := a.adminToken
 		a.mu.Unlock()
 
+		// 路径 3：会话 Cookie。
+		//
+		// 放在 Bearer 之前是因为它对浏览器是唯一的路径（Cookie 自动携带），
+		// 而 Bearer 走的是显式请求头，两者不会互相干扰。
+		if handle := sessionHandleFrom(r); handle != "" && a.sessions.lookup(handle, token) {
+			// 会话/Cookie 会被浏览器自动携带，所以必须防 CSRF。
+			// 只对写方法强制：GET 修改不了任何东西，而 SSE 等长连接
+			// 不该因为缺 Origin 就被拒。
+			if isStateChanging(r.Method) && !requireSameOrigin(r) {
+				slog.Warn("拒绝来源不明的管理写请求（会话鉴权）",
+					"method", r.Method, "path", r.URL.Path,
+					"origin", r.Header.Get("Origin"),
+					"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"))
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error":   "cross_origin_rejected",
+					"message": "写操作的来源与控制台不同源，已拒绝。",
+				})
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		if token == "" {
+			// 走到这里说明这个请求不享受回环免认证：要么来源不是回环，
+			// 要么是经本进程代理转发进来的（那属于外部访问）。
 			writeJSON(w, http.StatusForbidden, map[string]string{
 				"error": "admin_token_not_set",
-				"message": "管理端口正在监听非回环地址，但配置里没有 admin_token，" +
-					"已拒绝所有外部请求。请在 config.json 里设置 admin_token 后重载，" +
-					"或把 admin_addr 改回 127.0.0.1 只允许本机访问。",
+				"message": "该请求需要认证，但配置里没有 admin_token，已拒绝。" +
+					"请在 config.json 里设置 admin_token 后重载；" +
+					"若只想本机访问，可把 admin_addr 设为 127.0.0.1 并确认没有路由" +
+					"把 target 指向管理端口（经代理转发一律按外部请求处理）。",
 			})
 			return
 		}
@@ -82,12 +327,50 @@ func (a *App) adminGuard(next http.Handler) http.Handler {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="goproxy admin"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{
 				"error":   "unauthorized",
-				"message": "需要 Authorization: Bearer <admin_token>",
+				"message": "需要登录，或带 Authorization: Bearer <admin_token>",
 			})
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isStateChanging 判断方法是否会改动服务端状态。
+func isStateChanging(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	return true
+}
+
+// viaOwnProxy 判断请求是不是经**本进程自己的代理**转发进来的。
+//
+// 标记头由本进程在转发前往请求里注入（见 internalViaHeader），外部客户端
+// 理论上也能自己伪造这个头。但伪造的后果只是「把自己降级成需要认证」——
+// 相当于主动放弃回环免认证，对攻击者毫无好处，所以这里不需要额外防伪。
+func viaOwnProxy(r *http.Request) bool {
+	return r.Header.Get(internalViaHeader) != ""
+}
+
+// trustsLoopback 返回是否信任「来自回环地址」的请求。
+//
+// 默认信任（本机 curl / 脚本不必带令牌）。但一旦管理端口前面还有**别的**本地
+// 反向代理（nginx、Caddy 等），那些转发同样来自 127.0.0.1，且不会带本进程的
+// 标记头 —— 这时「回环」就同样不成立了，应当把 admin_trust_loopback 设为 false。
+func (a *App) trustsLoopback() bool {
+	a.mu.Lock()
+	v := a.adminTrustLoopback
+	a.mu.Unlock()
+	return v
+}
+
+// trustedNets 返回可信代理网段快照，登录限流用它解析真实 IP。
+func (a *App) trustedNets() []*net.IPNet {
+	if p := a.trusted.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func isLoopbackAddr(remoteAddr string) bool {
@@ -379,13 +662,14 @@ func (a *App) mutationResult(rev string, out *Config, id string) map[string]any 
 // configView 是 GET /_goproxy/config 的返回体。
 // 刻意不回传 admin_token 明文：界面从来不需要它，少一处泄露面。
 type configView struct {
-	DefaultPorts   []int    `json:"default_ports"`
-	AdminAddr      string   `json:"admin_addr"`
-	AdminEnabled   bool     `json:"admin_enabled"`
-	AdminTokenSet  bool     `json:"admin_token_set"`
-	AccessLog      bool     `json:"access_log"`
-	TrustedProxies []string `json:"trusted_proxies"`
-	RouteCount     int      `json:"route_count"`
+	DefaultPorts       []int    `json:"default_ports"`
+	AdminAddr          string   `json:"admin_addr"`
+	AdminEnabled       bool     `json:"admin_enabled"`
+	AdminTokenSet      bool     `json:"admin_token_set"`
+	AdminTrustLoopback bool     `json:"admin_trust_loopback"`
+	AccessLog          bool     `json:"access_log"`
+	TrustedProxies     []string `json:"trusted_proxies"`
+	RouteCount         int      `json:"route_count"`
 }
 
 func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -400,21 +684,23 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		addr = ""
 	}
 	writeJSON(w, http.StatusOK, configView{
-		DefaultPorts:   cfg.DefaultPorts,
-		AdminAddr:      addr,
-		AdminEnabled:   cfg.adminEnabled(),
-		AdminTokenSet:  cfg.AdminToken != "",
-		AccessLog:      cfg.AccessLog,
-		TrustedProxies: cfg.TrustedProxies,
-		RouteCount:     len(cfg.Routes),
+		DefaultPorts:       cfg.DefaultPorts,
+		AdminAddr:          addr,
+		AdminEnabled:       cfg.adminEnabled(),
+		AdminTokenSet:      cfg.AdminToken != "",
+		AdminTrustLoopback: cfg.adminTrustsLoopback(),
+		AccessLog:          cfg.AccessLog,
+		TrustedProxies:     cfg.TrustedProxies,
+		RouteCount:         len(cfg.Routes),
 	})
 }
 
 type configPatch struct {
-	DefaultPorts   *[]int    `json:"default_ports"`
-	AccessLog      *bool     `json:"access_log"`
-	TrustedProxies *[]string `json:"trusted_proxies"`
-	AdminToken     *string   `json:"admin_token"`
+	DefaultPorts       *[]int    `json:"default_ports"`
+	AccessLog          *bool     `json:"access_log"`
+	TrustedProxies     *[]string `json:"trusted_proxies"`
+	AdminToken         *string   `json:"admin_token"`
+	AdminTrustLoopback *bool     `json:"admin_trust_loopback"`
 }
 
 func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -460,6 +746,9 @@ func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.AdminToken != nil {
 			cfg.AdminToken = *p.AdminToken
+		}
+		if p.AdminTrustLoopback != nil {
+			cfg.AdminTrustLoopback = p.AdminTrustLoopback
 		}
 		return nil
 	})

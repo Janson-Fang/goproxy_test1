@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
 import * as api from './api'
 import { ApiError } from './api'
-import type { Stats } from './types'
+import type { SessionInfo, Stats } from './types'
 import { Badge, Card, Note, ToastHost, toast } from './ui'
 import { useHashTab, usePolling, useTheme } from './hooks'
 import { duration, num } from './format'
 import { Dashboard } from './pages/Dashboard'
 import { RoutesPage } from './pages/RoutesPage'
+import { CertsPage } from './pages/CertsPage'
 import { LogsPage } from './pages/LogsPage'
 import { SettingsPage } from './pages/SettingsPage'
 
-type Gate = 'checking' | 'ok' | 'need-token' | 'blocked'
+type Gate = 'checking' | 'ok' | 'need-login' | 'blocked'
 
 export default function App() {
   const [tab, navigate] = useHashTab()
@@ -18,6 +19,7 @@ export default function App() {
   const [gate, setGate] = useState<Gate>('checking')
   const [stats, setStats] = useState<Stats | null>(null)
   const [statsErr, setStatsErr] = useState<string | null>(null)
+  const [via, setVia] = useState<SessionInfo['via']>('none')
 
   const refresh = useCallback(async () => {
     try {
@@ -25,9 +27,17 @@ export default function App() {
       setStats(s)
       setStatsErr(null)
       setGate('ok')
+      // 会话来源单独查一次：它决定要不要显示「登出」。
+      // 失败不影响主流程（拿不到状态时按「不可登出」处理，最坏就是不显示按钮）。
+      try {
+        const info = await api.getSession()
+        setVia(info.via)
+      } catch {
+        setVia('none')
+      }
     } catch (e) {
       if (e instanceof ApiError && e.isUnauthorized) {
-        setGate('need-token')
+        setGate('need-login')
         return
       }
       if (e instanceof ApiError && e.isTokenNotSet) {
@@ -40,10 +50,21 @@ export default function App() {
 
   usePolling(refresh, 3000, gate === 'checking' || gate === 'ok')
 
-  if (gate === 'checking' || gate === 'need-token' || gate === 'blocked') {
+  const onLogout = useCallback(async () => {
+    try {
+      await api.logout()
+      toast('info', '已登出')
+    } catch {
+      toast('warn', '登出请求失败，但本机会话数据已清除')
+    }
+    setGate('checking')
+    void refresh()
+  }, [refresh])
+
+  if (gate === 'checking' || gate === 'need-login' || gate === 'blocked') {
     return (
       <>
-        <TokenGate mode={gate} onRetry={() => { setGate('checking'); void refresh() }} />
+        <LoginGate mode={gate} onRetry={() => { setGate('checking'); void refresh() }} />
         <ToastHost />
       </>
     )
@@ -87,6 +108,12 @@ export default function App() {
         <button className="btn ghost" onClick={() => void refresh()}>
           刷新
         </button>
+        {/* 只有真的靠会话登录时才给登出。本机免认证 / Bearer 令牌进来的没有会话可撤 */}
+        {via === 'session' && (
+          <button className="btn ghost" onClick={() => void onLogout()} title="注销当前会话">
+            登出
+          </button>
+        )}
       </header>
 
       <nav className="tabs">
@@ -96,6 +123,9 @@ export default function App() {
         <button className="tab" aria-selected={tab === 'routes'} onClick={() => navigate('routes')}>
           路由
           {stats && <span className="count">{stats.routes_configured}</span>}
+        </button>
+        <button className="tab" aria-selected={tab === 'certs'} onClick={() => navigate('certs')}>
+          证书
         </button>
         <button className="tab" aria-selected={tab === 'logs'} onClick={() => navigate('logs')}>
           日志
@@ -121,6 +151,9 @@ export default function App() {
         </div>
         <div style={{ display: tab === 'routes' ? 'block' : 'none' }}>
           <RoutesPage onChanged={() => void refresh()} />
+        </div>
+        <div style={{ display: tab === 'certs' ? 'block' : 'none' }}>
+          <CertsPage />
         </div>
         <div style={{ display: tab === 'logs' ? 'block' : 'none' }}>
           <LogsPage active={tab === 'logs'} />
@@ -149,14 +182,21 @@ function Logo() {
 }
 
 /**
- * 令牌门。
+ * 登录门。
  *
  * 控制台的静态页面本身刻意不鉴权（否则浏览器连页面都打不开，就没法输入令牌了），
  * 但所有 /_goproxy/* 接口都受 adminGuard 保护。所以在管理端口对外监听时，
- * 页面能打开、数据拿不到 —— 这一屏就是用来提示并采集令牌的。
+ * 页面能打开、数据拿不到 —— 这一屏就是用来完成登录的。
+ *
+ * 两条路径：
+ *  1. 首选：用 admin_token 换一个 HttpOnly 会话 Cookie（令牌不留在浏览器里）
+ *  2. 回退：把令牌放在内存里，以 Authorization: Bearer 发（刷新即丢）
+ *     留给「不方便登录」的场景，代价是刷新后要重新填。
  */
-function TokenGate({ mode, onRetry }: { mode: Gate; onRetry: () => void }) {
+function LoginGate({ mode, onRetry }: { mode: Gate; onRetry: () => void }) {
   const [token, setToken] = useState(api.getToken())
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
     if (mode === 'checking') {
@@ -202,9 +242,34 @@ function TokenGate({ mode, onRetry }: { mode: Gate; onRetry: () => void }) {
     )
   }
 
+  const doLogin = async (withToken: boolean) => {
+    if (!token) return
+    setBusy(true)
+    setErr(null)
+    try {
+      if (withToken) {
+        await api.login(token)
+        // 会话建立成功后立刻把令牌从内存里扔掉 —— 后续请求只靠 Cookie。
+        // 这是「令牌不进浏览器」这个收益的最后一步，别省。
+        api.clearToken()
+        setToken('')
+        toast('info', '登录成功')
+      } else {
+        api.setToken(token)
+        toast('info', '令牌已设置（仅本次会话有效）')
+      }
+      onRetry()
+    } catch (e) {
+      const msg = e instanceof ApiError ? e.message : String(e)
+      setErr(msg)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="gate">
-      <Card title="goproxy 控制台" sub={mode === 'checking' ? '正在连接…' : '需要管理令牌'}>
+      <Card title="goproxy 控制台" sub={mode === 'checking' ? '正在连接…' : '需要登录'}>
         <div className="stack">
           {mode === 'checking' ? (
             <div className="row">
@@ -213,9 +278,14 @@ function TokenGate({ mode, onRetry }: { mode: Gate; onRetry: () => void }) {
             </div>
           ) : (
             <>
-              <Note kind="warn">
-                管理接口返回了 <code>401 Unauthorized</code>。请输入服务端
-                <code> config.json </code>里配置的 <code>admin_token</code>。
+              <Note kind={err ? 'err' : 'warn'}>
+                {err ? (
+                  <>登录失败：{err}</>
+                ) : (
+                  <>
+                    需要认证。请输入服务端 <code>config.json</code> 里配置的 <code>admin_token</code>。
+                  </>
+                )}
               </Note>
               <div className="field">
                 <label className="label">管理令牌</label>
@@ -227,37 +297,31 @@ function TokenGate({ mode, onRetry }: { mode: Gate; onRetry: () => void }) {
                   value={token}
                   onChange={(e) => setToken(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      api.setToken(token)
-                      onRetry()
-                    }
+                    if (e.key === 'Enter' && !busy) void doLogin(true)
                   }}
                 />
-                <div className="hint">令牌只保存在这台浏览器的 localStorage 里，不会发往第三方。</div>
+                <div className="hint">
+                  登录成功后服务端会下发一个 <code>HttpOnly</code> 会话 Cookie，
+                  <strong>令牌本身不会留在浏览器里</strong>，脚本也读不到会话凭据。
+                </div>
               </div>
               <div className="row">
-                <button
-                  className="btn primary"
-                  disabled={!token}
-                  onClick={() => {
-                    api.setToken(token)
-                    toast('info', '令牌已保存，正在验证…')
-                    onRetry()
-                  }}
-                >
-                  连接
+                <button className="btn primary" disabled={!token || busy} onClick={() => void doLogin(true)}>
+                  {busy ? '登录中…' : '登录'}
                 </button>
                 <button
                   className="btn ghost"
-                  onClick={() => {
-                    api.setToken('')
-                    setToken('')
-                    toast('info', '已清除本机保存的令牌')
-                  }}
+                  disabled={!token || busy}
+                  onClick={() => void doLogin(false)}
+                  title="不建立会话，直接把令牌放在内存里用。刷新页面后需要重新输入。"
                 >
-                  清除已保存的令牌
+                  仅用令牌访问
                 </button>
               </div>
+              <Note kind="info">
+                「仅用令牌访问」是给不方便登录的场景留的回退路径：令牌只存在内存中，
+                每次刷新都要重填。正常使用建议直接登录。
+              </Note>
             </>
           )}
         </div>

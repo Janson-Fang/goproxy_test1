@@ -3,41 +3,60 @@
  *
  * 几个刻意的设计：
  *  1. 控制台静态页面本身不需要令牌（否则浏览器打不开页面就没法输入令牌了），
- *     但所有 /_goproxy/* 接口都受 adminGuard 保护 —— 令牌存在 localStorage，
- *     每次请求以 Authorization: Bearer 发出。
- *  2. 写接口支持 If-Match（后端用配置文件的 sha256 当 revision 做乐观并发）。
+ *     但所有 /_goproxy/* 接口都受 adminGuard 保护。
+ *  2. **默认走会话 Cookie**（登录后由服务端下发 HttpOnly Cookie，JS 读不到），
+ *     所以所有请求要带 credentials: 'same-origin'。Bearer 令牌作为回退路径保留，
+ *     给不方便登录的场景（比如把控制台嵌进自己的运维脚本）用。
+ *  3. 写接口支持 If-Match（后端用配置文件的 sha256 当 revision 做乐观并发）。
  *     两个页签同时编辑时，后提交的那个会拿到 409，而不是静默覆盖对方的改动。
- *  3. 实时日志走 fetch + ReadableStream 而不是 EventSource ——
+ *  4. 实时日志走 fetch + ReadableStream 而不是 EventSource ——
  *     EventSource 不能自定义请求头，带不了 Bearer 令牌。
+ *     （Cookie 模式下其实可以，但为了保留令牌回退路径，继续用 fetch。）
  */
 
 import type {
+  CertsResponse,
   ConfigPatch,
   ConfigView,
   LogEntry,
   LogsResponse,
   MutationResult,
+  PortInfo,
   Route,
+  SessionInfo,
   Stats,
 } from './types'
 
 const TOKEN_KEY = 'goproxy.admin_token'
 
+/**
+ * 令牌回退。**不再往 localStorage 写**，只在会话不可用时由用户临时输入，
+ * 存在内存里（刷新即丢）。
+ *
+ * 之前是持久化到 localStorage 的 —— 那等于把一个长期有效的秘密放在
+ * 任何一段 JS 都能读到的地方，而这个项目有已知的存储型 XSS 面
+ * （访问日志字段原样渲染）。现在正常情况下令牌根本不进浏览器：
+ * 用户登录一次，服务端下发 HttpOnly 会话 Cookie，脚本读不到。
+ */
+let memoryToken = ''
+
 export function getToken(): string {
-  try {
-    return localStorage.getItem(TOKEN_KEY) ?? ''
-  } catch {
-    return ''
-  }
+  return memoryToken
 }
 
 export function setToken(token: string): void {
+  memoryToken = token
+  // 顺手清掉历史版本可能留下的持久化令牌
   try {
-    if (token) localStorage.setItem(TOKEN_KEY, token)
-    else localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(TOKEN_KEY)
   } catch {
-    /* 隐私模式下 localStorage 可能不可写，忽略即可 */
+    /* 忽略 */
   }
+}
+
+/** 登录时用不到，但保留给「清除本机保存的令牌」这类入口 */
+export function clearToken(): void {
+  setToken('')
 }
 
 export interface ApiErrorInit {
@@ -109,6 +128,9 @@ async function raw<T>(
       headers,
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
       signal: opts.signal,
+      // 会话 Cookie 必须显式带上。跨源请求默认不发 Cookie，
+      // 漏了这个的话「登录成功但每个接口都 401」。
+      credentials: 'same-origin',
     })
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err
@@ -152,6 +174,35 @@ async function raw<T>(
 
   const etag = res.headers.get('ETag')
   return { data: payload as T, etag: etag ? etag.replace(/^"|"$/g, '') : null }
+}
+
+// ---------- 登录 / 会话 ----------
+
+/**
+ * 查询当前登录状态。
+ *
+ * 这个接口在 adminGuard 之内 —— 能正常返回 200 就说明已经通过了鉴权
+ * （可能是会话、回环直连、或 Bearer 令牌）。`has_session` 才表示
+ * 真正的登录态，前端据此决定要不要显示「登出」按钮。
+ */
+export async function getSession(): Promise<SessionInfo> {
+  const { data } = await raw<SessionInfo>('GET', '/_goproxy/session')
+  return data
+}
+
+/**
+ * 用管理令牌换一个会话。
+ *
+ * 成功后服务端下发 HttpOnly Cookie，令牌本身**不留在浏览器里** ——
+ * 换完就把内存里的副本清掉。这是这套机制的核心收益。
+ */
+export async function login(token: string): Promise<void> {
+  await raw<{ ok: boolean }>('POST', '/_goproxy/login', { body: { token } })
+}
+
+export async function logout(): Promise<void> {
+  await raw<{ ok: boolean }>('DELETE', '/_goproxy/session')
+  clearToken()
 }
 
 // ---------- 路由 ----------
@@ -232,6 +283,16 @@ export async function getLogs(limit = 200): Promise<LogsResponse> {
 
 export async function reloadConfig(): Promise<void> {
   await raw<{ ok: boolean }>('POST', '/_goproxy/reload')
+}
+
+export async function getPorts(): Promise<PortInfo[]> {
+  const { data } = await raw<PortInfo[]>('GET', '/_goproxy/ports')
+  return data
+}
+
+export async function getCerts(): Promise<CertsResponse> {
+  const { data } = await raw<CertsResponse>('GET', '/_goproxy/certs')
+  return data
 }
 
 // ---------- 实时事件（SSE） ----------

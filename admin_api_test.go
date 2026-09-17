@@ -439,6 +439,113 @@ func TestAdminAuth(t *testing.T) {
 	})
 }
 
+// TestAdminGuardRejectsProxiedLoopbackRequest 是本文件里最要紧的一条回归测试。
+//
+// 背景：管理端对来自回环的请求免认证，而代理转发正是从 127.0.0.1 发出的。
+// 于是「把一条路由的 target 指向管理端口」就能让外部客户端白拿免认证的管理权限。
+// 实测确认过：这样读 /_goproxy/config、写 POST /_goproxy/reload 全部 200。
+//
+// 修法是让代理转发时打上标记头，管理端见到标记头就按「外部请求」处理。
+// 这条测试如果失败，说明那个越权洞又回来了。
+func TestAdminGuardRejectsProxiedLoopbackRequest(t *testing.T) {
+	t.Run("带代理标记的回环请求必须认证", func(t *testing.T) {
+		e := newTestEnv(t, "s3cret-token", "")
+
+		// 不带令牌 → 必须被拒。未修时这里是 200，也就是越权成立。
+		rr := e.do(t, "GET", "/_goproxy/config", "", header(internalViaHeader, "1"))
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("经代理转发且无令牌应 401，实际 %d: %s", rr.Code, rr.Body)
+		}
+
+		// 带正确令牌 → 正常放行：加了标记不能把合法访问也一起挡死，
+		// 否则「用 TLS 路由把管理面板发布出去」这种正当用法就没法用了。
+		if rr := e.do(t, "GET", "/_goproxy/config", "",
+			header(internalViaHeader, "1"),
+			header("Authorization", "Bearer s3cret-token")); rr.Code != http.StatusOK {
+			t.Fatalf("带正确令牌应 200，实际 %d: %s", rr.Code, rr.Body)
+		}
+	})
+
+	t.Run("不带标记的回环请求仍然免认证", func(t *testing.T) {
+		e := newTestEnv(t, "s3cret-token", "")
+		if rr := e.do(t, "GET", "/_goproxy/config", ""); rr.Code != http.StatusOK {
+			t.Fatalf("本机直连应免认证放行，实际 %d: %s", rr.Code, rr.Body)
+		}
+	})
+
+	t.Run("伪造任意标记值同样要认证", func(t *testing.T) {
+		e := newTestEnv(t, "s3cret-token", "")
+		// 判断只认「有没有」这个头，不认值 —— 这样就不存在「猜中密钥就绕过」的说法。
+		if rr := e.do(t, "GET", "/_goproxy/config", "",
+			header(internalViaHeader, "随便编一个")); rr.Code != http.StatusUnauthorized {
+			t.Fatalf("带标记头一律要认证，应 401，实际 %d", rr.Code)
+		}
+	})
+}
+
+// TestAdminTrustLoopbackCanBeDisabled 覆盖「管理端口前面还挂着别的本地反代」的场景：
+// 那种转发同样来自 127.0.0.1，却不会带本进程的标记头，只能靠开关关掉回环信任。
+func TestAdminTrustLoopbackCanBeDisabled(t *testing.T) {
+	e := newTestEnv(t, "s3cret-token", "")
+
+	// 默认信任回环
+	if rr := e.do(t, "GET", "/_goproxy/config", ""); rr.Code != http.StatusOK {
+		t.Fatalf("默认应信任回环，实际 %d", rr.Code)
+	}
+
+	// 关掉（这次修改本身就靠回环免认证才做得了）
+	if rr := e.do(t, "PATCH", "/_goproxy/config",
+		`{"admin_trust_loopback":false}`); rr.Code != http.StatusOK {
+		t.Fatalf("关闭回环信任应 200，实际 %d: %s", rr.Code, rr.Body)
+	}
+
+	// 关掉之后，本机不带令牌也必须认证
+	if rr := e.do(t, "GET", "/_goproxy/config", ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("关闭后本机无令牌应 401，实际 %d: %s", rr.Code, rr.Body)
+	}
+
+	// 带令牌照常可用
+	authed := e.do(t, "GET", "/_goproxy/config", "",
+		header("Authorization", "Bearer s3cret-token"))
+	if authed.Code != http.StatusOK {
+		t.Fatalf("带令牌应 200，实际 %d", authed.Code)
+	}
+
+	// 视图里要能读到这个开关的当前值
+	if v := decode[configView](t, authed); v.AdminTrustLoopback {
+		t.Fatal("configView 应反映 admin_trust_loopback=false")
+	}
+}
+
+// TestReverseProxyMarksInternalVia 验证代理侧确实写了标记头，
+// 并且会**覆盖**客户端自带的同名头 —— 否则外部请求就能靠伪造它来干扰判断。
+func TestReverseProxyMarksInternalVia(t *testing.T) {
+	cfg := &Config{
+		DefaultPorts: []int{1},
+		AdminAddr:    "off",
+		Routes: []RouteConfig{{
+			ID: "r", ListenPort: 1, PathPrefix: "/", Target: "http://127.0.0.1:9",
+		}},
+	}
+	cfg.applyDefaults()
+
+	tbl, err := buildTable(cfg, nil, newTransport())
+	if err != nil {
+		t.Fatalf("建表失败: %v", err)
+	}
+	if len(tbl.routes) != 1 {
+		t.Fatalf("应有 1 条路由，实际 %d", len(tbl.routes))
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com/x", nil)
+	req.Header.Set(internalViaHeader, "客户端瞎写的")
+	tbl.routes[0].proxy.Director(req)
+
+	if got := req.Header.Get(internalViaHeader); got != "1" {
+		t.Fatalf("代理必须把标记头覆写成 1，实际 %q —— 客户端自带的值没被盖掉", got)
+	}
+}
+
 func TestAdminConfigEndpoint(t *testing.T) {
 	e := newTestEnv(t, "", "")
 
