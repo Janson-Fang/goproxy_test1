@@ -4,3 +4,5 @@ goproxy.exe
 *.exe
 *.log
 data/
+__pycache__/
+*.pyc

@@ -306,6 +306,54 @@ if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
     fi
     $SUDO install -d "$STATE_DIR"
     $SUDO chown goproxy:goproxy "$STATE_DIR" 2>/dev/null || true
+
+    # 证书与 ACME 缓存目录。单独建一个而不是复用 $STATE_DIR 根：
+    # 配置里 tls.cert_dir / tls.acme.cache_dir 默认是相对路径，会相对「配置文件
+    # 所在目录」解析，也就是 $CONFIG_DIR/data。
+    #
+    # 这里主动建好 $STATE_DIR/certs 并做成软链 $CONFIG_DIR/data -> 它，
+    # 让证书这类**运行态数据**落在 /var/lib 而不是 /etc —— 证书是状态不是配置，
+    # 混在配置目录里，备份配置时会一并带走私钥。软链已存在就不动
+    # （--no-service 或用户自己配了绝对路径的场景）。
+    CERT_DIR="$STATE_DIR/certs"
+    $SUDO install -d "$CERT_DIR"
+    $SUDO chown goproxy:goproxy "$CERT_DIR" 2>/dev/null || true
+    if [ ! -e "$CONFIG_DIR/data" ]; then
+        if $SUDO ln -s "$CERT_DIR" "$CONFIG_DIR/data" 2>/dev/null; then
+            ok "已把 $CONFIG_DIR/data 指向 $CERT_DIR（供 TLS/ACME 写证书）"
+        else
+            warn "建软链 $CONFIG_DIR/data -> $CERT_DIR 失败。若启用 TLS，请在配置里把"
+            warn "  tls.cert_dir / tls.acme.cache_dir 改成绝对路径 $CERT_DIR"
+        fi
+    elif [ ! -L "$CONFIG_DIR/data" ] && [ ! -w "$CONFIG_DIR/data" ]; then
+        warn "$CONFIG_DIR/data 已存在且不可写。启用 TLS 前请把它指到 $CERT_DIR，"
+        warn "  或在配置里把 tls.cert_dir / tls.acme.cache_dir 写成绝对路径"
+    fi
+
+    # 配置目录要对服务账号可写。管理接口的增删改路由、POST /reload、
+    # PATCH /_goproxy/config 全都是原子写 config.json（.tmp + rename），
+    # 写不进去这些操作直接失败。
+    #
+    # 这里踩过一次：ProtectSystem=strict 会把整个文件系统挂成只读，而单元里
+    # ReadWritePaths 只放行了 $STATE_DIR，于是「删除路由」报
+    #   open /etc/goproxy/config.json.tmp: read-only file system
+    #
+    # 关键是 systemd 的 ReadWritePaths 只改挂载属性、**不改 Unix 权限**：
+    # $CONFIG_DIR 是 root:root 0755 时，以 goproxy 身份跑的服务照样建不出 .tmp。
+    # 所以下面改属主和单元里的 ReadWritePaths 缺一不可，两个都得有。
+    if ! $SUDO chown goproxy:goproxy "$CONFIG_DIR" 2>/dev/null; then
+        warn "改不了 $CONFIG_DIR 的属主，管理接口改配置会失败。请手动执行："
+        warn "  sudo chown goproxy:goproxy $CONFIG_DIR"
+    fi
+
+    # 已有的配置文件也要过一遍属主：config.json.bak 万一是 root:root 0644，
+    # 服务每次写备份都会 permission denied（不致命，但备份会一直停在旧内容）。
+    for f in config.json config.json.bak config.json.tmp; do
+        if [ -e "$CONFIG_DIR/$f" ]; then
+            $SUDO chown goproxy:goproxy "$CONFIG_DIR/$f" 2>/dev/null || true
+        fi
+    done
+
     $SUDO install -d "$SYSTEMD_DIR"
 
     # 单元文件是要覆盖的（ExecStart 里带着本次的 BIN_DIR / CONFIG_DIR）。
@@ -337,7 +385,13 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$STATE_DIR
+
+# ProtectSystem=strict 会把整个文件系统挂成只读（/etc 也在内），
+# 所以凡是运行期要写的地方都必须显式放行：
+#   $STATE_DIR  —— 证书、ACME 缓存、运行态文件（$CONFIG_DIR/data 软链到这里）
+#   $CONFIG_DIR —— 管理接口要原子写 config.json（.tmp + rename）。
+#                  漏掉它，「删除路由」会报 config.json.tmp: read-only file system。
+ReadWritePaths=$STATE_DIR $CONFIG_DIR
 
 [Install]
 WantedBy=multi-user.target

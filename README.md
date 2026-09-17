@@ -2,10 +2,10 @@
 
 一个用 Go 写的 L7 HTTP 反向代理，核心验证 **「同一 IP 不同端口 → 不同后端」**（场景 C）以及按域名/路径分流。
 
-demo 已经做到 M3：转发、多端口分流、热重载、限流、**熔断**、**访问控制（IP 黑白名单 / Basic / JWT）**，
-外加**管理写接口、监控数据源和网页版管理控制台**。
+demo 已经做到 M4：转发、多端口分流、热重载、限流、**熔断**、**访问控制（IP 黑白名单 / Basic / JWT）**、
+**TLS / ACME 自动证书**，外加**管理写接口、监控数据源和网页版管理控制台**。
 
-仍然**故意不做**：TLS/ACME、SQLite。这些按正式方案的 M4–M7 迭代。
+仍然**故意不做**：SQLite（配置仍用 JSON 文件）、泛域名自动证书、mTLS。这些按正式方案的 M5–M7 迭代。
 
 ---
 
@@ -189,28 +189,167 @@ cd web && npm run dev
 | `/_goproxy/routes/{id}` | PUT | 全量替换（未提到的字段回默认值） |
 | `/_goproxy/routes/{id}` | PATCH | 局部更新，启停路由就用它 |
 | `/_goproxy/routes/{id}` | DELETE | 删除 |
-| `/_goproxy/ports` | GET | 当前实际监听的端口 |
+| `/_goproxy/ports` | GET | 当前实际监听的端口，以及每个端口是否走 TLS |
+| `/_goproxy/certs` | GET | 证书状态：域名、来源、签发者、到期时间、剩余天数、状态 |
 | `/_goproxy/config` | GET | 全局配置（**不回传 `admin_token` 明文**） |
-| `/_goproxy/config` | PATCH | 改 `default_ports` / `access_log` / `trusted_proxies` / `admin_token` |
+| `/_goproxy/config` | PATCH | 改 `default_ports` / `access_log` / `trusted_proxies` / `admin_token` / `admin_trust_loopback` |
 | `/_goproxy/stats` | GET | 聚合状态：版本、uptime、指标汇总、熔断计数、采样曲线 |
 | `/_goproxy/logs` | GET | 最近 N 条访问记录，`?limit=200`（上限 1000） |
 | `/_goproxy/events` | GET | 实时访问日志，SSE 推送 |
 | `/_goproxy/reload` | POST | 手动触发重载 |
+| `/_goproxy/login` | POST | 用 `admin_token` 换取会话 Cookie（**在鉴权闸门之外**，见下节） |
+| `/_goproxy/session` | GET | 当前会话状态：`authenticated` / `via` / `has_session` / `token_set` |
+| `/_goproxy/session` | DELETE | 登出（吊销会话 + 清 Cookie；也接受 `POST`） |
 
 ### 认证
 
 管理接口能改路由，等于能改流量走向，**不能裸奔**。
 
+控制台是网页，让用户把 `admin_token` 贴在浏览器里既不安全也不好用，
+所以管理端提供**三条**鉴权路径，任一通过即放行：
+
 | 来源 | 要求 |
 |---|---|
-| 回环地址（`127.0.0.1` / `::1`） | 免认证 |
-| 其它地址 | 必须 `Authorization: Bearer <admin_token>` |
+| 1. 回环地址（`127.0.0.1` / `::1`），且**不是经本进程代理转发进来的** | 免认证 |
+| 2. `Authorization: Bearer <admin_token>` | curl / 脚本 / Prometheus 用 |
+| 3. 会话 Cookie（控制台登录后拿到） | 浏览器用，`HttpOnly`，脚本读不到 |
 
 `admin_addr` 监听了非回环地址但没配 `admin_token` 时，**所有外部请求一律 403** ——
 宁可打不开，也不能让人随便改配置。
 
 > 判断来源只认 `RemoteAddr`。`X-Forwarded-For` 是客户端随手就能写的头，
 > 拿它判断「是不是本机」等于把认证决定权交给攻击者。这条有单测和端到端验证盯着。
+
+#### 控制台登录（会话）
+
+浏览器打开控制台时，如果没有会话，会看到一个令牌输入框：
+
+1. `POST /_goproxy/login`，body `{"token":"<admin_token>"}`
+2. 校验通过 → 下发 `HttpOnly` 会话 Cookie，**前端立刻丢弃内存里的令牌**
+3. 之后所有请求靠 Cookie 鉴权；用户再也看不到、也不需要持有令牌
+
+令牌本身**不落任何持久化存储**：前端只放在模块级内存变量里，
+刷新页面即丢失，所以每次刷新都要重新登录（对单机自托管是可接受的取舍）。
+
+会话的几个关键设计：
+
+| 项 | 值 | 为什么 |
+|---|---|---|
+| Cookie 名 | `goproxy_admin_session` | — |
+| Cookie `Path` | `/_goproxy/` | **不能**写成 `/_goproxy/ui/`：接口不在 `ui/` 之下，会导致「登录成功但刷新后仍然 401」 |
+| `HttpOnly` | 始终 | XSS 偷不走凭据的唯一依据 |
+| `SameSite` | `Strict` | CSRF 第一道防线 |
+| `Secure` | 仅请求走 TLS 时 | 明文端口加了会被浏览器直接丢弃 |
+| 空闲超时 | 30 分钟（滑动） | 一直在用就一直有效 |
+| 绝对超时 | 12 小时（不延长） | 不能靠「一直点」无限续期 |
+| 服务端存储 | 只存 `sha256(handle)` | 内存被 dump 也拿不到可用句柄 |
+| 上限 | 128 条 | 防内存无限增长 |
+| 绑定令牌指纹 | `sha256(admin_token)` | **改 `admin_token` 即全部会话立刻失效**，不需要额外的吊销机制 |
+
+登出走 `DELETE /_goproxy/session`（也接受 `POST`），会吊销会话并清 Cookie。
+
+##### 登录防爆破
+
+| 机制 | 参数 |
+|---|---|
+| 单 IP 失败封禁 | 5 次 → 10 分钟 |
+| 全局失败封禁 | 50 次 → 1 分钟（挡换 IP 池） |
+| 响应时间 | 恒定 ~400ms，抹平时序侧信道 |
+| 失败响应 | 空令牌与错令牌**完全一致**（否则等于告诉攻击者服务端有没有配令牌） |
+
+`429` 会带 `Retry-After`（加了抖动，避免所有客户端同时重试）。
+
+##### CSRF
+
+`SameSite=Strict` 是第一层，显式校验是第二层（纵深防御，代价几乎为零）。
+只对**写方法 + 会话鉴权**生效：`Bearer` 不随请求自动携带，本来就没有 CSRF 面，
+不该给 curl 增加负担。
+
+两种校验策略，差别只在「两个头都没有」时怎么办：
+
+| 场景 | 策略 | 理由 |
+|---|---|---|
+| 会话写请求 | **fail-closed**：缺头即拒 | 能走到这里说明带了 Cookie，而浏览器跨站写请求**一定**会发 `Origin`；缺头就可疑 |
+| 登录请求 | **fail-open**：缺头放行 | 登录本来就没有 Cookie，curl/脚本也不发这两个头。跨站攻击**一定**会发 `Origin`/`Sec-Fetch-Site`，所以放行的只是「本来就非浏览器」的请求，不构成 CSRF 面。一律 fail-closed 会让 `curl -d '{"token":...}' /_goproxy/login` 直接 403 |
+
+##### 为什么 `/login` 必须在鉴权闸门**之外**
+
+`POST /_goproxy/login` 和 `GET /_goproxy/session` 这两条路径**不经过** `adminGuard`。
+
+这不是随手放行：登录接口的职责就是「在还没有凭据的时候拿到凭据」，
+放在闸门之内等于把钥匙锁在屋里 —— 未登录的浏览器只会拿到 401，
+永远走不到登录页。代码里由 `isAuthPath()` 单独列出，安全评审只需看这一个函数。
+
+放行不等于不设防，两条路径各自带完整防护（见上面的防爆破与 CSRF 表）。
+其余所有管理接口仍然一律经过 `adminGuard`，没有任何豁免。
+
+#### 安全响应头
+
+所有响应（静态资源、接口、纯文本清单）都带：
+
+| 头 | 值 |
+|---|---|
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `X-Robots-Tag` | `noindex, nofollow` |
+| `Referrer-Policy` | `no-referrer` |
+| `Content-Security-Policy` | 控制台与接口用两套不同策略 |
+
+控制台 CSP 是 `script-src 'self'`（**不允许**内联脚本）。这也是首屏主题脚本
+必须是外链 `theme.js` 而不是内联 `<script>` 的原因 —— 详见 `web/public/theme.js` 的注释。
+
+`style-src` 保留了 `'unsafe-inline'`，这是**刻意的取舍**：React 的 `style={{...}}`
+会产出内联样式属性，去掉它就得把所有动态样式改成 CSS 变量，收益不抵成本。
+
+接口的 CSP 更严（`default-src 'none'`），因为它只返回 JSON，不需要加载任何东西。
+
+#### 500 错误不回显内部信息
+
+`writeErr` 对未预期的错误**不返回 `err.Error()`** —— 那里面常常带着绝对路径、
+`permission denied`、甚至配置内容片段，等于免费给攻击者做信息收集。
+
+客户端拿到的是一个短错误编号：
+
+```json
+{"error":"internal","message":"服务端内部错误，详情见服务端日志（错误编号 3f2a9c1b）。"}
+```
+
+详情只进服务端日志（带同一个 `error_id`），排查时按编号对账。
+
+#### 为什么「回环免认证」还要额外加一个条件
+
+光看 `RemoteAddr` 是不够的，因为**代理转发到管理端口时，源地址就是 `127.0.0.1`**。
+于是「把某条路由的 `target` 指向管理端口」就等于给外部客户端开了一道免认证的后门：
+
+```jsonc
+// 危险配置示例：外部访问 8081 就能白拿全部管理权限
+{ "id": "bad", "listen_port": 8081, "path_prefix": "/",
+  "target": "http://127.0.0.1:9080" }
+```
+
+实测确认过：这样经代理访问 `/_goproxy/config`、甚至 `POST /_goproxy/reload`
+都是 `200`，等于完全接管（改路由 = 劫持全部流量）。
+
+所以代理转发时会写入一个标记头，管理端**只要看到这个头就按外部请求处理**，
+不再因为来源是回环而放行。这个头不需要保密，也不靠保密生效：
+
+- 伪造它只会让判断更严，对攻击者不利；
+- 省略它也躲不开 —— 经代理进来的请求，代理一定会写进去。
+
+反过来，用一条 TLS 路由把管理面板发布出去（比如 `host: admin.example.com`）
+**是完全可行的**，只是访问它时必须带令牌（或先登录）—— 因为那确实是一次外部访问。
+
+#### `admin_trust_loopback`
+
+```jsonc
+{ "admin_trust_loopback": false }
+```
+
+默认 `true`（保持本机 curl / 脚本免令牌的习惯）。当管理端口前面**还挂着别的本地反向代理**
+（nginx、Caddy 等）时应当设为 `false`：那种转发同样来自 `127.0.0.1`，
+且不会带本进程的标记头，「回环 = 本机运维」这个前提就不成立了。
+
+可以运行时改（`PATCH /_goproxy/config`），不用重启。
 
 ### 用法
 
@@ -484,16 +623,160 @@ EOF
 
 ---
 
+## TLS / HTTPS
+
+### 总开关 + 路由覆盖
+
+TLS 由**顶层 `tls.enabled` 开关**控制，每条路由再用 `tls_mode` 决定自己的行为：
+
+```jsonc
+{
+  "tls": {
+    "enabled": true,          // 全局开关，关掉则所有路由都退回明文
+    "https_port": 443,        // HTTPS 监听端口（HTTP 在下面 acme 的 http_port）
+    "cert_dir": "data/certs", // 相对路径 → 相对配置文件所在目录
+    "acme": {
+      "email": "you@example.com",
+      "staging": false,       // true = 用 Let's Encrypt 测试环境，不占正式额度
+      "directory_url": ""     // 留空按 staging 自动选；也可指向自建 ACME（如 step-ca）
+    }
+  },
+  "routes": [
+    { "id": "web", "listen_port": 443, "host": "app.example.com",
+      "tls_mode": "auto", "target": "http://127.0.0.1:9001" },
+
+    { "id": "legacy", "listen_port": 8443, "host": "old.example.com",
+      "tls_mode": "manual", "cert_file": "data/certs/old.crt",
+      "key_file": "data/certs/old.key", "redirect_http": false,
+      "target": "http://127.0.0.1:9002" },
+
+    { "id": "plain", "listen_port": 8080,
+      "tls_mode": "off", "target": "http://127.0.0.1:9003" }
+  ]
+}
+```
+
+| `tls_mode` | 含义 | 证书来源 |
+|---|---|---|
+| `auto` | 自动申请 + 自动续期 | ACME（Let's Encrypt），走 HTTP-01 |
+| `manual` | 用你自己指定的证书 | `cert_file` / `key_file`，**支持热更新** |
+| `off` | 该路由纯明文 | 无 |
+
+路由不写 `tls_mode` 时默认跟随全局：全局开了就是 `auto`，没开就是 `off`。
+
+### 端口级，不是路由级
+
+**一个端口要么全明文、要么全 TLS**，二者不能混。原因很实际：如果同一个端口
+对某些请求加密、对另一些不加密，攻击者只要构造一个走明文的请求就能把流量降级
+（TLS stripping）。所以 TLS 是按**监听端口**决定的，不是按路由。
+
+由此带来一个必须知道的约束：**路由的 `listen_port` 就是决定它跑不跑 TLS 的依据**。
+同在 443 上的路由都走 TLS，同在 8080 上的都走明文。
+
+### HTTP→HTTPS 跳转
+
+开着 TLS 时，打到明文端口（默认 80）的请求会 **301 跳到 HTTPS**，路径和 query 原样保留：
+
+```
+http://app.example.com/a?b=1   →   https://app.example.com/a?b=1
+```
+
+不想要跳转就在路由上写 `redirect_http: false`（比如想让明文端口继续提供 API，
+不逼客户端跟着跳）。`tls_mode: "off"` 的路由天然不跳 —— 它本来就没有 HTTPS 可跳。
+
+判断「这个请求是不是已经走了 TLS」靠的是监听端口本身，不是请求里的头，
+所以不存在 `X-Forwarded-Proto` 被伪造导致的重定向死循环。
+
+### 80 端口的三个职责
+
+开了 TLS 之后，80 端口同时干三件事，按顺序判断：
+
+1. **ACME 挑战** —— `/.well-known/acme-challenge/*` 交给 autocert 应答（申请/续期要用）
+2. **跳转** —— 其余请求 301 到 HTTPS（除非路由写了 `redirect_http: false`）
+3. **明文代理** —— 该端口上的 `tls_mode: "off"` 路由照常提供明文服务
+
+### 证书热更新
+
+`manual` 模式的证书文件**每 30 秒轮询一次 mtime**，文件变了就重新加载，不用重启：
+
+```bash
+# 换了证书直接覆盖文件，30 秒内自动生效
+sudo cp new.crt /etc/goproxy/data/certs/old.crt
+sudo cp new.key /etc/goproxy/data/certs/old.key
+```
+
+重新加载**失败时会继续用旧证书**——轮换期间写错文件不至于把站点搞挂，
+但错误会通过下面的接口暴露出来，方便你发现这次轮换其实没生效。
+
+### ACME 的硬约束
+
+自动证书有几个绕不过去的限制，配之前必须知道：
+
+| 约束 | 说明 |
+|---|---|
+| **HTTP-01 固定走 80** | 申请时必须能从公网访问你域名的 80 端口。所以 `listen_port` 自定义的路由**拿不到自动证书**，只能 `manual` 或 `off` |
+| **TLS-ALPN-01 固定走 443** | 同上，443 也必须是标准端口 |
+| **不能给裸 IP 签发** | Let's Encrypt 拒绝为 IP 地址签发证书，`auto` 只认域名 |
+| **不支持泛域名** | `*.example.com` 需要 DNS-01 验证，demo 没做。泛域名请用 `manual` 挂通配证书 |
+| **有严格频率限制** | 同一域名重复签发有每周限额，所以 `data/` 目录（ACME 缓存）**必须持久化**，容器/服务重启后不能丢 |
+
+验证阶段建议先开 `staging: true` 跑通流程，确认没问题再切回正式环境
+—— 测试环境的额度宽松得多，出错了也不会把正式域名拖进限流。
+
+### 查看证书状态
+
+```bash
+curl -s http://127.0.0.1:9080/_goproxy/certs | jq .
+```
+
+```jsonc
+{
+  "tls_enabled": true,
+  "acme_dir": "https://acme-v02.api.letsencrypt.org/directory",
+  "certs": [
+    { "domain": "app.example.com", "source": "acme", "issuer": "Let's Encrypt",
+      "not_after": "2026-12-14T08:30:00Z", "days_left": 89, "state": "valid" },
+    { "domain": "old.example.com", "source": "manual", "issuer": "My CA",
+      "not_after": "2026-10-01T00:00:00Z", "days_left": 15, "state": "expiring" }
+  ]
+}
+```
+
+`state` 有四种：`valid` / `expiring`（**剩不到 20 天**）/ `expired` / `error`（加载失败）。
+证书加载失败时 `days_left` 是 0，别把它误读成「还有很久」——所以 `error` 的判断
+优先级高于 `expiring`，控制台的「证书」页就是这么显示的。
+
+控制台左侧「证书」标签页也有一份同样的表格，外加当前监听的端口及各端口是否走 TLS。
+
+### 与自带部署脚本的配合
+
+`install.sh` 会处理三件事：
+
+- systemd 单元里给了 `AmbientCapabilities=CAP_NET_BIND_SERVICE`，**非 root 也能绑 80/443**
+- **让配置目录对服务账号可写**。管理接口增删改路由靠的是原子写
+  （写 `config.json.tmp` 再 `rename` 覆盖），而 `ProtectSystem=strict` 下 `/etc`
+  默认只读 —— 不放行的话「删除路由」会直接报
+  `open /etc/goproxy/config.json.tmp: read-only file system`。
+  脚本会把 `$CONFIG_DIR` 加进 `ReadWritePaths`，**并且**把它 `chown` 给 `goproxy`。
+  两件都得做：`ReadWritePaths` 只改挂载属性，不改 Unix 权限
+- 把 `$CONFIG_DIR/data` 软链到 `/var/lib/goproxy/certs`，让证书这类运行态数据落在
+  `/var/lib` 而不是 `/etc` —— 证书是状态不是配置，混在配置目录里，备份配置会连私钥一起带走
+
+---
+
 ## 已知限制（demo 边界）
 
 | 不做 | 原因 / 何时做 |
 |---|---|
-| TLS / ACME 证书 | M4。且自定义端口拿不到自动证书（HTTP-01 固定走 80），只能跑明文或挂手动证书 |
-| Web 管理界面 | **后端接口已全部就绪**（路由 CRUD + `stats` + `logs` + SSE `events`），前端待做。现在只能用 curl / 脚本操作 |
+| 泛域名（`*.example.com`）自动证书 | 需要 DNS-01 验证。要泛域名就用 `manual` 挂通配证书 |
+| 客户端证书（mTLS） | 没做。需要双向认证的话建议在上一层网关终结 |
 | 访问日志落盘 | 只往标准输出写，没有内置文件轮转。需要留存就接 `systemd` 的 journal 或外部 logrotate |
 | SQLite | M1 正式版。现在用 JSON 文件，`loadConfig` 换掉即可，下游不动 |
 | 路由变更审计 | 写接口目前不记录「谁在什么时候改了哪条路由」。多人共用管理端时会需要 |
 | 多实例共享状态 | 限流和熔断都是进程内内存，多副本各算各的。另外**写配置也是单机行为**，两个实例各写各的会互相覆盖，多副本场景需要换成共享存储 + 一致性协议。预留了接口，后续换 Redis / SQLite |
+| 会话持久化 | 会话存在进程内存里，**重启即全部失效**。对单机自托管是可接受的取舍（换来的是「不引入存储依赖」）。要跨重启保持登录就得引入存储 |
+| 多用户 / 权限分级 | 只有「知道 `admin_token` 就能全权操作」这一档。没有只读账号、没有按路由授权 |
+| CSP 的 `style-src` 内联 | 保留 `'unsafe-inline'`，因为 React 的 `style={{...}}` 产出内联样式属性。去掉需要把动态样式全改成 CSS 变量，收益不抵成本 |
 
 ---
 
@@ -656,7 +939,7 @@ systemctl show -p ExecMainStartTimestamp goproxy   # 重启时间应该是刚刚
 | 变量 | 默认值 | 用途 |
 |---|---|---|
 | `SYSTEMD_DIR` | `/etc/systemd/system` | 单元文件放哪 |
-| `STATE_DIR` | `/var/lib/goproxy` | 单元里的 `WorkingDirectory` / `ReadWritePaths` |
+| `STATE_DIR` | `/var/lib/goproxy` | 单元里的 `WorkingDirectory`，也是证书目录的落点（`ReadWritePaths` 里除了它还包含配置目录 —— 管理接口要能写配置） |
 
 ### 版本号从哪来
 
@@ -719,6 +1002,9 @@ Description=goproxy reverse proxy
 After=network.target
 
 [Service]
+# 降权运行。注意：得给服务账号配置目录的写权限（见下面 ReadWritePaths 的说明）
+User=goproxy
+Group=goproxy
 ExecStart=/opt/goproxy/goproxy -c /opt/goproxy/config.json
 WorkingDirectory=/opt/goproxy
 Restart=always
@@ -729,18 +1015,40 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+
+# 这个目录必须同时可读**可写**：管理接口改配置走原子写
+# （写 config.json.tmp 再 rename 覆盖）。只读的话「删除路由」会报
+# read-only file system，而且只在真正操作时才暴露。
+#
+# 把配置放 /etc/goproxy（脚本的默认布局）时同理 —— 要一起放行，
+# 并且把属主给服务账号：ReadWritePaths 只解除只读挂载，不改 Unix 权限，
+# 目录还是 root:root 0755 的话服务照样建不出 .tmp。
 ReadWritePaths=/opt/goproxy
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+> **管理接口报 `read-only file system` 或 `permission denied`？** 都是上面这条
+> 没配对，跟接口本身无关。`install.sh` 装的话重跑一次即可（配置不动、
+> 单元重写、在跑的服务会自动重启）；手写单元的按上面两件事补：
+> `ReadWritePaths` 里加上配置目录，并 `chown <服务账号> <配置目录>`。
+
 Docker：
 
 ```bash
+# 配置要挂「目录」不能挂单个文件：单文件在容器里是个挂载点，
+# 而原子写的最后一步是 rename 覆盖它 —— 内核禁止 rename 到挂载点（EBUSY），
+# 改成 :rw 也没用，只会把 read-only file system 换成 device or resource busy。
+# 宿主目录的属主要给容器里的 uid 10001，否则同样写不进去。
+mkdir -p config data && cp config.json config/ && sudo chown -R 10001:10001 config data
+
 docker compose up -d --build
 # 或
-docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:/etc/goproxy/config.json:ro goproxy:demo
+docker build -t goproxy:demo . && docker run --network host \
+  -v $PWD/config:/etc/goproxy \
+  -v $PWD/data:/etc/goproxy/data \
+  goproxy:demo
 ```
 
 ---
@@ -751,10 +1059,14 @@ docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:
 |---|---|
 | `main.go` | 组装、请求入口、管理端点注册、配置热重载、优雅停机 |
 | `config.go` | 配置结构与校验、配置文件的原子写入与 revision |
-| `admin_api.go` | 管理接口：认证闸门、路由 CRUD、全局配置读写 |
+| `admin_api.go` | 管理接口：认证闸门、路由 CRUD、全局配置读写、登录与会话端点 |
+| `session.go` | 控制台登录会话：只存句柄哈希、空闲/绝对过期、登录限流、CSRF 同源校验 |
+| `secheaders.go` | 安全响应头与 CSP（控制台与接口用两套策略） |
 | `router.go` | 三级匹配表（端口 → host → path），不可变快照 |
 | `proxy.go` | ReverseProxy 封装：连接池、超时、XFF、真实 IP 解析 |
-| `listener.go` | 多端口监听管理，按路由表变化自动增删 |
+| `listener.go` | 多端口监听管理，按路由表变化自动增删；TLS 端口用 `tls.NewListener` 包一层 |
+| `tlsconfig.go` | TLS/ACME 配置结构、默认值、校验；端口 → TLS 配置的推导 |
+| `tls.go` | 证书管理器：按 SNI 分发、manual 热加载（30s 轮询）、autocert 接入、证书状态 |
 | `ratelimit.go` | 按 IP 分桶的令牌桶（带过期清理） |
 | `circuitbreaker.go` | 滑动窗口熔断器（closed / open / half-open） |
 | `acl.go` | IP 黑白名单（CIDR） |
@@ -770,7 +1082,11 @@ docker build -t goproxy:demo . && docker run --network host -v $PWD/config.json:
 | `admin_api_test.go` | 管理接口单测：CRUD、并发写冲突、认证、坏配置不落盘 |
 | `stats_test.go` | 环形缓冲、采样序列、SSE、并发重载单测 |
 | `webui_test.go` | 控制台托管单测：内嵌资源、缓存头、SPA 回落、静态壳免鉴权但接口仍鉴权 |
-| `scripts/e2e_console.py` | 端到端自检：真实后端 + 真实反代，69 项断言 |
+| `tls_test.go` | TLS 单测：按 SNI 分发、通配匹配、热加载、续期告警阈值、跳转逻辑、ACME 约束 |
+| `example_config_test.go` | 守卫测试：`config.example.json` 必须能加载，部署文件必须暴露 443 |
+| `deploy_test.go` | 部署守卫：单元 `ReadWritePaths` 含配置目录、`install.sh` 改属主、Dockerfile `chown`、compose 挂目录而非单文件 |
+| `session_test.go` | 会话与登录单测：存储哈希、过期、限流、Cookie 属性、CSRF、端点可达性、恒定耗时 |
+| `scripts/e2e_console.py` | 端到端自检：真实后端 + 真实反代，107 项断言（含认证与会话一节） |
 
 ```bash
 go test ./...   # 跑测试
@@ -778,17 +1094,37 @@ go vet ./...    # 静态检查
 
 # 端到端自检：会用真实二进制起 4 个测试后端 + 反代，
 # 覆盖控制台依赖的全部接口（静态资源、根路径分流、限流/认证真实流量、
-# stats/logs、SSE、路由 CRUD + ETag 并发、全局配置、Prometheus 指标）。
+# stats/logs、SSE、路由 CRUD + ETag 并发、全局配置、Prometheus 指标、
+# 以及三条鉴权路径 / 登录 / CSRF / 登出 / 安全响应头）。
 # 需要 PATH 里有 go 和 python3；产物都落在临时目录，不污染工作区。
 python scripts/e2e_console.py
 ```
+
+TLS 另有两个实机端到端脚本（在仓库外的开发目录里，自签证书 + 真实进程）：
+
+- **`e2e_tls.py`** —— 起两个后端 + 两个自签证书，逐个 SNI 校验**证书链和域名**
+  （用自签证书当 CA 做完整校验，而不是只看握手成功）、HTTPS 是否转到了正确的后端、
+  明文端口是否 301（含非标准端口）、`/certs` 与 `/ports` 接口的形状。
+- **`e2e_tls_reload.py`** —— 热加载验证：比对**DER 指纹**（PEM 解码后再哈希，
+  直接哈希 PEM 文件比的是错的字节），替换磁盘上的证书后等 30 秒轮询周期，
+  断言服务端换上了新证书且**没有重启**。
+
+> ACME 的签发流程没有端到端覆盖 —— 本地没有公网域名，HTTP-01 拿不到证书。
+> 这部分靠单测覆盖（`TestACMEEffectiveDirectoryURL`、`TestAutoCertRejectsIPAndWildcard`、
+> `TestAutoCertRejectsCustomPort` 等），实机验证只能等有域名时做。
 
 ---
 
 ## 下一步
 
-已完成 M1–M3，加上管理写接口、监控数据源和管理控制台前端（原属 M6 的部分已经做完）。
-接下来：**TLS / ACME 自动证书**（M4）→ 配置源换成 SQLite（M5）。
+已完成 M1–M4（含 TLS / ACME 自动证书）、管理写接口、监控数据源、管理控制台前端，
+以及**登录 / 会话 / 安全加固**（三条鉴权路径、会话 Cookie、防爆破、CSRF、安全响应头）。
+
+接下来：
+
+- **配置源换成 SQLite（M5 正式版）** —— `loadConfig` 换掉即可，HTTP 层与前端不动
+- 审计日志：记录「谁在什么时候改了哪条路由」
+- 多用户与权限分级（现在只有「知道 `admin_token` 即全权」一档）
 
 > 完整的架构方案、数据模型与里程碑计划不在这个仓库里。
 

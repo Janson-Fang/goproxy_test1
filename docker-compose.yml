@@ -8,10 +8,33 @@ services:
     # 单机场景推荐用 host 网络，路由里配什么端口就自动用什么端口。
     network_mode: host
     volumes:
-      - ./config.json:/etc/goproxy/config.json:ro
-    # 若改用 bridge 网络，需要逐个映射端口：
+      # 配置要挂「目录」，不能挂单个文件。
+      #
+      # 单文件挂载（- ./config.json:/etc/goproxy/config.json）会让这个文件在容器里
+      # 变成一个挂载点，而配置的原子写最后一步正是 rename 覆盖它 —— Linux 内核在
+      # vfs_rename 里禁止 rename 到挂载点，直接返回 EBUSY。所以光把 :ro 改成 :rw
+      # 是没用的，只会把 read-only file system 换成 device or resource busy。
+      #
+      # 宿主机目录的属主要给容器里的 uid 10001（goproxy），否则一样写不进去：
+      #   mkdir -p config && cp config.json config/ && sudo chown -R 10001:10001 config
+      - ./config:/etc/goproxy:rw
+
+      # 证书与 ACME 缓存必须持久化。默认 tls.cert_dir / tls.acme.cache_dir 是
+      # 相对路径（相对配置文件所在目录，即 /etc/goproxy/），所以这里把整个
+      # /etc/goproxy/data 挂出来最省事。也可以把配置里的路径改成绝对路径
+      # /var/lib/goproxy 再挂那个目录。
+      #
+      # 为什么必须持久化：Let's Encrypt 对「同一域名重复签发」有每周限额，
+      # 冷启动反复申请会直接被限流，把站点证书搞成长期不可用。
+      - ./data:/etc/goproxy/data:rw
+    # 容器内以 uid 10001 运行，绑定 80/443 这类特权端口依赖 CAP_NET_BIND_SERVICE。
+    # Docker 默认已授予，这里显式声明一份，避免落到更严格的默认策略上时莫名 listen 失败。
+    cap_add:
+      - NET_BIND_SERVICE
+    # 若改用 bridge 网络，需要逐个映射端口（含 TLS 的 443）：
     # ports:
     #   - "80:80"
+    #   - "443:443"
     #   - "8081:8081"
     #   - "8082:8082"
     #   - "9080:9080"

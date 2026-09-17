@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,25 @@ type App struct {
 	// adminToken 管理接口令牌。只从回环访问时不需要，非回环必须带。
 	adminToken string
 
+	// adminTrustLoopback 是否信任来自回环地址的请求。
+	// 默认 true（本机 curl / 脚本免令牌）；管理端口前面还挂了别的本地反代时
+	// 应设为 false —— 那些转发同样来自 127.0.0.1，却不是「本机运维」。
+	adminTrustLoopback bool
+
+	// sessions 管理控制台的登录会话。内存存储：进程重启即全部失效，
+	// 对单机自托管是可接受的取舍（换来的是「不引入存储依赖」）。
+	sessions *sessionStore
+
+	// trusted 是可信代理网段快照，登录限流解析真实 IP 时要用。
+	trusted atomic.Pointer[[]*net.IPNet]
+
+	// tlsmgr 证书管理器。顶层 tls.enabled=false 时为 nil，
+	// 这时所有端口跑明文，行为与引入 TLS 之前完全一致。
+	tlsmgr atomic.Pointer[tlsManager]
+
+	// tlsCfg 当前生效的 TLS 配置快照，供构造端口 spec 时读取。
+	tlsCfg atomic.Pointer[Config]
+
 	// writeMu 串行化「读配置 → 改 → 写回 → 热重载」这一个事务，
 	// 防止两个并发写各自读到旧文件、互相覆盖（经典 lost update）。
 	// 单独一把锁而不复用 mu：写事务会先拿 writeMu，再在 reload() 里拿 mu,
@@ -56,9 +76,47 @@ func NewApp(cfgPath string) (*App, error) {
 		listeners: NewListenerManager(),
 		metrics:   NewMetrics(),
 		logs:      newLogBuffer(logRingSize),
+		sessions:  newSessionStore(),
 		lastMod:   st.ModTime(),
 		lastSize:  st.Size(),
 	}, nil
+}
+
+// warnIfConfigUnwritable 启动时探一下配置目录能不能写。
+//
+// 管理接口改配置走的是原子写（写 config.json.tmp，再 rename 覆盖）。目录一旦
+// 不可写，增删改路由、POST /reload、PATCH /config 会全部失败 —— 而失败只在
+// 真正点下去那一刻才暴露，很容易被当成接口 bug 去查。
+//
+// 实际踩过：systemd 的 ProtectSystem=strict 把 /etc 挂成只读，单元里
+// ReadWritePaths 又只放行了状态目录，于是「删除路由」报
+//
+//	open /etc/goproxy/config.json.tmp: read-only file system
+//
+// 只告警不退出：配置只读时纯转发仍然完全可用，不该因此起不来。
+func (a *App) warnIfConfigUnwritable() {
+	if err := a.configWriteProbe(); err != nil {
+		slog.Warn("配置目录不可写：管理接口的增删改路由会全部失败",
+			"dir", filepath.Dir(a.cfgPath),
+			"err", err,
+			"hint", "systemd 需要把该目录加进 ProtectSystem=strict 的 ReadWritePaths，并让服务账号拥有它；"+
+				"Docker 要挂目录而不是单个文件（单文件挂载会让 rename 撞上 EBUSY）")
+	}
+}
+
+// configWriteProbe 探一下能不能在配置目录里建文件，返回 nil 表示原子写没问题。
+//
+// 用 CreateTemp + 立即删除，而不是看权限位：ACL、只读挂载、SELinux
+// 都能让权限位显示「可写」而实际写不进去。真正建一个文件才算数。
+func (a *App) configWriteProbe() error {
+	f, err := os.CreateTemp(filepath.Dir(a.cfgPath), ".writable-probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
 }
 
 // reload 重新加载配置并原子替换路由表。
@@ -83,6 +141,9 @@ func (a *App) reload() error {
 	}
 	// 可信代理网段挂进快照。这里还没 Store，没有并发读者，不需要额外同步。
 	tbl.trusted = nets
+	// 登录限流也要解析真实 IP，单独存一份引用（它不跟着 tbl 的原子替换走，
+	// 但网段本身在配置里很少变，重载时会一起更新）。
+	a.trusted.Store(&nets)
 
 	// 释放已经不存在的路由上的限流器（它们各自跑着清理 goroutine）
 	if old != nil {
@@ -104,10 +165,20 @@ func (a *App) reload() error {
 		a.adminAddr = ""
 	}
 	a.adminToken = cfg.AdminToken
+	a.adminTrustLoopback = cfg.adminTrustsLoopback()
 	a.accessLog.Store(cfg.AccessLog)
 	a.table.Store(tbl)
 
-	if err := a.listeners.Sync(tbl.ListenPorts(), a.handler()); err != nil {
+	// 构建证书管理器。这是唯一可能失败的新步骤：证书读不出来、
+	// ACME 缓存目录建不了，都应该让 reload 报错而不是带病运行。
+	tlsmgr, err := newTLSManager(cfg)
+	if err != nil {
+		return err
+	}
+	a.tlsmgr.Store(tlsmgr)
+	a.tlsCfg.Store(cfg)
+
+	if err := a.listeners.Sync(a.portSpecs(cfg, tlsmgr), a.handler()); err != nil {
 		// 单个端口失败不影响其它端口，只告警
 		slog.Warn("部分端口监听失败", "err", err)
 	}
@@ -117,11 +188,71 @@ func (a *App) reload() error {
 	if adminShown == "" {
 		adminShown = "(已关闭)"
 	}
+	tlsShown := "off"
+	if cfg.TLS.Enabled {
+		tlsShown = fmt.Sprintf("on (%d 个 TLS 端口)", len(cfg.tlsPorts()))
+	}
 	slog.Info("配置已生效",
 		"routes", len(tbl.routes),
 		"ports", tbl.ListenPorts(),
+		"tls", tlsShown,
 		"admin", adminShown)
 	return nil
+}
+
+// portSpecs 把「要监听哪些端口 + 哪些端口跑 TLS」算成 ListenerManager 要的形式。
+func (a *App) portSpecs(cfg *Config, m *tlsManager) []portSpec {
+	ports := cfg.allListenPorts()
+	tlsSet := cfg.tlsPorts()
+
+	specs := make([]portSpec, 0, len(ports))
+	for _, p := range ports {
+		spec := portSpec{port: p}
+		if tlsSet[p] && m != nil {
+			spec.tls = tlsListenerInfo{
+				enabled: true,
+				config:  cfg.tlsConfigFor(m),
+			}
+		}
+		specs = append(specs, spec)
+	}
+	return specs
+}
+
+// acmeChallengePrefix 是 ACME HTTP-01 挑战的固定路径前缀（RFC 8555）。
+const acmeChallengePrefix = "/.well-known/acme-challenge/"
+
+// httpsRedirectURL 把当前明文请求改写成对应的 HTTPS 地址。
+//
+// 几个必须做对的细节：
+//   - 端口：HTTPS 端口是 443 时**不写端口**。写成 "https://a.com:443/"
+//     虽然功能上等价，但地址栏里会一直显示 :443，容易让人误判成配错了。
+//   - Host：用 r.Host 保留客户端请求的域名（它自带端口则剥掉）。
+//   - 路径与查询串原样带上，否则跳转后会丢参数。
+func (a *App) httpsRedirectURL(r *http.Request) string {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	httpsPort := 0
+	if cfg := a.tlsCfg.Load(); cfg != nil {
+		httpsPort = cfg.TLS.HTTPSPort
+	}
+
+	var b strings.Builder
+	b.WriteString("https://")
+	b.WriteString(host)
+	if httpsPort != 0 && httpsPort != defaultHTTPSPort {
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(httpsPort))
+	}
+	b.WriteString(r.URL.EscapedPath())
+	if q := r.URL.RawQuery; q != "" {
+		b.WriteByte('?')
+		b.WriteString(q)
+	}
+	return b.String()
 }
 
 // handler 是所有监听端口共用的入口。端口从 context 里取。
@@ -157,6 +288,36 @@ func (a *App) handler() http.Handler {
 		if tbl == nil {
 			writeJSON(rec, http.StatusServiceUnavailable, map[string]string{"error": "路由表尚未就绪"})
 			return
+		}
+
+		// 明文端口上的三件事，顺序不能乱：
+		//   1) ACME 的 HTTP-01 挑战 —— 它必须能到达，绝不能跳转，
+		//      一跳转 Let's Encrypt 的验证就失败（而且是静默失败，很难查）。
+		//   2) HTTP→HTTPS 重定向
+		//   3) 明文代理（tls_mode=off 的路由）
+		if !requestIsTLS(r) {
+			if m := a.tlsmgr.Load(); m != nil && m.acme != nil {
+				// autocert 的 HTTPHandler 认识 /.well-known/acme-challenge/ 前缀
+				// 并直接响应，其余请求交给 fallback。
+				// 传 nil fallback 之前先判前缀，避免它为每个普通请求都掺一脚。
+				if strings.HasPrefix(r.URL.Path, acmeChallengePrefix) {
+					m.acme.HTTPHandler(nil).ServeHTTP(rec, r)
+					return
+				}
+			}
+
+			// 该路由开了 TLS 且要求跳转 → 301 到 HTTPS
+			if rt := tbl.Match(port, r.Host, r.URL.Path); rt != nil && rt.wantsHTTPSRedirect() {
+				target := a.httpsRedirectURL(r)
+				rec.Header().Set("Location", target)
+				// 301 是永久重定向，浏览器会缓存。这里用 301
+				// 是因为「明文→HTTPS」的策略确实不会来回变，
+				// 让客户端把跳转记下来能省掉一次明文往返。
+				rec.WriteHeader(http.StatusMovedPermanently)
+				blocked = "redirected_to_https"
+				a.metrics.IncRequest(rt.ID, http.StatusMovedPermanently)
+				return
+			}
 		}
 
 		rt = tbl.Match(port, r.Host, r.URL.Path)
@@ -305,9 +466,29 @@ func (a *App) logAccess(r *http.Request, port int, rt *Route, blocked, ip string
 func (a *App) adminHandler() http.Handler {
 	guarded := a.adminGuard(a.adminMux())
 
+	// 登录/会话这两条路径**必须在 adminGuard 之外**。
+	//
+	// 这不是随手放行，而是登录本身的语义决定的：登录接口的职责就是
+	// 「在还没有凭据的时候拿到凭据」，把它放在 Guard 之内等于把钥匙锁在屋里 ——
+	// 未登录的浏览器只会拿到 401，永远走不到登录页。
+	// （这个坑真实踩过：/login 曾经注册在 adminMux 上，结果所有登录测试全 401。）
+	//
+	// 放行不等于不设防，两条路径各自带完整防护：
+	//   - /login  ：来源同源校验 + 按 IP/全局失败计数封禁 + 恒定耗时 + 常量时间比对
+	//   - /session：GET 只读且不泄漏信息（自己报告当前凭据来源）；写方法要同源校验
+	// 其余所有管理接口仍然一律经过 adminGuard，没有任何豁免。
+	auth := http.NewServeMux()
+	auth.HandleFunc("/_goproxy/login", a.handleLogin)
+	auth.HandleFunc("/_goproxy/session", a.handleSession)
+
 	root := http.NewServeMux()
 	root.Handle(uiPrefix, a.uiHandler())
 	root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if isAuthPath(r.URL.Path) {
+			auth.ServeHTTP(w, r)
+			return
+		}
+
 		if isAdminAPIPath(r.URL.Path) {
 			guarded.ServeHTTP(w, r)
 			return
@@ -332,7 +513,16 @@ func (a *App) adminHandler() http.Handler {
 		// 于是 `curl -f /_goproxy/statss` 这种拼写错误看着像成功。
 		http.NotFound(w, r)
 	})
-	return root
+	// 安全头包在最外层：无论落到静态资源、接口还是纯文本清单都会带上。
+	return securityHeaders(root)
+}
+
+// isAuthPath 判断路径是不是「登录/会话」这两条需要在认证前就能访问的接口。
+//
+// 单独列出来而不是复用 isAdminAPIPath，是为了让「哪些路径绕过了 adminGuard」
+// 这件事在代码里一眼可见 —— 安全评审时只需要看这一个函数。
+func isAuthPath(p string) bool {
+	return p == "/_goproxy/login" || p == "/_goproxy/session"
 }
 
 // isAdminAPIPath 判断路径是不是管理端接口。
@@ -365,14 +555,45 @@ func serveAdminIndex(w http.ResponseWriter) {
 	io.WriteString(w, "goproxy admin\n"+
 		"  管理控制台（浏览器打开）  "+uiPrefix+"\n"+
 		"  /healthz  /readyz  /metrics\n"+
+		"  /_goproxy/login           POST 用 admin_token 换取会话 Cookie\n"+
+		"  /_goproxy/session         GET 当前登录态  DELETE 登出\n"+
 		"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
 		"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
 		"  /_goproxy/config          GET / PATCH 全局配置\n"+
 		"  /_goproxy/ports           当前监听端口\n"+
+		"  /_goproxy/certs           证书状态（域名/签发者/到期/来源）\n"+
 		"  /_goproxy/stats           聚合状态（指标 + 采样曲线 + 熔断计数）\n"+
 		"  /_goproxy/logs            最近访问记录  ?limit=N\n"+
 		"  /_goproxy/events          实时访问日志（SSE）\n"+
 		"  /_goproxy/reload          POST 手动重载配置\n")
+}
+
+// handleCerts 返回所有证书的状态。
+//
+// 未启用 TLS 时返回空列表而不是 404：「没配 TLS」和「配了但没证书」
+// 是两件不同的事，前者前端展示为「TLS 未启用」的空态，
+// 用 404 会让它看起来像接口挂了。
+func (a *App) handleCerts(w http.ResponseWriter, r *http.Request) {
+	m := a.tlsmgr.Load()
+	certs := []CertStatus{}
+	if m != nil {
+		certs = m.Status()
+	}
+
+	enabled := false
+	acme := ""
+	if cfg := a.tlsCfg.Load(); cfg != nil {
+		enabled = cfg.TLS.Enabled
+		if cfg.TLS.ACME != nil {
+			acme = cfg.TLS.ACME.effectiveDirectoryURL()
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tls_enabled": enabled,
+		"acme_dir":    acme,
+		"certs":       certs,
+	})
 }
 
 // adminMux 是真正的管理接口集合，整体由 adminGuard 保护。
@@ -409,8 +630,12 @@ func (a *App) adminMux() *http.ServeMux {
 	mux.HandleFunc("GET /_goproxy/logs", a.handleLogs)
 	mux.HandleFunc("GET /_goproxy/events", a.handleEvents)
 	mux.HandleFunc("/_goproxy/ports", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, a.listeners.Ports())
+		writeJSON(w, http.StatusOK, a.listeners.PortInfos())
 	})
+	// 登录 / 会话不在这里注册 —— 它们由 adminHandler 在外层单独分派，
+	// 因为登录接口必须能在「尚未认证」时被访问到。见 adminHandler 里的注释。
+	// 证书状态：域名、签发者、到期时间、来源。控制台的证书页读它。
+	mux.HandleFunc("GET /_goproxy/certs", a.handleCerts)
 	mux.HandleFunc("/_goproxy/reload", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "use POST", http.StatusMethodNotAllowed)
@@ -502,6 +727,24 @@ func (a *App) sampleLoop(ctx context.Context) {
 	}
 }
 
+// sessionSweepLoop 定期清掉过期会话与陈旧的登录失败记录。
+//
+// 会话是内存里的 map，如果不主动清理，过期条目会一直留着 ——
+// 单管理员的场景下量很小，但「过期即失效」如果只靠 lookup 时判断，
+// 内存占用就只增不减，长期跑着不放心。
+func (a *App) sessionSweepLoop(ctx context.Context) {
+	t := time.NewTicker(sessionSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.sessions.sweep()
+		}
+	}
+}
+
 func (a *App) Run(ctx context.Context) error {
 	// 启动第一行就报版本：线上排查「到底跑的是哪一版」时，
 	// journalctl 的头几行就能回答，不用去翻二进制。
@@ -510,6 +753,10 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.reload(); err != nil {
 		return err
 	}
+
+	// 放在 reload 之后：配置文件本身读不到会先在这里上面就退出，
+	// 能走到这说明「读」没问题，接下来要确认「写」也没问题。
+	a.warnIfConfigUnwritable()
 
 	a.mu.Lock()
 	adminAddr := a.adminAddr
@@ -537,6 +784,7 @@ func (a *App) Run(ctx context.Context) error {
 	go a.watchLoop(ctx)
 	go a.statsLoop(ctx)
 	go a.sampleLoop(ctx)
+	go a.sessionSweepLoop(ctx)
 
 	<-ctx.Done()
 	slog.Info("收到退出信号，开始优雅停机")
