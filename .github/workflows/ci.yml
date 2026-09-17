@@ -212,14 +212,56 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      # 先把产物挂上去，再单独生成 release notes。
+      #
+      # 分开的理由：generate_release_notes 会调 GitHub 的「按 tag 差异生成说明」
+      # 接口，那一路可能在 tag 刚推送、差异计算还没就绪时失败。
+      # 两件事耦合在一起时，一次 notes 失败会让**整个发布**失败 ——
+      # 二进制明明编译好了却一个都没挂上去（v0.5.0 就踩到了这一次）。
+      # 拆开之后，最坏情况只是 notes 是空的，产物一定在。
+      - name: 上传产物并创建 Release
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS-*.txt
-          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 独立生成 release notes，失败不阻断发布（产物已经挂好了）
+      - name: 生成 Release 说明
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes=$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body) || exit 0
+          [ -n "$notes" ] || exit 0
+          gh release edit "$TAG" --notes "$notes" || true
+
+      # 断言产物真的挂上去了 —— 否则「发布成功」只是自我感觉良好
+      - name: 校验 Release 产物齐全
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="${{ github.ref_name }}"
+          # 等几秒让 release 落库
+          sleep 3
+          assets=$(gh release view "$tag" --json assets --jq '.assets[].name')
+          echo "已挂载产物："
+          echo "$assets"
+          for want in goproxy-linux-amd64.tar.gz goproxy-linux-arm64.tar.gz \
+                      SHA256SUMS-amd64.txt SHA256SUMS-arm64.txt; do
+            echo "$assets" | grep -qx "$want" || {
+              echo "::error::Release $tag 缺少产物 $want"; exit 1; }
+          done
+          echo "四个产物齐全"
