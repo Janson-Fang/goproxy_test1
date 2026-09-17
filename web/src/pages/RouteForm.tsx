@@ -7,6 +7,7 @@ import type {
   RateLimitScope,
   Route,
   RouteAuthConfig,
+  TLSMode,
 } from '../types'
 import { Checkbox, Field, Modal, Note, Switch, toast } from '../ui'
 import { pairList, parsePairs, parsePorts, splitList } from '../format'
@@ -31,6 +32,11 @@ interface FormState {
   strip_prefix: boolean
   preserve_host: boolean
   timeout_ms: string
+
+  tlsMode: TLSMode
+  certFile: string
+  keyFile: string
+  redirectHttp: boolean
 
   rlEnabled: boolean
   rlRps: string
@@ -71,6 +77,10 @@ function emptyForm(): FormState {
     strip_prefix: false,
     preserve_host: false,
     timeout_ms: '',
+    tlsMode: '',
+    certFile: '',
+    keyFile: '',
+    redirectHttp: true,
     rlEnabled: false,
     rlRps: '100',
     rlBurst: '200',
@@ -108,6 +118,10 @@ function fromRoute(r: Route): FormState {
   f.strip_prefix = !!r.strip_prefix
   f.preserve_host = !!r.preserve_host
   f.timeout_ms = r.timeout_ms ? String(r.timeout_ms) : ''
+  f.tlsMode = r.tls_mode ?? ''
+  f.certFile = r.cert_file ?? ''
+  f.keyFile = r.key_file ?? ''
+  f.redirectHttp = r.redirect_http !== false
 
   if (r.rate_limit) {
     f.rlEnabled = true
@@ -174,6 +188,10 @@ function toRoute(f: FormState): Route {
     strip_prefix: f.strip_prefix,
     preserve_host: f.preserve_host,
     timeout_ms: numOr(f.timeout_ms, 0),
+    tls_mode: f.tlsMode,
+    cert_file: f.certFile.trim(),
+    key_file: f.keyFile.trim(),
+    redirect_http: f.redirectHttp,
     rate_limit: null,
     circuit_breaker: null,
     auth: null,
@@ -268,6 +286,27 @@ function validate(f: FormState, isCreate: boolean, adminPort: number): Record<st
     e.host = '通配只支持 *.example.com 这种前缀形式'
   }
 
+  // TLS 校验与后端 validateTLS 对齐。这里拦一道是为了不让用户白跑一趟 ——
+  // 后端才是权威，但 400 回来时表单已经关了，改起来很难受。
+  const host = f.host.trim()
+  if (f.tlsMode === 'manual') {
+    if (!f.certFile.trim()) e.certFile = 'manual 模式必须填证书文件'
+    if (!f.keyFile.trim()) e.keyFile = 'manual 模式必须填私钥文件'
+  } else if (f.tlsMode === 'auto') {
+    if (!host) {
+      e.tlsMode = 'ACME 无法为裸 IP 或任意域名签发证书，请先填 host'
+    } else if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+      e.tlsMode = "Let's Encrypt 不对裸 IP 签发证书，请改用域名或 manual"
+    } else if (host.startsWith('*.')) {
+      e.tlsMode = '通配域名需要 DNS-01 挑战，自动签发不支持，请用 manual 挂通配证书'
+    } else {
+      const p = numOr(f.listen_port, 0)
+      if (p !== 0 && p !== 80 && p !== 443) {
+        e.tlsMode = `ACME 挑战固定走 80/443，监听在 ${p} 上拿不到自动证书`
+      }
+    }
+  }
+
   if (f.rlEnabled) {
     if (numOr(f.rlRps, -1) <= 0) e.rlRps = '必须大于 0'
     if (numOr(f.rlBurst, -1) < 0) e.rlBurst = '不能为负'
@@ -319,7 +358,7 @@ function validate(f: FormState, isCreate: boolean, adminPort: number): Record<st
 
 /* ============ 组件 ============ */
 
-type TabKey = 'basic' | 'forward' | 'limit' | 'breaker' | 'guard'
+type TabKey = 'basic' | 'forward' | 'tls' | 'limit' | 'breaker' | 'guard'
 
 export function RouteForm({
   initial,
@@ -351,11 +390,12 @@ export function RouteForm({
   const submit = () => {
     setTouched(true)
     if (hasError) {
-      // 把用户直接送到第一个出错的页签，而不是让他在 5 个页签里找
-      const order: TabKey[] = ['basic', 'forward', 'limit', 'breaker', 'guard']
+      // 把用户直接送到第一个出错的页签，而不是让他在 6 个页签里找
+      const order: TabKey[] = ['basic', 'forward', 'tls', 'limit', 'breaker', 'guard']
       const where: Record<TabKey, string[]> = {
         basic: ['id', 'listen_port', 'path_prefix', 'target', 'timeout_ms', 'host'],
         forward: [],
+        tls: ['tlsMode', 'certFile', 'keyFile'],
         limit: ['rlRps', 'rlBurst'],
         breaker: ['cbErrorRate', 'cbMinCalls', 'cbOpenSecs', 'cbHalfOpenCalls', 'cbWindowSecs'],
         guard: ['accounts', 'jwtSecret', 'jwtPublicKey', 'jwtAlgs', 'aclCidrs'],
@@ -403,6 +443,9 @@ export function RouteForm({
         </button>
         <button className="subtab" aria-selected={tab === 'forward'} onClick={() => setTab('forward')}>
           转发
+        </button>
+        <button className="subtab" aria-selected={tab === 'tls'} onClick={() => setTab('tls')}>
+          TLS{flag(form.tlsMode === 'auto' || form.tlsMode === 'manual')}
         </button>
         <button className="subtab" aria-selected={tab === 'limit'} onClick={() => setTab('limit')}>
           限流{flag(form.rlEnabled)}
@@ -538,6 +581,93 @@ export function RouteForm({
             匹配顺序是 <b>端口 → 域名 → 路径前缀</b>，路径取<b>最长前缀</b>。
             所以同端口下 <code>/api/v2</code> 会优先于 <code>/api</code>，<code>/</code> 是最后的兜底。
           </Note>
+        </div>
+      )}
+
+      {tab === 'tls' && (
+        <div className="stack">
+          <Field
+            label="TLS 模式"
+            error={err('tlsMode')}
+            hint="留空表示按顶层 tls.enabled 推导：开关打开→auto，关闭→off"
+          >
+            <select
+              className={`input${err('tlsMode') ? ' invalid' : ''}`}
+              value={form.tlsMode}
+              onChange={(e) => set('tlsMode', e.target.value as TLSMode)}
+            >
+              <option value="">（继承全局）</option>
+              <option value="off">off —— 明文 HTTP</option>
+              <option value="manual">manual —— 挂本地证书</option>
+              <option value="auto">auto —— ACME 自动签发</option>
+            </select>
+          </Field>
+
+          {form.tlsMode === 'manual' && (
+            <fieldset className="group">
+              <legend>证书文件</legend>
+              <div className="stack" style={{ gap: 10 }}>
+                <Field
+                  label="证书 cert_file"
+                  error={err('certFile')}
+                  hint="fullchain.pem。相对路径相对 tls.cert_dir 解析。"
+                >
+                  <input
+                    className={`input mono${err('certFile') ? ' invalid' : ''}`}
+                    value={form.certFile}
+                    placeholder="certs/example.com/fullchain.pem"
+                    onChange={(e) => set('certFile', e.target.value)}
+                  />
+                </Field>
+                <Field
+                  label="私钥 key_file"
+                  error={err('keyFile')}
+                  hint="证书与私钥必须是同一对，后端会在保存前真实验证。"
+                >
+                  <input
+                    className={`input mono${err('keyFile') ? ' invalid' : ''}`}
+                    value={form.keyFile}
+                    placeholder="certs/example.com/privkey.pem"
+                    onChange={(e) => set('keyFile', e.target.value)}
+                  />
+                </Field>
+                <Note kind="info">
+                  证书文件变更后 30 秒内自动热重载，不需要重启进程。
+                </Note>
+              </div>
+            </fieldset>
+          )}
+
+          {form.tlsMode === 'auto' && (
+            <Note kind="warn">
+              ACME 只在 <b>80 / 443</b> 上能完成挑战，且<b>不能签发裸 IP 或通配域名</b>的证书。
+              当前路由的 <code>host</code> 必须是具体域名、<code>listen_port</code> 为 0 或 80/443，
+              否则保存时会报错。
+              <div className="faint small" style={{ marginTop: 6 }}>
+                调试阶段建议在顶层 <code>tls.acme.staging</code> 打开测试环境，
+                避免反复申请烧掉生产配额。
+              </div>
+            </Note>
+          )}
+
+          {(form.tlsMode === 'auto' || form.tlsMode === 'manual') && (
+            <fieldset className="group">
+              <legend>明文访问</legend>
+              <Checkbox
+                checked={form.redirectHttp}
+                onChange={(v) => set('redirectHttp', v)}
+                label={
+                  <>
+                    把 HTTP 请求跳到 HTTPS（<code>redirect_http</code>）
+                    <span className="faint small"> · 默认开启</span>
+                  </>
+                }
+              />
+              <div className="faint small" style={{ marginTop: 8 }}>
+                关掉后该路由的两种协议都能访问。仅建议给只认 HTTP 的健康检查探针或老客户端用。
+              </div>
+            </fieldset>
+          )}
         </div>
       )}
 

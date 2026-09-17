@@ -167,6 +167,211 @@ def build_binaries(outdir):
     return built
 
 
+def run_auth_section(tmp, bins):
+    """认证与会话的端到端验证。
+
+    为什么要**另起一个实例**、而不是复用上面那个：
+    演示配置里没有 admin_token，而回环地址默认免认证 —— 两件事叠加，
+    上面那个实例根本走不到鉴权分支，拿它测认证等于什么都没测。
+
+    这里单独起一个带 admin_token 的实例，并且**主动带上内部标记头**
+    （X-Goproxy-Internal-Via）把每个请求降级成「经代理转发进来的外部请求」，
+    这样才能真正走到 adminGuard 的鉴权逻辑。标记头本身不保密：
+    伪造它只会让判断更严格，对攻击者不利。
+    """
+    import http.cookiejar
+
+    port_admin = 9081
+    port_biz = 9082
+    auth_cfg_path = os.path.join(tmp, "auth-config.json")
+
+    with open(os.path.join(ROOT, "config.json"), encoding="utf-8") as f:
+        base = json.load(f)
+
+    cfg = {
+        "admin_addr": "127.0.0.1:%d" % port_admin,
+        "admin_token": "e2e-s3cret-token",
+        "access_log": False,
+        "default_ports": [],
+        "routes": [],
+    }
+    with open(auth_cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    del base, port_biz
+
+    if port_in_use(port_admin):
+        check("认证实例端口空闲", False, "%d 已被占用" % port_admin)
+        return
+
+    proc = subprocess.Popen(
+        [bins["goproxy-test"], "-c", auth_cfg_path, "-text-log"],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        if not wait_port(port_admin, 15, proc=proc):
+            check("认证实例启动", False, "端口 %d 没起来" % port_admin)
+            return
+
+        base_url = "http://127.0.0.1:%d" % port_admin
+        # 每个请求都带内部标记头：把「本机回环」降级成「外部请求」，
+        # 否则回环免认证会让所有鉴权断言失去意义。
+        external = {"X-Goproxy-Internal-Via": "1"}
+
+        # 不带 Cookies 的裸 opener，用来观察「没有凭据」的行为
+        bare = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def req(path, method="GET", body=None, headers=None, opener=None):
+            data = json.dumps(body).encode() if body is not None else None
+            r = urllib.request.Request(base_url + path, data=data, method=method)
+            for k, v in external.items():
+                r.add_header(k, v)
+            if data is not None:
+                r.add_header("Content-Type", "application/json")
+            for k, v in (headers or {}).items():
+                r.add_header(k, v)
+            o = opener or bare
+            try:
+                with o.open(r, timeout=10) as resp:
+                    return resp.status, dict(resp.headers), resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers), e.read()
+
+        # ---- 10.1 三种凭据路径 ----
+        st, h, b = req("/_goproxy/routes")
+        check("外部请求无凭据 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+
+        st, h, b = req("/_goproxy/routes", headers={"Authorization": "Bearer wrong"})
+        check("错误 Bearer -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+
+        st, h, b = req(
+            "/_goproxy/routes",
+            headers={"Authorization": "Bearer e2e-s3cret-token"},
+        )
+        check("正确 Bearer -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+
+        # ---- 10.2 登录换取会话 Cookie ----
+        # 用带 CookieJar 的 opener，模拟浏览器
+        jar = http.cookiejar.CookieJar()
+        browser = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar)
+        )
+
+        st, h, b = req(
+            "/_goproxy/login",
+            method="POST",
+            body={"token": "wrong-token"},
+            headers={"Origin": base_url},
+            opener=browser,
+        )
+        check("登录用错令牌 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+
+        st, h, b = req(
+            "/_goproxy/login",
+            method="POST",
+            body={"token": "e2e-s3cret-token"},
+            headers={"Origin": base_url},
+            opener=browser,
+        )
+        check("登录用对令牌 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+        if st != 200:
+            return
+
+        sess_cookies = [c for c in jar if c.name == "goproxy_admin_session"]
+        check("登录下发了会话 Cookie", len(sess_cookies) == 1, "实际 %d 个" % len(sess_cookies))
+        if sess_cookies:
+            c = sess_cookies[0]
+            # 浏览器直接读不到 HttpOnly 之外的属性时，属性名会落在 _rest 里
+            rest = getattr(c, "_rest", {}) or {}
+            check("  会话 Cookie 是 HttpOnly",
+                  c.has_nonstandard_attr("HttpOnly") or "HttpOnly" in rest,
+                  "属性 %s" % rest)
+            check("  会话 Cookie Path 是 /_goproxy/", c.path == "/_goproxy/", "实际 %r" % c.path)
+
+        # ---- 10.3 会话能免令牌访问 ----
+        st, h, b = req("/_goproxy/routes", opener=browser)
+        check("带会话 Cookie 免令牌 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+
+        st, h, b = req("/_goproxy/session", opener=browser)
+        check("GET /session -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+        if st == 200:
+            info = json.loads(b)
+            check("  via 报告为 session", info.get("via") == "session", str(info))
+            check("  has_session 为真", info.get("has_session") is True, str(info))
+
+        # ---- 10.4 CSRF：带会话的跨源写请求必须被拒 ----
+        st, h, b = req(
+            "/_goproxy/config",
+            method="PATCH",
+            body={"access_log": True},
+            headers={"Origin": "http://evil.example"},
+            opener=browser,
+        )
+        check("会话 + 跨源 Origin 写 -> 403", st == 403, "实际 %s :: %s" % (st, b[:150]))
+
+        st, h, b = req(
+            "/_goproxy/config",
+            method="PATCH",
+            body={"access_log": False},
+            headers={"Origin": base_url},
+            opener=browser,
+        )
+        check("会话 + 同源 Origin 写 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+
+        # 登录接口也不能被跨站调用（登录 CSRF）
+        st, h, b = req(
+            "/_goproxy/login",
+            method="POST",
+            body={"token": "e2e-s3cret-token"},
+            headers={"Origin": "http://evil.example"},
+            opener=bare,
+        )
+        check("跨源登录 -> 403", st == 403, "实际 %s :: %s" % (st, b[:150]))
+
+        # 但不带 Origin 的脚本请求要能登录（fail-open 的那一半）
+        st, h, b = req("/_goproxy/login", method="POST", body={"token": "e2e-s3cret-token"})
+        check("无 Origin 的脚本登录 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+
+        # ---- 10.5 登出后会话立即失效 ----
+        st, h, b = req("/_goproxy/session", method="DELETE",
+                       headers={"Origin": base_url}, opener=browser)
+        check("登出 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+
+        st, h, b = req("/_goproxy/routes", opener=browser)
+        check("登出后旧会话失效 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+
+        # ---- 10.6 安全响应头 ----
+        st, h, b = req("/_goproxy/routes", headers={"Authorization": "Bearer e2e-s3cret-token"})
+        low = {k.lower(): v for k, v in h.items()}
+        check("带 X-Content-Type-Options: nosniff",
+              low.get("x-content-type-options") == "nosniff", str(low.get("x-content-type-options")))
+        check("带 X-Frame-Options: DENY",
+              low.get("x-frame-options") == "DENY", str(low.get("x-frame-options")))
+        csp = low.get("content-security-policy", "")
+        check("接口带 CSP 且不含 unsafe-inline", "unsafe-inline" not in csp, csp[:160])
+
+        st, h, b = req("/_goproxy/ui/")
+        low = {k.lower(): v for k, v in h.items()}
+        csp = low.get("content-security-policy", "")
+        check("控制台带 CSP", bool(csp), str(low))
+        check("  控制台 CSP 限制 script-src 为 self",
+              "script-src 'self'" in csp, csp[:200])
+        # style-src 允许 unsafe-inline 是刻意取舍：React 的 style={{}} 需要它
+        check("  控制台仍允许 style 内联（已知取舍）",
+              "style-src 'self' 'unsafe-inline'" in csp, csp[:220])
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        time.sleep(0.4)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def main():
     if shutil.which("go") is None:
         print("PATH 里找不到 go，无法编译测试二进制")
@@ -510,6 +715,9 @@ def main():
         check("metrics 含 goproxy_requests_total", b"goproxy_requests_total" in b)
         check("metrics 含熔断状态", b"goproxy_circuit_state" in b)
         check("metrics 含 p95 直方图", b"goproxy_request_duration_seconds_bucket" in b)
+
+        print("\n== 10. 认证与会话 ==")
+        run_auth_section(tmp, bins)
 
     finally:
         for p in procs:

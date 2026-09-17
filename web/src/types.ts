@@ -109,12 +109,99 @@ export interface Route {
   preserve_host: boolean
   /** 0 表示用全局默认 60s */
   timeout_ms: number
+  /** TLS 模式：off 明文 / auto 自动签发 / manual 挂本地证书。留空按全局开关推导。 */
+  tls_mode?: TLSMode
+  /** manual 模式的证书与私钥路径。相对路径相对 tls.cert_dir 解析。 */
+  cert_file?: string
+  key_file?: string
+  /** 是否把明文请求跳到 HTTPS。缺省为 true。 */
+  redirect_http?: boolean
   rate_limit?: RateLimitConfig | null
   circuit_breaker?: CBConfig | null
   auth?: RouteAuthConfig | null
   acl?: ACLConfig | null
   /** 服务端附带的实时观测值，提交时会被忽略 */
   live?: RouteLive | null
+}
+
+// ---------- TLS ----------
+
+export type TLSMode = '' | 'off' | 'auto' | 'manual'
+
+export interface ACMEConfig {
+  /** 注册邮箱，CA 用它发到期提醒 */
+  email?: string
+  /** ACME 目录地址。留空走 Let's Encrypt 生产环境。 */
+  directory_url?: string
+  /** 改用 Let's Encrypt 测试环境。调试时务必打开，避免烧掉生产配额。 */
+  staging?: boolean
+  /** 证书缓存目录，必须持久化。默认 data/certs。 */
+  cache_dir?: string
+  /** 允许申请证书的域名白名单。留空表示按路由的 host 限制。 */
+  hosts?: string[]
+}
+
+export interface TLSConfig {
+  /** 总开关。默认 false，即全部明文。 */
+  enabled: boolean
+  acme?: ACMEConfig | null
+  /** 手动证书的默认目录 */
+  cert_dir?: string
+  /** 明文端口，承担 ACME 挑战与 HTTP→HTTPS 重定向。默认 80。 */
+  http_port?: number
+  /** TLS 端口。默认 443。 */
+  https_port?: number
+}
+
+/** 单张证书的状态 */
+export interface CertStatus {
+  hosts: string[]
+  /** manual | auto */
+  source: string
+  issuer?: string
+  subject?: string
+  not_before?: string
+  not_after?: string
+  /** 剩余天数，负数表示已过期 */
+  days_left: number
+  /** 剩余天数低于告警阈值（20 天） */
+  expiring: boolean
+  expired: boolean
+  /** 加载或签发失败的原因 */
+  error?: string
+  /** 引用这张证书的路由 ID */
+  routes?: string[]
+}
+
+export interface CertsResponse {
+  tls_enabled: boolean
+  acme_dir: string
+  certs: CertStatus[]
+}
+
+/** 监听端口及其 TLS 属性 */
+export interface PortInfo {
+  port: number
+  tls: boolean
+}
+
+// ---------- 登录 / 会话 ----------
+
+/**
+ * GET /_goproxy/session 的响应。
+ *
+ * 注意这个接口本身在 adminGuard 之内：**能拿到 200 就一定已经通过鉴权**，
+ * 所以 `authenticated` 恒为 true。真正要区分的是「怎么通过的」：
+ *
+ *   session  —— 登录态，可以显示登出按钮
+ *   loopback —— 本机直连免认证（没有会话可登出）
+ *   bearer   —— 靠 Authorization 头（脚本场景，控制台里一般不会出现）
+ */
+export interface SessionInfo {
+  authenticated: boolean
+  via: 'session' | 'loopback' | 'bearer' | 'none'
+  has_session: boolean
+  token_set: boolean
 }
 
 // ---------- 全局配置 ----------

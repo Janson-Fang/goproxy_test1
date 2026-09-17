@@ -6,16 +6,14 @@
     <meta name="color-scheme" content="dark light" />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <title>goproxy 控制台</title>
-    <script>
-      // 在首屏渲染前定好主题，避免浅色用户看到一瞬白→黑的闪烁
-      try {
-        var t = localStorage.getItem('goproxy.theme')
-        if (t !== 'light' && t !== 'dark') {
-          t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
-        }
-        document.documentElement.dataset.theme = t
-      } catch (e) {}
-    </script>
+    <!--
+      首屏主题脚本必须是**同步的普通脚本**（不能加 type="module"，也不能加 defer）：
+      module 要等 DOM 解析完才执行，那时默认主题已经渲染过一帧，浅色用户会看到闪烁。
+
+      它也不能内联 —— 内联脚本会让 CSP 不得不放开 'unsafe-inline'。
+      见 public/theme.js 的注释。
+    -->
+    <script src="./theme.js"></script>
   </head>
   <body>
     <div id="root"></div>

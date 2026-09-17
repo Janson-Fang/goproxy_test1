@@ -837,6 +837,21 @@ table.tbl tr.clickable {
   padding: 1px 4px;
   border-radius: 4px;
 }
+/* 配置片段。给「照着抄」的场景用，所以等宽 + 保留缩进 + 可横向滚动
+   （窄屏下长行不折行，折了反而看不出 JSON 的层级）。 */
+pre.code {
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  white-space: pre;
+}
 
 /* ---------- 空态 / 加载 ---------- */
 

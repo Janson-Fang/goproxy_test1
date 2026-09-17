@@ -44,7 +44,7 @@ export function usePolling(fn: () => void | Promise<void>, intervalMs: number, e
   }, [intervalMs, enabled])
 }
 
-export const TAB_KEYS = ['dashboard', 'routes', 'logs', 'settings'] as const
+export const TAB_KEYS = ['dashboard', 'routes', 'certs', 'logs', 'settings'] as const
 export type TabKey = (typeof TAB_KEYS)[number]
 
 function readHash(): TabKey {
