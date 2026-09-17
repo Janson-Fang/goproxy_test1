@@ -6,3 +6,4 @@ goproxy.exe
 data/
 __pycache__/
 *.pyc
+.release-notes.tmp
