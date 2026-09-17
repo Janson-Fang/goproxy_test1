@@ -12,6 +12,22 @@ import (
 	"time"
 )
 
+// internalViaHeader 由本进程的代理在转发请求时**无条件写入**，
+// 用来标记「这个请求是经我自己代理进来的」。
+//
+// 为什么需要它：管理端对来自回环地址的请求免认证（保留本机 curl / 脚本的运维习惯），
+// 而代理转发恰恰是从 127.0.0.1 发出的 —— 于是「把一条路由的 target 指向管理端口」
+// 就等于让外部客户端白拿一份免认证的管理权限：改路由、读全部访问日志、改配置。
+//
+// 管理端只要看到这个头，就必须按「外部请求」处理，绝不因为来源是回环就放行。
+//
+// 这个头**不需要保密**，也不该靠保密来生效：
+//   - 伪造它只会让判断更严格，对攻击者不利；
+//   - 省略它也躲不开 —— 经代理进来的请求，Director 一定会写进去。
+//
+// 值只是个占位；判断只认「有没有」。
+const internalViaHeader = "X-Goproxy-Internal-Via"
+
 // newTransport 返回一个调优过的连接池。所有路由共享同一个 Transport，
 // 这样后端连接才能复用；只有配了 route 级超时才 Clone 一份独立的。
 func newTransport() *http.Transport {
@@ -74,6 +90,11 @@ func newReverseProxy(r *Route, tr *http.Transport) *httputil.ReverseProxy {
 			if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 				req.Header.Set("X-Real-IP", host)
 			}
+
+			// 标记「这是本进程代理转发的」。Set 会覆盖客户端自带的同名头，
+			// 所以外部请求无法靠伪造这个头来改变管理端的判断（见 internalViaHeader）。
+			// 必须在所有 header 覆盖完成之后写，避免被后续操作覆盖掉。
+			req.Header.Set(internalViaHeader, "1")
 		},
 
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {

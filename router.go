@@ -27,6 +27,12 @@ type Route struct {
 	StripPrefix  bool
 	PreserveHost bool
 
+	// TLSMode 是这条路由的 TLS 模式（off|auto|manual）。
+	TLSMode string
+	// RedirectHTTP 表示这条路由是否把明文请求跳到 HTTPS。
+	// 只有 TLSMode 非 off 时才有意义 —— 明文路由跳过去也没人接。
+	RedirectHTTP bool
+
 	targetURL *url.URL
 	proxy     *httputil.ReverseProxy
 	limiter   *IPLimiter
@@ -37,6 +43,19 @@ type Route struct {
 	// 配置指纹：热重载时只有当配置真的变了才重建有状态对象
 	cbFP   string
 	authFP string
+}
+
+// wantsHTTPSRedirect 报告明文请求是否应该被跳转到 HTTPS。
+//
+// 两个条件缺一不可：
+//   - 路由本身是加密的（off 模式跳过去也没有服务端接得住）
+//   - 路由显式要求跳转（redirect_http=false 时保留明文访问，
+//     比如某些老客户端或健康检查探针只认 HTTP）
+func (r *Route) wantsHTTPSRedirect() bool {
+	if r.TLSMode == TLSModeOff {
+		return false
+	}
+	return r.RedirectHTTP
 }
 
 // RouteTable 是不可变的路由快照，用 atomic.Pointer 整体替换实现热更新。
@@ -174,6 +193,8 @@ func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable
 			Target:       rc.Target,
 			StripPrefix:  rc.StripPrefix,
 			PreserveHost: rc.PreserveHost,
+			TLSMode:      rc.routeTLSMode(),
+			RedirectHTTP: rc.redirectHTTP(),
 			targetURL:    u,
 		}
 

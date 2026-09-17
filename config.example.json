@@ -1,58 +1,101 @@
 {
   "_说明": "生产配置示例。与 config.json 的区别：这里用 80 端口 + 域名分流，业务端口单独列出。",
 
-  "default_ports": [80],
+  "default_ports": [80, 443],
   "admin_addr": "127.0.0.1:9080",
   "_admin_addr_说明": "留空=用默认值 127.0.0.1:8080；写 off/none/disabled 可彻底关闭管理端口。改它属于启动期配置，改完要重启。",
   "_admin_token_说明": "管理接口令牌。只在管理端口监听非回环地址时才需要；那时不配它，所有外部请求一律 403。回环地址访问不需要。",
+  "_admin_trust_loopback_说明": "默认 true = 本机访问免令牌。只有当你把管理端口前面又挂了别的本地反向代理（nginx/Caddy）时才需要设为 false —— 那种转发同样来自 127.0.0.1 却带不了本进程的标记头。注意：本进程自己的代理转发不需要靠它兜底，代理会写标记头，管理端一律按外部请求处理。",
   "access_log": true,
 
   "trusted_proxies": ["10.0.0.0/8"],
 
+  "_tls_说明": "TLS 总闸。enabled=false（默认）时全部端口跑明文，行为与不带 TLS 的版本完全一致。打开后路由默认走 auto（ACME 自动签发），可逐条覆盖成 manual 或 off。",
+  "tls": {
+    "enabled": true,
+    "_enabled_说明_": "改为 false 即可整体退回明文 HTTP",
+    "http_port": 80,
+    "https_port": 443,
+    "cert_dir": "certs",
+    "_cert_dir_说明": "手动证书的默认目录。路由里只写 cert_file/key_file（相对路径）时相对它解析。",
+    "acme": {
+      "email": "ops@example.com",
+      "_staging_说明": "调试阶段务必设 true：Let's Encrypt 生产配额很紧（每域名每周 50 张），反复失败重试会烧掉配额，之后一周都签不出来。",
+      "staging": false,
+      "cache_dir": "data/certs",
+      "_cache_dir_说明": "证书缓存目录，必须持久化。每次重启都重新申请会很快撞上 CA 的频率限制。",
+      "hosts": ["www.example.com", "api.example.com"],
+      "_hosts_说明": "允许申请证书的域名白名单。强烈建议显式列出：SNI 是客户端可控的，不限制的话任何人扫一遍 SNI 就能让本机替一堆不相干的域名去申请证书。"
+    }
+  },
+
   "routes": [
     {
       "id": "web",
-      "name": "官网（按域名）",
+      "name": "官网（ACME 自动证书 + 明文跳转）",
       "listen_port": 0,
       "host": "www.example.com",
       "path_prefix": "/",
       "target": "http://127.0.0.1:9001",
-      "preserve_host": true
+      "preserve_host": true,
+      "tls_mode": "auto",
+      "redirect_http": true
     },
     {
       "id": "api",
-      "name": "API（按域名 + 路径）",
+      "name": "API（域名 + 路径 + 限流，自动证书）",
       "listen_port": 0,
       "host": "api.example.com",
       "path_prefix": "/v1",
       "target": "http://127.0.0.1:9002",
+      "tls_mode": "auto",
       "rate_limit": { "rps": 200, "burst": 400, "scope": "ip" }
     },
     {
       "id": "admin-internal",
-      "name": "后台（带独立超时）",
+      "name": "后台（自签/内部 CA 证书，保留明文访问）",
       "listen_port": 0,
       "host": "admin.example.com",
       "path_prefix": "/",
       "target": "http://127.0.0.1:9003",
-      "timeout_ms": 120000
+      "timeout_ms": 120000,
+      "tls_mode": "manual",
+      "cert_file": "admin.example.com/fullchain.pem",
+      "key_file": "admin.example.com/privkey.pem",
+      "_redirect_http_说明": "设为 false：这条路由的探针只认 HTTP，不做强制跳转",
+      "redirect_http": false
+    },
+    {
+      "id": "legacy-plain",
+      "name": "老设备专用（挂通配手动证书）",
+      "listen_port": 0,
+      "host": "*.legacy.example.com",
+      "path_prefix": "/",
+      "target": "http://127.0.0.1:9004",
+      "tls_mode": "manual",
+      "cert_file": "wildcard/fullchain.pem",
+      "key_file": "wildcard/privkey.pem",
+      "_说明": "通配证书只能用 manual：ACME 的 HTTP-01 签不出通配，需要 DNS-01，本版本未支持"
     },
 
     {
       "id": "port-8081",
-      "name": "裸 IP:8081 直接访问",
+      "name": "裸 IP:8081 直接访问（明文）",
       "listen_port": 8081,
       "host": "",
       "path_prefix": "/",
-      "target": "http://127.0.0.1:9011"
+      "target": "http://127.0.0.1:9011",
+      "tls_mode": "off",
+      "_说明": "自定义端口上拿不到自动证书：ACME 挑战固定走 80/443"
     },
     {
       "id": "port-8082",
-      "name": "裸 IP:8082 直接访问",
+      "name": "裸 IP:8082 直接访问（带限流）",
       "listen_port": 8082,
       "host": "",
       "path_prefix": "/",
       "target": "http://127.0.0.1:9012",
+      "tls_mode": "off",
       "rate_limit": { "rps": 50, "burst": 100 }
     },
     {
@@ -62,7 +105,8 @@
       "host": "",
       "path_prefix": "/api",
       "target": "http://127.0.0.1:9013",
-      "strip_prefix": true
+      "strip_prefix": true,
+      "tls_mode": "off"
     },
     {
       "id": "port-8083-b",
@@ -70,7 +114,8 @@
       "listen_port": 8083,
       "host": "",
       "path_prefix": "/",
-      "target": "http://127.0.0.1:9014"
+      "target": "http://127.0.0.1:9014",
+      "tls_mode": "off"
     },
 
     {

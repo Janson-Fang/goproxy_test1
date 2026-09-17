@@ -34,10 +34,34 @@ type Config struct {
 	// 没有它所有外部请求一律拒绝 —— 这是防止管理接口裸奔的唯一闸门。
 	AdminToken string `json:"admin_token,omitempty"`
 
+	// AdminTrustLoopback 是否信任来自回环地址的请求（默认 true）。
+	//
+	// 用指针是为了区分「没写」（用默认值 true）和「显式写了 false」——
+	// 普通 bool 的零值就是 false，没法表达「没写」。
+	//
+	// 什么时候该关掉：管理端口前面还挂了别的本地反向代理（nginx、Caddy…）。
+	// 那种转发同样来自 127.0.0.1，且不会带本进程的代理标记头，
+	// 于是「回环 = 本机运维」这个前提不再成立。
+	// 本进程自己的代理转发**不需要**靠这个开关兜底：它会带标记头，
+	// 管理端一律按外部请求处理（见 internalViaHeader）。
+	AdminTrustLoopback *bool `json:"admin_trust_loopback,omitempty"`
+
 	AccessLog bool `json:"access_log"`
 	// TrustedProxies 里的项是 IP 或 CIDR。
-	TrustedProxies []string      `json:"trusted_proxies,omitempty"`
-	Routes         []RouteConfig `json:"routes"`
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
+
+	// TLS 是全局 TLS/ACME 配置。默认 enabled=false，即完全保持历史行为：
+	// 所有端口跑明文 HTTP。打开后路由默认走 ACME 自动证书，可逐条覆盖。
+	TLS TLSConfig `json:"tls,omitzero"`
+
+	Routes []RouteConfig `json:"routes"`
+
+	// cfgPath 是配置文件的路径，不序列化。
+	//
+	// 存它是为了解析证书文件里的相对路径：进程的工作目录取决于怎么启动的
+	// （systemd 是 /、docker 是 /、手动是当前目录），拿它当基准太不稳，
+	// 相对配置文件所在目录才符合直觉。
+	cfgPath string `json:"-"`
 }
 
 type RouteConfig struct {
@@ -58,6 +82,19 @@ type RouteConfig struct {
 	Target       string `json:"target"`
 	StripPrefix  bool   `json:"strip_prefix"`
 	PreserveHost bool   `json:"preserve_host"`
+
+	// ---- TLS（仅顶层 tls.enabled=true 时生效）----
+
+	// TLSMode: off（明文）| auto（ACME 自动签发）| manual（挂本地证书）。
+	// 留空时按顶层开关推导：开关打开→auto，关闭→off。
+	TLSMode string `json:"tls_mode,omitempty"`
+	// CertFile / KeyFile 是 manual 模式的证书与私钥路径。
+	// 相对路径相对 tls.cert_dir 解析（没配 cert_dir 则相对配置文件所在目录）。
+	CertFile string `json:"cert_file,omitempty"`
+	KeyFile  string `json:"key_file,omitempty"`
+	// RedirectHTTP 控制该路由是否把 HTTP 请求 301 跳到 HTTPS。
+	// 用指针是为了区分「没写」和「显式写了 false」—— 没写默认 true。
+	RedirectHTTP *bool `json:"redirect_http,omitempty"`
 
 	// TimeoutMs 为 0 时使用全局默认（60s）
 	TimeoutMs int `json:"timeout_ms"`
@@ -126,6 +163,8 @@ func parseConfigFile(path string) (raw []byte, cfg *Config, err error) {
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return nil, nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
+	// 证书相对路径的解析基准。反序列化完成后再设，避免被 JSON 里的同名字段覆盖。
+	cfg.cfgPath = path
 	return raw, cfg, nil
 }
 
@@ -141,6 +180,7 @@ func (c *Config) applyTopDefaults() {
 	if c.AdminAddr == "" {
 		c.AdminAddr = defaultAdminAddr
 	}
+	c.applyTLSDefaults()
 }
 
 // applyRouteDefaults 给路由补默认值。这些回写文件是安全的，
@@ -155,6 +195,7 @@ func (c *Config) applyRouteDefaults() {
 			r.PathPrefix = "/"
 		}
 	}
+	c.applyRouteTLSDefaults()
 }
 
 // validateWithDefaults 在「补过默认值」的副本上校验，不改动原对象。
@@ -177,6 +218,12 @@ func (c *Config) applyDefaults() {
 
 // adminEnabled 报告是否应该监听管理端口。
 func (c *Config) adminEnabled() bool { return !isOff(c.AdminAddr) }
+
+// adminTrustsLoopback 报告是否信任来自回环地址的管理请求。
+// 留空即信任（保持历史行为：本机 curl / 脚本免令牌）。
+func (c *Config) adminTrustsLoopback() bool {
+	return c.AdminTrustLoopback == nil || *c.AdminTrustLoopback
+}
 
 // isOff 识别用于「显式关闭」的哨兵值。
 // 这里刻意用显式字面量而不是空串 —— 空串已经承担了「用默认值」的语义，
@@ -206,6 +253,10 @@ func (c *Config) validate() error {
 	// trusted_proxies 每一项必须是 IP 或 CIDR。不在这里拦，
 	// 写接口就会先把坏配置落盘、再在 reload 阶段失败。
 	if _, err := c.trustedNets(); err != nil {
+		return err
+	}
+
+	if err := c.validateTLS(); err != nil {
 		return err
 	}
 
@@ -309,12 +360,20 @@ func (c *Config) trustedNets() ([]*net.IPNet, error) {
 }
 
 // allListenPorts 汇总需要监听的端口：默认端口 + 所有路由显式声明的端口。
+//
+// 启用 TLS 时还要带上 tls.https_port —— 它是 TLS 的默认落点，
+// 即使没有任何路由把 listen_port 写成 443，也得听着。
+// 漏掉它会让「host 匹配 + 默认端口」这类最常见的配置直接 404：
+// 请求确实到了 443，但路由表里没有这个端口的索引桶，Match 只能返回空。
 func (c *Config) allListenPorts() []int {
 	set := make(map[int]struct{})
 	for _, p := range c.DefaultPorts {
 		if p > 0 && p <= 65535 {
 			set[p] = struct{}{}
 		}
+	}
+	if c.TLS.Enabled && c.TLS.HTTPSPort > 0 {
+		set[c.TLS.HTTPSPort] = struct{}{}
 	}
 	for _, r := range c.Routes {
 		if !r.enabled() {
