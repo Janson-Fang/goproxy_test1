@@ -499,6 +499,197 @@ func TestBearerUnaffectedByCSRFCheck(t *testing.T) {
 	}
 }
 
+// ---------- 经代理访问时的同源判定 ----------
+
+// 经本进程代理进来时，Origin 要和**浏览器实际使用的 host** 比，
+// 不能和 r.Host 比 —— 后者已被 Director 改写成内部地址了。
+//
+// 这是用户报的 bug：把控制台用一条路由发布出去（例如 32000 端口 → 管理端口），
+// 浏览器发的 Origin 是 http://<公网IP>:32000，而 r.Host 是 127.0.0.1:<管理端口>，
+// 两者永不相等 → 登录 403 cross_origin_rejected → 页面卡在「正在检查管理接口…」。
+func TestSessionAcceptsSameOriginBehindProxy(t *testing.T) {
+	e := newTestEnv(t, "s3cret", "")
+	c := loginAndGetCookie(t, e, "s3cret")
+
+	const publicHost = "118.190.159.207:32000"
+
+	// 模拟 proxy.go 的 Director 改写后的请求：
+	//   Host 被换成内部地址，X-Forwarded-Host 记着浏览器真正访问的地址，
+	//   同时带上 internalViaHeader 标记「这是我自己代理转发的」。
+	viaProxy := func(r *http.Request) {
+		r.AddCookie(c)
+		r.Host = "127.0.0.1:19090" // 内网管理端口
+		r.Header.Set("X-Forwarded-Host", publicHost)
+		r.Header.Set(internalViaHeader, "1")
+	}
+
+	// 1) 经代理 + Origin 与浏览器实际访问的 host 一致 → 应当放行
+	rr := e.do(t, "PATCH", "/_goproxy/config", `{"access_log":true}`,
+		remote("203.0.113.9:5000"),
+		viaProxy,
+		header("Origin", "http://"+publicHost))
+	if rr.Code != http.StatusOK {
+		t.Errorf("经代理的同源写请求应当放行，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+
+	// 2) 经代理 + Origin 是第三方 → 仍然必须拒绝。
+	//    这条是这次修复的**安全边界**：放宽同源判定绝不能变成「一律放行」。
+	rr = e.do(t, "PATCH", "/_goproxy/config", `{"access_log":true}`,
+		remote("203.0.113.9:5000"),
+		viaProxy,
+		header("Origin", "http://evil.example"))
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("经代理但来源是第三方时必须拒绝，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+
+	// 3) 经代理 + Origin 指向内网管理端口（即 r.Host 的值）→ 也必须拒绝。
+	//    这一条专门守住「别退回去用 r.Host 比」：谁也不该能靠猜内部地址通过校验。
+	rr = e.do(t, "PATCH", "/_goproxy/config", `{"access_log":true}`,
+		remote("203.0.113.9:5000"),
+		viaProxy,
+		header("Origin", "http://127.0.0.1:19090"))
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("Origin 指向内部管理地址时必须拒绝，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+}
+
+// 伪造 X-Forwarded-Host 不能绕过同源校验。
+//
+// 前提：攻击者必须**不经本进程代理**（直接打管理端口）才谈得上「伪造」——
+// 一旦经代理，Director 会用真实的原始 Host 覆盖掉他写的值。
+// 这里覆盖的正是那条「不经代理直接打管理端口 + 自带 X-Forwarded-Host」的路径。
+func TestSessionRejectsForgedForwardedHost(t *testing.T) {
+	e := newTestEnv(t, "s3cret", "")
+	c := loginAndGetCookie(t, e, "s3cret")
+
+	// 不经代理（没有 internalViaHeader），X-Forwarded-Host 纯属客户端瞎写：
+	// 此时它**不该**被采信，判定仍以 r.Host 为准，于是 evil.example 被拒。
+	rr := e.do(t, "PATCH", "/_goproxy/config", `{"access_log":true}`,
+		remote("203.0.113.9:5000"),
+		func(r *http.Request) {
+			r.AddCookie(c)
+			r.Host = "example.com"
+			// 攻击者想用这个头让校验通过
+			r.Header.Set("X-Forwarded-Host", "evil.example")
+		},
+		header("Origin", "http://evil.example"))
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("未经代理时伪造 X-Forwarded-Host 必须无效，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+
+	// 同样不经代理，但 Origin 与真实 Host 一致 → 正常放行（没有误伤）
+	rr = e.do(t, "PATCH", "/_goproxy/config", `{"access_log":true}`,
+		remote("203.0.113.9:5000"),
+		func(r *http.Request) {
+			r.AddCookie(c)
+			r.Host = "example.com"
+			r.Header.Set("X-Forwarded-Host", "evil.example")
+		},
+		header("Origin", "http://example.com"))
+	if rr.Code != http.StatusOK {
+		t.Errorf("未经代理时仍应按 r.Host 判定并放行，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+}
+
+// 登录接口也要能在代理后面正常工作。
+func TestLoginViaProxySucceeds(t *testing.T) {
+	e := newTestEnv(t, "s3cret", "")
+
+	rr := e.do(t, "POST", "/_goproxy/login", `{"token":"s3cret"}`,
+		remote("203.0.113.9:5000"),
+		func(r *http.Request) {
+			r.Host = "127.0.0.1:19090"
+			r.Header.Set("X-Forwarded-Host", "118.190.159.207:32000")
+			r.Header.Set(internalViaHeader, "1")
+		},
+		header("Origin", "http://118.190.159.207:32000"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("经代理登录应当成功，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Header().Get("Set-Cookie"), sessionCookieName) {
+		t.Error("登录成功应下发会话 Cookie")
+	}
+}
+
+// 端口不同就不算同源（同源策略按 scheme+host+port 三元组判定）。
+// 防的是「把端口归一化过头」这种过宽实现。
+func TestOriginCheckKeepsPortSignificance(t *testing.T) {
+	e := newTestEnv(t, "s3cret", "")
+	c := loginAndGetCookie(t, e, "s3cret")
+
+	rr := e.do(t, "PATCH", "/_goproxy/config", `{"access_log":true}`,
+		remote("203.0.113.9:5000"),
+		func(r *http.Request) {
+			r.AddCookie(c)
+			r.Host = "127.0.0.1:19090"
+			r.Header.Set("X-Forwarded-Host", "118.190.159.207:32000")
+			r.Header.Set(internalViaHeader, "1")
+		},
+		// 同一主机、不同端口 —— 不是同源
+		header("Origin", "http://118.190.159.207:32001"))
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("同主机不同端口不算同源，应拒绝，实际 %d：%s", rr.Code, rr.Body.String())
+	}
+}
+
+// normalizeHostPort / sameHostPort 的单元测试。
+//
+// 重点是「缺省端口补齐」这一条：浏览器在 80 端口上会省略 Origin 里的端口，
+// 而 Host 可能带着 :80，不归一化就会出现「同一个来源有时判同源有时不判」的抖动。
+func TestSameHostPort(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"example.com", "example.com", true},
+		{"example.com", "example.com:80", true}, // 省略的 80 要补上
+		{"example.com:80", "example.com:80", true},
+		{"EXAMPLE.com", "example.com", true},       // host 大小写不敏感
+		{"example.com", "example.com:8080", false}, // 端口不同 → 不同源
+		{"example.com", "evil.example", false},     // 主机不同
+		{"118.190.159.207:32000", "118.190.159.207:32000", true},
+		{"118.190.159.207:32000", "118.190.159.207:32001", false},
+		{"example.com:8080", "example.com", false}, // 非默认端口对缺省 → 不等
+		{"", "example.com", false},                 // 空值不相等
+		{"::1", "::1", true},                       // IPv6 字面量
+	}
+	for _, tc := range cases {
+		if got := sameHostPort(tc.a, tc.b); got != tc.want {
+			t.Errorf("sameHostPort(%q, %q) = %v，期望 %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+// effectiveRequestHost 的取值规则：只有「经本进程代理」才信 X-Forwarded-Host。
+func TestEffectiveRequestHost(t *testing.T) {
+	cases := []struct {
+		name    string
+		viaMark string
+		xfh     string
+		host    string
+		want    string
+	}{
+		{"不经代理 → 用 r.Host", "", "evil.example", "example.com", "example.com"},
+		{"经代理 + 有 XFH → 用 XFH", "1", "118.190.159.207:32000", "127.0.0.1:19090", "118.190.159.207:32000"},
+		{"经代理但没 XFH → 退回 r.Host", "1", "", "127.0.0.1:19090", "127.0.0.1:19090"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := http.NewRequest("GET", "http://x/", nil)
+			r.Host = tc.host
+			if tc.viaMark != "" {
+				r.Header.Set(internalViaHeader, tc.viaMark)
+			}
+			if tc.xfh != "" {
+				r.Header.Set("X-Forwarded-Host", tc.xfh)
+			}
+			if got := effectiveRequestHost(r); got != tc.want {
+				t.Errorf("effectiveRequestHost = %q，期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------- 登录接口本身 ----------
 
 // 登录接口必须在**没有任何凭据**时就能访问到。

@@ -404,8 +404,9 @@ func sessionHandleFrom(r *http.Request) string {
 // 显式校验 Origin 是**纵深防御**的第二道，代价几乎为零。
 //
 // 规则（任一满足即放行）：
-//   - Origin 头存在且与请求的 Host 同源
 //   - Sec-Fetch-Site 明确是 same-origin / none（老浏览器不发这个头，那时看 Origin）
+//   - Origin 头存在且与 effectiveRequestHost 相同（见那个函数的注释：
+//     不是简单拿 r.Host 比，经代理进来时 r.Host 已被改写）
 //
 // 注意这里只对**会话/Cookie 鉴权**的写请求强制 —— Bearer 令牌不会随请求
 // 自动携带，本来就没有 CSRF 面，不该给 curl 增加负担。
@@ -434,7 +435,7 @@ func requireSameOrigin(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return strings.EqualFold(u, r.Host)
+	return sameHostPort(u, effectiveRequestHost(r))
 }
 
 // requireCrossSiteNotClaimed 是给**登录接口**用的同源校验（fail-open）。
@@ -464,10 +465,86 @@ func requireCrossSiteNotClaimed(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return strings.EqualFold(u, r.Host)
+	return sameHostPort(u, effectiveRequestHost(r))
 }
 
-// parseOrigin 取出 origin 里的 host:port，用于和 r.Host 比对。
+// effectiveRequestHost 返回「浏览器地址栏里那个 host:port」，
+// 用于和 Origin 头比对。**不要**直接拿 r.Host 比 —— 那是这个 bug 的根因。
+//
+// 背景：控制台的页面和接口都在 /_goproxy/ 下，用户完全可以把整个管理端口
+// 用一条代理路由发布出去，于是浏览器访问的是
+//
+//	http://118.190.159.207:32000/_goproxy/ui/     ← Origin: 118.190.159.207:32000
+//
+// 而请求被本进程的代理转发到管理端口时，proxy.go 的 Director 会做
+// `req.Host = target.Host`，把 Host 改写成**内部地址**（如 127.0.0.1:19090）。
+// 结果 Origin 和 r.Host 永远不可能相等，登录请求被 403 拒掉，控制台卡在
+// 「正在检查管理接口…」—— 用户实际报的就是这个。
+//
+// 从哪拿真实的 host：proxy.go 在同一处写了 X-Forwarded-Host（原始 Host）。
+// 但**不能无条件相信这个头** —— 它是客户端随手就能加的，直接信任等于把
+// CSRF 防护的决定权交给攻击者（攻击者发一个 Origin 和 X-Forwarded-Host
+// 都填成自己域名的请求即可绕过）。所以只在两个条件同时成立时才采用：
+//
+//  1. 请求确实经过本进程的代理（viaOwnProxy）。这个标记由 Director 无条件
+//     覆盖写入，外部伪造它只会让自己被按「经代理」处理（更严格），不构成绕过；
+//  2. 这个 host 确实是本进程代理时改写的（X-Forwarded-Host 非空）。
+//
+// 反过来，攻击者想借 X-Forwarded-Host 绕过 CSRF，必须让请求**经本进程代理**
+// 进来，而那时 Director 会用**真实的原始 Host** 覆盖掉他伪造的值 —— 他写的
+// 那个值根本活不到管理端。所以这里信 X-Forwarded-Host 是安全的。
+//
+// 直接访问（不经代理）时退回 r.Host，与旧行为一致，没有放松。
+func effectiveRequestHost(r *http.Request) string {
+	if viaOwnProxy(r) {
+		if h := r.Header.Get("X-Forwarded-Host"); h != "" {
+			return h
+		}
+	}
+	return r.Host
+}
+
+// sameHostPort 比对两个 host:port 是否等同，缺端口时按协议默认端口补齐。
+//
+// 为什么要补默认端口：浏览器在 80/443 上访问时会**省略** Origin 里的端口
+// （`Origin: http://example.com`），而 r.Host 也常常不带端口，但代理改写过的
+// X-Forwarded-Host 是原样的 Host，可能带着 `:80`。不归一化就会出现
+// 「同一个来源，有时相等有时不等」这种极难排查的抖动。
+//
+// 更关键的是**不能**只比 host 忽略端口：同主机不同端口 = 不同源
+// （同源策略明确按 scheme+host+port 三元组判定）。把端口丢掉会让
+// 「同级端口上的无关服务」也能通过校验，等于自己削掉一层防护。
+// 所以这里的做法是「缺省时补上、都有时严格比」。
+func sameHostPort(a, b string) bool {
+	return strings.EqualFold(normalizeHostPort(a), normalizeHostPort(b))
+}
+
+// normalizeHostPort 把 host / host:port 统一成带端口的小写形式。
+// 补的默认端口只能是 80：本函数没有 scheme 信息，而**只有 http 才有
+// 「省略 80」这个行为** —— 恰恰是这里要修的场景（用户部署在
+// http://118.190.159.207:32000/，带的是非默认端口，不会被省略）。
+// https 的情况另说：443 从不会被省略，且 8080 这类端口根本不是
+// https 的默认值，因此补 80 不会造成「本该不同源却判成同源」。
+func normalizeHostPort(h string) string {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return ""
+	}
+	// 去掉可能的 userinfo（正常不会有，保守处理）
+	if i := strings.LastIndex(h, "@"); i >= 0 {
+		h = h[i+1:]
+	}
+	host, port, err := net.SplitHostPort(h)
+	if err != nil {
+		return strings.ToLower(h) + ":80"
+	}
+	if port == "" {
+		port = "80"
+	}
+	return strings.ToLower(host) + ":" + port
+}
+
+// parseOrigin 取出 origin 里的 host:port。
 // 单独写一个函数而不是用 net/url：这里只需要 host 部分，且必须容忍
 // 只有 host 没有 scheme 的非标准写法。
 func parseOrigin(origin string) (string, error) {
@@ -483,8 +560,9 @@ func parseOrigin(origin string) (string, error) {
 		return "", fmt.Errorf("空的 origin")
 	}
 	if _, _, err := net.SplitHostPort(s); err != nil {
-		// 没有端口：http 默认 80、https 默认 443，两种都可能与 r.Host 相等，
-		// 所以原样返回让调用方比对（r.Host 有端口时会不相等，这是保守的正确行为）
+		// 没有端口：原样返回，由 normalizeHostPort 统一补默认端口后再比。
+		// （旧注释说「原样返回让调用方比 r.Host」，那是 r.Host 时代的事；
+		//  现在两边都会过 normalizeHostPort，所以这里不需要做任何推断。）
 		return s, nil
 	}
 	return s, nil

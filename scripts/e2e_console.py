@@ -239,6 +239,7 @@ def run_auth_section(tmp, bins):
     import http.cookiejar
 
     port_admin = 9081
+    port_console = 9084  # 控制台经代理发布出来的端口，见下面 cfg["routes"]
     port_biz = 9082
     auth_cfg_path = os.path.join(tmp, "auth-config.json")
 
@@ -258,7 +259,26 @@ def run_auth_section(tmp, bins):
         "admin_users": [{"username": E2E_ADMIN_USER, "password_hash": pw_hash}],
         "access_log": False,
         "default_ports": [],
-        "routes": [],
+        # ---- 10.7 用的「把控制台自己发布出去」的路由 ----
+        #
+        # 直接挂在**这个实例**上，而不是另起一个进程：另起一个就必须再占一个
+        # 管理端口，而 wait_port 会因为第二个进程 bind 失败而报「端口没起来」——
+        # 第一次就是这么踩的（第二个实例抢 9081 报 EADDRINUSE，整个 10.7 全废）。
+        # 同一个进程里发布自己的管理端口，既省事又更贴近用户的实际部署。
+        #
+        # 为什么这条路由必须在**主实例**里：它把管理端口发布到 port_console，
+        # 于是浏览器访问 http://<host>:port_console/_goproxy/ui/ 时，请求由
+        # goproxy 自己转发给内部管理端口 —— 这正是那个 bug 的触发条件
+        # （Director 改写 Host，Origin 仍是浏览器的公网地址）。
+        "routes": [
+            {
+                "id": "console-via-proxy",
+                "name": "把控制台发布出去",
+                "listen_port": port_console,
+                "path_prefix": "/",
+                "target": "http://127.0.0.1:%d" % port_admin,
+            }
+        ],
     }
     with open(auth_cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -266,6 +286,9 @@ def run_auth_section(tmp, bins):
 
     if port_in_use(port_admin):
         check("认证实例端口空闲", False, "%d 已被占用" % port_admin)
+        return
+    if port_in_use(port_console):
+        check("控制台发布端口空闲", False, "%d 已被占用" % port_console)
         return
 
     proc = subprocess.Popen(
@@ -471,6 +494,100 @@ def run_auth_section(tmp, bins):
         # style-src 允许 unsafe-inline 是刻意取舍：React 的 style={{}} 需要它
         check("  控制台仍允许 style 内联（已知取舍）",
               "style-src 'self' 'unsafe-inline'" in csp, csp[:220])
+
+        # ---- 10.7 经代理访问控制台（回归：v0.6.0 的「卡在正在检查管理接口…」） ----
+        #
+        # 这一段守的 bug：把管理端口用一条路由发布出去（用户实际就是这么部署的，
+        # http://<公网IP>:32000/_goproxy/ui/），经代理进来的请求 Host 会被
+        # Director 改写成内部地址，而浏览器发的 Origin 是公网地址 —— 如果同源
+        # 校验拿 r.Host 去比，登录必然 403 cross_origin_rejected，前端又没处理
+        # 非 401 错误，于是永远停在「正在检查管理接口…」。
+        #
+        # 用的是同一个实例（它的 config 里已经挂了 console-via-proxy 那条路由），
+        # 所以这里走的是**真实代理链路**，不是伪造头 —— 伪造的话就测不出
+        # 「Director 到底写了什么」，而那个值恰恰是判定的依据。
+        if not wait_port(port_console, 10):
+            check("控制台发布端口监听", False, "%d 没起来" % port_console)
+        else:
+            via_url = "http://127.0.0.1:%d" % port_console
+            pbare = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            def vreq(path, method="GET", body=None, headers=None, opener=None):
+                data = json.dumps(body).encode() if body is not None else None
+                r = urllib.request.Request(via_url + path, data=data, method=method)
+                if data is not None:
+                    r.add_header("Content-Type", "application/json")
+                for k, v in (headers or {}).items():
+                    r.add_header(k, v)
+                o = opener or pbare
+                try:
+                    with o.open(r, timeout=10) as resp:
+                        return resp.status, dict(resp.headers), resp.read()
+                except urllib.error.HTTPError as e:
+                    return e.code, dict(e.headers), e.read()
+
+            # 静态页面经代理要能打开（这是「页面能显示但数据拿不到」的前提）
+            st, h, b = vreq("/_goproxy/ui/")
+            check("经代理 GET /_goproxy/ui/ -> 200", st == 200, "实际 %s" % st)
+
+            # 未登录时接口应当 401（能看到 credentials_configured）
+            st, h, b = vreq("/_goproxy/stats", headers={"Origin": via_url})
+            check("经代理未登录 /stats -> 401", st == 401, "实际 %s :: %s" % (st, b[:120]))
+            st, h, b = vreq("/_goproxy/session", headers={"Origin": via_url})
+            check("经代理未登录 /session -> 401", st == 401, "实际 %s :: %s" % (st, b[:120]))
+            try:
+                cc = json.loads(b.decode("utf-8")).get("credentials_configured")
+            except Exception:  # noqa: BLE001
+                cc = None
+            check("  经代理 /session 报告 credentials_configured=true", cc is True, str(cc))
+
+            # 核心断言：经代理登录必须成功
+            vjar = http.cookiejar.CookieJar()
+            vbrowser = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPCookieProcessor(vjar),
+            )
+            st, h, b = vreq(
+                "/_goproxy/login",
+                method="POST",
+                body={"username": E2E_ADMIN_USER, "password": E2E_ADMIN_PASSWORD},
+                headers={"Origin": via_url, "Sec-Fetch-Site": "same-origin"},
+                opener=vbrowser,
+            )
+            check("经代理登录 -> 200（不再 403 cross_origin_rejected）",
+                  st == 200, "实际 %s :: %s" % (st, b[:150]))
+            check("  经代理登录下发了会话 Cookie",
+                  any("goproxy" in c.name for c in vjar), str([c.name for c in vjar]))
+
+            # 带着会话经代理读 + 写
+            st, h, b = vreq("/_goproxy/stats", headers={"Origin": via_url}, opener=vbrowser)
+            check("经代理带会话读 /stats -> 200", st == 200, "实际 %s :: %s" % (st, b[:120]))
+
+            st, h, b = vreq(
+                "/_goproxy/config",
+                method="PATCH",
+                body={"access_log": False},
+                headers={"Origin": via_url, "Sec-Fetch-Site": "same-origin"},
+                opener=vbrowser,
+            )
+            check("经代理带会话写 /config -> 200（CSRF 校验已正确放宽）",
+                  st == 200, "实际 %s :: %s" % (st, b[:150]))
+
+            # 安全边界：放宽必须只对「浏览器真正用的那个源」生效
+            for label, origin in (
+                ("第三方", "http://evil.example"),
+                ("内部管理地址", base_url),
+                ("同主机不同端口", "http://127.0.0.1:%d" % (port_console + 1)),
+            ):
+                st, h, b = vreq(
+                    "/_goproxy/config",
+                    method="PATCH",
+                    body={"access_log": False},
+                    headers={"Origin": origin},
+                    opener=vbrowser,
+                )
+                check("经代理 Origin=%s 写 -> 403" % label,
+                      st == 403, "实际 %s :: %s" % (st, b[:150]))
     finally:
         try:
             proc.terminate()

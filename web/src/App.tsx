@@ -22,8 +22,15 @@ import { SettingsPage } from './pages/SettingsPage'
  *   ok          —— 已通过认证
  * 而「服务端到底有没有配账号」是 need-login 之上的一个**子状态**，
  * 由 credentialsConfigured 单独携带，用来决定登录页给表单还是给配置指引。
+ *
+ * v0.6.1 补上了 'error' 这一态，修的是「页面永远卡在正在检查管理接口…」：
+ * 原来的 catch 只处理 401，其余失败只写 statsErr、**不动 gate**，而
+ * 『正在检查管理接口…』的渲染条件是 gate === 'checking'，于是任何非 401
+ * 的失败（403 admin_credentials_not_set、502、断网……）都会让用户对着
+ * 一个转圈的图标无限等下去，既进不去也看不到原因。
+ * 现在非 401 的失败一律落到 'error'，把真实错误摆到用户面前，并给重试按钮。
  */
-type Gate = 'checking' | 'ok' | 'need-login'
+type Gate = 'checking' | 'ok' | 'need-login' | 'error'
 
 export default function App() {
   const [tab, navigate] = useHashTab()
@@ -65,11 +72,25 @@ export default function App() {
         }
         return
       }
-      setStatsErr(e instanceof Error ? e.message : String(e))
+      // 非 401 失败：**必须**把 gate 从 'checking' 挪走。
+      // 漏了这一步的后果就是用户报的那个 bug —— 页面永远停在
+      // 「正在检查管理接口…」，连失败原因都看不到。
+      // 这里刻意不设 'need-login'：那会误导用户去输密码，而问题
+      // 根本不在密码（比如 403 admin_credentials_not_set 是没配账号，
+      // 502 是代理转发不通，status 0 是压根连不上服务端）。
+      // 错误信息存进 statsErr，由 error 那一屏负责展示。
+      setStatsErr(e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e))
+      setGate('error')
     }
   }, [])
 
   usePolling(refresh, 3000, gate === 'checking' || gate === 'ok')
+
+  const retry = useCallback(() => {
+    setGate('checking')
+    setStatsErr(null)
+    void refresh()
+  }, [refresh])
 
   const onLogout = useCallback(async () => {
     try {
@@ -82,13 +103,22 @@ export default function App() {
     void refresh()
   }, [refresh])
 
+  if (gate === 'error') {
+    return (
+      <>
+        <ConnectionError detail={statsErr} onRetry={retry} />
+        <ToastHost />
+      </>
+    )
+  }
+
   if (gate === 'checking' || gate === 'need-login') {
     return (
       <>
         <LoginGate
           mode={gate}
           credentialsConfigured={credsConfigured}
-          onRetry={() => { setGate('checking'); void refresh() }}
+          onRetry={retry}
         />
         <ToastHost />
       </>
@@ -206,6 +236,74 @@ function Logo() {
         <path d="M34 22h6a8 8 0 0 1 8 8v4a8 8 0 0 1-8 8h-6" />
       </g>
     </svg>
+  )
+}
+
+/**
+ * 连不上管理接口时的兜底屏。
+ *
+ * 这一屏存在的唯一理由是：**不要让人对着转圈的图标等一个不会来的结果**。
+ * 触发它的是 refresh() 里非 401 的失败，也就是「请求发出去了，但没拿到
+ * 一个能用来登录的答复」。常见成因各不相同，所以下面按错误码分类给指引，
+ * 而不是笼统地说一句「连接失败」—— 用户自己排查的成本全在这句话的精度上。
+ *
+ * 注意：不要把它做成登录表单，那会把人引到「是不是我密码打错了」这条
+ * 完全错误的岔路上去。
+ */
+function ConnectionError({ detail, onRetry }: { detail: string | null; onRetry: () => void }) {
+  return (
+    <div className="gate">
+      <Card title="goproxy 控制台" sub="无法连接管理接口">
+        <div className="stack">
+          <Note kind="err">
+            探测管理接口失败，未能进入控制台。
+            {detail && (
+              <>
+                <br />
+                <span className="faint small">服务端返回：{detail}</span>
+              </>
+            )}
+          </Note>
+
+          <div className="small">
+            页面本身已经加载出来了（静态资源是公开的），说明你确实连到了
+            goproxy 的某个端口；失败发生在读取 <code>/_goproxy/</code> 接口这一步。
+            按下面的提示对号入座：
+          </div>
+
+          <div className="small">
+            <b>403 · admin_credentials_not_set</b> —— 服务端
+            <code>config.json</code> 里既没有 <code>admin_users</code> 也没有
+            <code>admin_token</code>。在服务器上配一个管理员账号并保存（会热重载）：
+            <pre className="code">{`goproxy -hash-password '你的密码'`}</pre>
+          </div>
+
+          <div className="small">
+            <b>502 · bad_gateway</b> —— 你是通过一条代理路由访问控制台的，
+            但后端的管理端口没在监听（<code>admin_addr</code> 被写成
+            <code>off</code>，或进程刚重启还没起来）。检查服务器的
+            <code>admin_addr</code> 与进程状态。
+          </div>
+
+          <div className="small">
+            <b>连接被拒绝 / 请求超时</b> —— 请求没能到达 goproxy。
+            如果你是从外网访问，确认实例的防火墙 / 安全组放行了当前端口，
+            以及 <code>config.json</code> 里确实有监听这个端口的路由。
+          </div>
+
+          <Note kind="info">
+            修改 <code>config.json</code> 后会自动热重载，不需要重启进程；
+            改完点下面的重试即可。
+          </Note>
+
+          <div className="row">
+            <button className="btn primary" onClick={onRetry}>
+              重试
+            </button>
+          </div>
+        </div>
+      </Card>
+    </div>
   )
 }
 
