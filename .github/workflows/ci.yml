@@ -212,12 +212,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      # fetch-depth: 0 是**必须**的：下面「生成 Release 说明」要读 annotated tag 的
-      # message（`git for-each-ref refs/tags/$TAG`）。浅克隆下 tag 对象拿不到，
-      # 结果是静默回退成只有 auto changelog —— 正是这个步骤要避免的事。
+      # 这里**不再需要** fetch-depth: 0。曾经要用它来保证本地能读到 tag 对象，
+      # 但那条路本身不可靠（见下面「第三次踩」那段：checkout 会把 refs/tags/<tag>
+      # 重写成轻量标签），现在说明一律走 API 读，服务端权威，与本地克隆深度无关。
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -249,9 +247,25 @@ jobs:
       #      亲手写在 tag 上的说明被 88 字节的 "Full Changelog" 冲掉。
       #
       # 现在的约定：**手写的发布说明写在 annotated tag 的 message 里**
-      # （`git tag -a v0.6.0 -F notes.md`，第一行会被 git 当成标题丢掉，
+      # （`git tag -a v0.6.0 -F notes.md`，第一行会被当成标题丢掉，
       #   所以正文从第二行起）。CI 把它取出来当正文，auto changelog 只作附录。
       # 这样发布说明跟着 tag 走、有版本控制、且不依赖任何手动点击。
+      #
+      # ⚠ 第三次踩（v0.7.0）：**不能用本地 git 读 tag 说明。**
+      #
+      # actions/checkout 在 tag 触发的 run 里会先 `git rev-parse` 把 tag 解析成
+      # 它指向的 commit sha，再执行
+      #   git fetch --no-tags ... origin +<commit-sha>:refs/tags/<tag>
+      # 于是本地 `refs/tags/<tag>` 被**重写成指向 commit 的轻量标签**
+      # （日志里能看到那一行；上面那句 fetch-depth: 0 的注释也因此失效）。
+      # 而 `git for-each-ref ... %(contents:body)` 对轻量标签返回的是
+      # **提交信息** —— 脚本不报错，只是安静地把 commit message 当成发布说明发出去。
+      # v0.7.0 就这么发了一版，正文是提交信息。
+      #
+      # 所以改成走 API 读 tag 对象：服务端权威，不受本地 ref 改写影响，
+      # 而且**读完能立刻判断「这到底是不是一条 annotated tag」**。
+      # 也刻意不保留 git 那条路 —— 一个会静默取到错误文本的回退，
+      # 比直接失败危险得多。
       - name: 生成 Release 说明
         continue-on-error: true
         env:
@@ -261,10 +275,22 @@ jobs:
           set -eu
           repo="${{ github.repository }}"
 
-          # tag 的 message：git 会去掉开头的标题行，剩下的就是手写正文。
-          # 用 --format 而不是给 git 加参数，避免掉进 shell 引号地狱。
-          tag_notes=$(git for-each-ref "refs/tags/$TAG" \
-            --format='%(contents:body)' 2>/dev/null || true)
+          # tag 对象本身。annotated tag 的 ref 指向一个 tag 对象；
+          # 轻量标签的 ref 直接指向 commit（那种情况本来就没有说明）。
+          ref_json=$(gh api "repos/$repo/git/ref/tags/$TAG" 2>/dev/null || true)
+          obj_type=$(printf '%s' "$ref_json" | jq -r '.object.type // empty' 2>/dev/null || true)
+          obj_sha=$(printf '%s' "$ref_json" | jq -r '.object.sha // empty' 2>/dev/null || true)
+          echo "tag $TAG -> object.type=$obj_type sha=$obj_sha"
+
+          tag_notes=""
+          if [ "$obj_type" = "tag" ]; then
+            # 第一行是标题（release 名已经是它了），正文从第二行起 —— 与旧约定一致。
+            tag_notes=$(gh api "repos/$repo/git/tags/$obj_sha" --jq .message 2>/dev/null \
+              | tail -n +2 || true)
+          fi
+          # 把取到的正文打一行出来。这一步是为了让「取错来源」在日志里可见 ——
+          # 之前那次就是因为它完全不可见，才没人发现发出去的是提交信息。
+          echo "tag 说明首行：$(printf '%s' "$tag_notes" | head -n 1)"
 
           changelog=$(gh api "repos/$repo/releases/generate-notes" \
             -f tag_name="$TAG" --jq .body 2>/dev/null || true)
@@ -275,9 +301,10 @@ jobs:
           elif [ -n "${tag_notes:-}" ]; then
             body="$tag_notes"
           elif [ -n "${changelog:-}" ]; then
+            echo "::warning::tag $TAG 没有说明（object.type=$obj_type），本次 Release 只有 auto changelog"
             body="$changelog"
           else
-            echo "tag 没有说明、auto changelog 也拿不到，保留 Release 现状"
+            echo "::warning::tag 没有说明、auto changelog 也拿不到，保留 Release 现状"
             exit 0
           fi
 
