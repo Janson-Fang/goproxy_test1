@@ -233,6 +233,13 @@ func (a *App) reload() error {
 	if cfg.TLS.Enabled {
 		tlsShown = fmt.Sprintf("on (%d 个 TLS 端口)", len(cfg.tlsPorts()))
 	}
+	// 全局黑名单非空时单独告警一句。它会影响**所有**入口，包括你正在用的
+	// 控制台 —— 所以「现在有几条全局封禁在生效」值得在启动/重载日志里显式出现，
+	// 而不是埋在字段里等人自己发现。
+	if n := tbl.globalDeny.Len(); n > 0 {
+		slog.Warn("全局黑名单已生效", "rules", n, "scope", "所有入口，含管理端口")
+	}
+
 	slog.Info("配置已生效",
 		"routes", len(tbl.routes),
 		"ports", tbl.ListenPorts(),
@@ -331,6 +338,31 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
+		// 0) 全局黑名单 —— 必须排在路由匹配**之前**。
+		//
+		// 位置是这份名单的语义决定的：它管的是「所有入口」，其中恰恰包括
+		// **匹配不到任何路由**的那些请求。如果放在路由匹配之后，扫描器挨个端口
+		// 扫过来时压根不会命中任何路由，也就永远走不到这份名单 ——
+		// 而那正是最需要拦下的流量。
+		//
+		// 放在这里还有一个附带好处：被全局封禁的地址连 ACME 挑战和
+		// HTTP→HTTPS 跳转都不会触发，是最彻底的拒绝。
+		if gdec := decideIP(tbl.globalDeny, nil, ip, false); !gdec.Allowed {
+			blocked = gdec.Reason
+			// 路由标签留空：全局封禁不属于任何一条路由，硬填一个 ID 是假信息。
+			// 404 分支也是这么处理的。
+			a.metrics.IncRejected("", gdec.Reason)
+			a.metrics.IncRequest("", http.StatusForbidden)
+			// 响应体刻意不带命中的具体规则：那等于告诉扫描器「你踩到哪条线了」。
+			// 具体规则进访问日志（blocked 标签 + 命中测试工具），运维看得到，
+			// 对面学不到。
+			writeJSON(rec, http.StatusForbidden, map[string]any{
+				"error":  "forbidden",
+				"reason": gdec.Reason,
+			})
+			return
+		}
+
 		// 明文端口上的三件事，顺序不能乱：
 		//   1) ACME 的 HTTP-01 挑战 —— 它必须能到达，绝不能跳转，
 		//      一跳转 Let's Encrypt 的验证就失败（而且是静默失败，很难查）。
@@ -374,15 +406,18 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
-		// 1) IP 黑白名单
-		if rt.acl != nil && !rt.acl.Allowed(ip) {
-			blocked = "acl"
-			a.metrics.IncRejected(rt.ID, "acl")
+		// 1) 路由级 IP 名单（白名单 + 黑名单）
+		//
+		// 全局黑名单上面已经判过了，这里传 nil 跳过它，避免同一次请求算两遍。
+		if adec := decideIP(nil, rt.acl, ip, false); !adec.Allowed {
+			blocked = adec.Reason
+			a.metrics.IncRejected(rt.ID, adec.Reason)
 			a.metrics.IncRequest(rt.ID, http.StatusForbidden)
 			writeJSON(rec, http.StatusForbidden, map[string]any{
 				"error":  "forbidden",
 				"route":  rt.ID,
-				"reason": "ip_not_allowed",
+				"reason": adec.Reason,
+				"layer":  adec.Layer,
 			})
 			return
 		}
@@ -504,6 +539,38 @@ func (a *App) logAccess(r *http.Request, port int, rt *Route, blocked, ip string
 // 第三层不能省。早期版本只把精确的 "/" 重定向到控制台，其余全交给管理接口
 // 那个兜底的 "/"，结果是：用户在浏览器里手写 /_goproxy/（最容易猜的地址）
 // 看到的是纯文本接口清单，而 / 才进控制台 —— 表现得像「控制台没生效」。
+// adminIPGuard 把全局黑名单套到管理端口上。
+//
+// 为什么要在业务侧之外再套一遍：管理端口是独立监听的，走的是完全另一套
+// handler，业务请求那条管线覆盖不到它。「全局」的意思是对**所有入口**生效，
+// 所以这里必须单独判一次。
+//
+// 关于客户端 IP 的取值，有一个容易误判的地方：如果控制台是通过自己的路由
+// 发布出去的（比如把管理端口挂到公网 32000 上），那么到达管理端口的这一跳
+// 来自本机反向代理，RemoteAddr 是 127.0.0.1。这看起来像是「判定用错了 IP」，
+// 其实不然 —— 那个请求在**外层业务端口**上已经用真实客户端 IP 判过全局黑名单了，
+// 走到这里的是已经放行的流量。两层都在判，各自覆盖自己看得到的那个来源。
+func (a *App) adminIPGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tbl := a.table.Load()
+		if tbl == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ip := clientIP(r, tbl.trusted)
+		dec := decideIP(tbl.globalDeny, nil, ip, false)
+		if !dec.Allowed {
+			a.metrics.IncRejected("", dec.Reason)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":  "forbidden",
+				"reason": dec.Reason,
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (a *App) adminHandler() http.Handler {
 	guarded := a.adminGuard(a.adminMux())
 
@@ -555,7 +622,8 @@ func (a *App) adminHandler() http.Handler {
 		http.NotFound(w, r)
 	})
 	// 安全头包在最外层：无论落到静态资源、接口还是纯文本清单都会带上。
-	return securityHeaders(root)
+	// 全局黑名单放在安全头**之内**，这样被它拦下的 403 也带着安全头。
+	return securityHeaders(a.adminIPGuard(root))
 }
 
 // isAuthPath 判断路径是不是「登录/会话」这两条需要在认证前就能访问的接口。
@@ -602,7 +670,8 @@ func serveAdminIndex(w http.ResponseWriter) {
 		"  /_goproxy/session         GET 当前登录态  DELETE 登出\n"+
 		"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
 		"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
-		"  /_goproxy/config          GET / PATCH 全局配置\n"+
+		"  /_goproxy/config          GET / PATCH 全局配置（含 global_ip_deny 全局黑名单）\n"+
+		"  /_goproxy/acl/test        GET ?ip=&route_id= 或 POST {ip,route_id} 名单命中测试\n"+
 		"  /_goproxy/ports           当前监听端口\n"+
 		"  /_goproxy/certs           证书状态（域名/签发者/到期/来源）\n"+
 		"  /_goproxy/stats           聚合状态（指标 + 采样曲线 + 熔断计数）\n"+
@@ -668,6 +737,9 @@ func (a *App) adminMux() *http.ServeMux {
 	mux.HandleFunc("DELETE /_goproxy/routes/{id}", a.handleDeleteRoute)
 	mux.HandleFunc("GET /_goproxy/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /_goproxy/config", a.handlePatchConfig)
+	// IP 名单的命中测试：GET ?ip=&route_id= 或 POST {ip, route_id}。
+	// 不填 ip 就是「测我自己」，控制台的一键自检靠它。
+	mux.HandleFunc("/_goproxy/acl/test", a.handleACLTest)
 	// 管理台的数据源（实现见 stats.go）
 	mux.HandleFunc("GET /_goproxy/stats", a.handleStats)
 	mux.HandleFunc("GET /_goproxy/logs", a.handleLogs)

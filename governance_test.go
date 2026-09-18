@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -121,47 +122,344 @@ func TestIsBackendFailure(t *testing.T) {
 	}
 }
 
-// ---------- ACL ----------
+// ---------- IP 名单（全局黑名单 / 白名单 / 黑名单 三层） ----------
 
-func TestACLAllowMode(t *testing.T) {
-	a, err := NewACL("allow", []string{"10.0.0.0/8", "192.168.1.5"})
+// mustList 建一份名单，省掉测试里到处判 err。
+func mustList(t *testing.T, rules ...string) *IPList {
+	t.Helper()
+	rs := make([]IPRule, 0, len(rules))
+	for _, r := range rules {
+		rs = append(rs, IPRule{CIDR: r})
+	}
+	l, err := NewIPList(rs)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("构建名单失败: %v", err)
 	}
-	cases := map[string]bool{
-		"10.1.2.3":    true,
-		"192.168.1.5": true,  // 单个 IP 写法
-		"192.168.1.6": false, // 不在白名单
-		"8.8.8.8":     false,
-		"172.16.0.1":  false,
+	return l
+}
+
+// mustACL 建一份路由级名单。
+//
+// nil 与空切片在这里被刻意区分开：nil = 这份名单没配，
+// 空切片 = 显式配了但是空的（白名单这么写是配置错误）。
+func mustACL(t *testing.T, allow, deny []string) *ACL {
+	t.Helper()
+	mk := func(list []string) []IPRule {
+		if list == nil {
+			return nil
+		}
+		out := make([]IPRule, 0, len(list))
+		for _, s := range list {
+			out = append(out, IPRule{CIDR: s})
+		}
+		return out
 	}
-	for ip, want := range cases {
-		if got := a.Allowed(ip); got != want {
-			t.Errorf("allow 模式 ip=%s 期望 %v，实际 %v", ip, want, got)
+	a, err := NewACL(&RouteACLConfig{Allow: mk(allow), Deny: mk(deny)})
+	if err != nil {
+		t.Fatalf("构建 ACL 失败: %v", err)
+	}
+	return a
+}
+
+// TestACLThreeLayerOrder 是这次改动的核心断言：三层名单的判定顺序。
+//
+// 顺序本身就是规格 —— 改它等于改线上行为。所以这里用一个覆盖全部分支的表
+// 把它钉死：将来谁调整了 decideIP 的顺序，这个测试会立刻变红。
+func TestACLThreeLayerOrder(t *testing.T) {
+	global := mustList(t, "203.0.113.0/24")
+	route := mustACL(t,
+		[]string{"10.0.0.0/8", "203.0.113.66"}, // 白名单
+		[]string{"10.0.0.66"})                  // 黑名单
+
+	cases := []struct {
+		ip      string
+		allowed bool
+		layer   string
+		reason  string
+		why     string
+	}{
+		{"10.1.2.3", true, "", "",
+			"白名单内，两份黑名单都没命中"},
+		{"10.0.0.66", false, layerDeny, reasonACLRouteDeny,
+			"白名单里的例外被路由黑名单追加禁掉"},
+		{"203.0.113.66", false, layerGlobalDeny, reasonACLGlobalDeny,
+			"同时命中全局黑名单和白名单 —— 全局优先，白名单救不回来"},
+		{"192.168.1.9", false, layerAllow, reasonACLAllowMiss,
+			"白名单已启用但不在名单内"},
+		{"203.0.113.7", false, layerGlobalDeny, reasonACLGlobalDeny,
+			"全局黑名单命中，连白名单那一层都不用看"},
+	}
+	for _, c := range cases {
+		got := decideIP(global, route, c.ip, false)
+		if got.Allowed != c.allowed || got.Layer != c.layer || got.Reason != c.reason {
+			t.Errorf("ip=%s（%s）:\n  期望 allowed=%v layer=%q reason=%q\n  实际 allowed=%v layer=%q reason=%q",
+				c.ip, c.why, c.allowed, c.layer, c.reason, got.Allowed, got.Layer, got.Reason)
 		}
 	}
 }
 
-func TestACLDenyMode(t *testing.T) {
-	a, err := NewACL("deny", []string{"10.0.0.0/8"})
-	if err != nil {
-		t.Fatal(err)
+// TestACLGlobalDenyIsNotExemptable 单独钉住「全局黑名单不可被白名单豁免」。
+//
+// 这是三层模型里唯一带着强烈取舍的规则。代价是「想给某个被封的地址开口子，
+// 必须先去全局名单里删掉它」；换来的是「封禁一定生效」—— 紧急处置攻击源时
+// 最需要的性质。如果有人把它改成「白名单可以豁免」，这个测试会红。
+func TestACLGlobalDenyIsNotExemptable(t *testing.T) {
+	global := mustList(t, "1.2.3.4")
+	// 白名单里**明确写了**同一个 IP，也不能把它捞回来
+	route := mustACL(t, []string{"1.2.3.4"}, nil)
+
+	got := decideIP(global, route, "1.2.3.4", false)
+	if got.Allowed {
+		t.Fatal("全局黑名单必须优先于白名单：白名单里写了同一个 IP 也不能放行")
 	}
-	if a.Allowed("10.0.0.1") {
-		t.Error("黑名单内的 IP 应被拒绝")
+	if got.Layer != layerGlobalDeny {
+		t.Errorf("应当由全局黑名单拦下，实际层名 %q", got.Layer)
 	}
-	if !a.Allowed("8.8.8.8") {
-		t.Error("黑名单外的 IP 应放行")
+	if got.Rule != "1.2.3.4" {
+		t.Errorf("应当报告命中的具体规则，实际 %q", got.Rule)
 	}
 }
 
-func TestACLEmptyCIDRsRejected(t *testing.T) {
-	// allow 模式配空列表会拒绝所有流量，属于明显的配置错误，应当在启动时报错
-	if _, err := NewACL("allow", nil); err == nil {
-		t.Error("allow 模式但 cidrs 为空，应当报错而不是静默拒绝所有请求")
+// TestACLNotConfiguredMeansUnrestricted 守住「没配 ≠ 空白」。
+//
+// 这两种状态在 JSON 里只差一个字符，语义却相反，是这套模型里最容易写错的地方。
+func TestACLNotConfiguredMeansUnrestricted(t *testing.T) {
+	// 整个 ACL 为 nil，和两侧名单都没配，都表示不做 IP 限制
+	for _, acl := range []*ACL{nil, mustACL(t, nil, nil)} {
+		if got := decideIP(nil, acl, "8.8.8.8", false); !got.Allowed {
+			t.Errorf("没配任何名单时不应拦请求，实际被 %q 拦下", got.Layer)
+		}
 	}
-	if _, err := NewACL("bogus", []string{"10.0.0.0/8"}); err == nil {
-		t.Error("非法 mode 应报错")
+
+	// 只配黑名单：名单外放行，名单内拒绝
+	only := mustACL(t, nil, []string{"8.8.8.8"})
+	if !decideIP(nil, only, "1.1.1.1", false).Allowed {
+		t.Error("只配黑名单时，名单外的地址应放行")
+	}
+	if decideIP(nil, only, "8.8.8.8", false).Allowed {
+		t.Error("黑名单内的地址应被拒绝")
+	}
+}
+
+// TestACLAllowOnly 覆盖只配白名单的情形（对应 v0.6.x 的 mode=allow）。
+func TestACLAllowOnly(t *testing.T) {
+	a := mustACL(t, []string{"10.0.0.0/8", "192.168.1.5"}, nil)
+	cases := map[string]bool{
+		"10.1.2.3":    true,
+		"192.168.1.5": true, // 单个 IP 的简写形式
+		"192.168.1.6": false,
+		"8.8.8.8":     false,
+		"172.16.0.1":  false,
+	}
+	for ip, want := range cases {
+		if got := decideIP(nil, a, ip, false).Allowed; got != want {
+			t.Errorf("白名单模式 ip=%s 期望 %v，实际 %v", ip, want, got)
+		}
+	}
+}
+
+// TestACLUnknownIPFailsClosedForAllow：解析不出客户端 IP 时，
+// 只要配了白名单就必须按「不在名单内」处理。
+//
+// 反过来的 fail-open 会把「拿不到来源」变成绕过白名单的手段。
+func TestACLUnknownIPFailsClosedForAllow(t *testing.T) {
+	if decideIP(nil, mustACL(t, []string{"10.0.0.0/8"}, nil), "", false).Allowed {
+		t.Error("解析不出 IP 时，配了白名单就必须拒绝，不能放行")
+	}
+	// 没有白名单可比对时，取不到来源不至于要拒绝
+	if !decideIP(nil, mustACL(t, nil, []string{"10.0.0.0/8"}), "", false).Allowed {
+		t.Error("只配黑名单且解析不出 IP 时，不应拒绝")
+	}
+}
+
+// TestACLDecisionTrace：命中测试要用的 trace 只在需要时才建。
+func TestACLDecisionTrace(t *testing.T) {
+	global := mustList(t, "203.0.113.0/24")
+	route := mustACL(t, []string{"10.0.0.0/8"}, []string{"10.0.0.66"})
+
+	// 热路径不带 trace，避免每个请求都白建一个切片
+	if d := decideIP(global, route, "10.1.2.3", false); d.Steps != nil {
+		t.Errorf("trace=false 时不应填 Steps，实际 %d 步", len(d.Steps))
+	}
+
+	// 命中测试要能看到三层各自的结论
+	d := decideIP(global, route, "203.0.113.7", true)
+	if len(d.Steps) != 1 {
+		t.Fatalf("命中全局黑名单应只记 1 步就结束，实际 %d 步", len(d.Steps))
+	}
+	if d.Steps[0].Layer != layerGlobalDeny || !d.Steps[0].Matched {
+		t.Errorf("第一步应当是「全局黑名单命中」，实际 %+v", d.Steps[0])
+	}
+
+	// 放行时三层都要有记录，排查「为什么它进来了」才有的看
+	d = decideIP(global, route, "10.1.2.3", true)
+	if len(d.Steps) != 3 {
+		t.Fatalf("放行时应记满三层，实际 %d 步", len(d.Steps))
+	}
+	if !d.Steps[1].Matched || d.Steps[1].Rule != "10.0.0.0/8" {
+		t.Errorf("第二步应当是在白名单命中并给出规则，实际 %+v", d.Steps[1])
+	}
+}
+
+// TestIPRuleAcceptsStringAndObject 覆盖名单条目的两种写法与序列化取舍。
+func TestIPRuleAcceptsStringAndObject(t *testing.T) {
+	var rules []IPRule
+	raw := `["10.0.0.0/8", {"cidr": "1.2.3.4", "note": "爬虫"}]`
+	if err := json.Unmarshal([]byte(raw), &rules); err != nil {
+		t.Fatalf("两种写法都应当能解析: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("期望解析出 2 条，实际 %d", len(rules))
+	}
+	if rules[0].CIDR != "10.0.0.0/8" || rules[0].Note != "" {
+		t.Errorf("字符串简写解析结果不对: %+v", rules[0])
+	}
+	if rules[1].CIDR != "1.2.3.4" || rules[1].Note != "爬虫" {
+		t.Errorf("对象写法解析结果不对: %+v", rules[1])
+	}
+
+	// 序列化：没有备注时必须回到字符串简写。
+	// 否则一次控制台保存就把 ["10.0.0.0/8"] 撑成 [{"cidr":"10.0.0.0/8"}]，
+	// 配置文件越存越长。
+	b, err := json.Marshal(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `["10.0.0.0/8",{"cidr":"1.2.3.4","note":"爬虫"}]`
+	if string(b) != want {
+		t.Errorf("序列化期望 %s，实际 %s", want, string(b))
+	}
+}
+
+// TestIPRuleRejectsGarbage：既不合法也不是对象的写法必须报错。
+func TestIPRuleRejectsGarbage(t *testing.T) {
+	var rules []IPRule
+	if err := json.Unmarshal([]byte(`[123]`), &rules); err == nil {
+		t.Error("数字既不是字符串也不是对象，应当报错")
+	}
+	// 缺 cidr 的条目：反序列化能过，但构建名单时必须拦下 ——
+	// 否则它会变成一条谁都匹配不上的死规则，看起来配了其实没配。
+	if _, err := NewIPList([]IPRule{{Note: "只有备注"}}); err == nil {
+		t.Error("cidr 为空的条目应当在构建名单时报错")
+	}
+}
+
+// TestIPListRejectsMalformed 覆盖 CIDR 解析的合法与非法边界。
+func TestIPListRejectsMalformed(t *testing.T) {
+	for _, bad := range []string{"not-an-ip", "", "10.0.0.0/33", "300.1.1.1"} {
+		if _, err := NewIPList([]IPRule{{CIDR: bad}}); err == nil {
+			t.Errorf("%q 不是合法的 IP 或 CIDR，应当报错", bad)
+		}
+	}
+	for _, ok := range []string{
+		"10.0.0.0/8", "192.168.1.5", "0.0.0.0/0",
+		"2001:db8::/32", "::1", "::ffff:10.0.0.1",
+	} {
+		if _, err := NewIPList([]IPRule{{CIDR: ok}}); err != nil {
+			t.Errorf("%q 应当是合法条目，实际报错: %v", ok, err)
+		}
+	}
+	// nil 表示「这份名单没配」，不是「空名单」
+	l, err := NewIPList(nil)
+	if err != nil || l != nil {
+		t.Errorf("NewIPList(nil) 应当返回 (nil, nil)，实际 (%v, %v)", l, err)
+	}
+}
+
+// TestIPListMatchesMappedIPv6 覆盖 IPv4-mapped IPv6 的匹配。
+//
+// 实测确认 Go 的 net.IPNet.Contains 对这四种组合都能正确匹配，且 ParseIP
+// 本身就把 ::ffff:1.2.3.4 归一化成 1.2.3.4。所以这里**不需要**任何地址归一化
+// 代码 —— 写成测试是为了防止将来有人「顺手加一层归一化」，那反而会引入
+// 新的边界问题（比如把 ::ffff:10.0.0.0/120 这种写法弄坏）。
+func TestIPListMatchesMappedIPv6(t *testing.T) {
+	cases := []struct{ cidr, ip string }{
+		{"10.0.0.0/24", "::ffff:10.0.0.5"},
+		{"::ffff:10.0.0.0/120", "10.0.0.5"},
+		{"::ffff:10.0.0.0/120", "::ffff:10.0.0.5"},
+		{"::ffff:10.0.0.5/128", "10.0.0.5"},
+	}
+	for _, c := range cases {
+		l, err := NewIPList([]IPRule{{CIDR: c.cidr}})
+		if err != nil {
+			t.Errorf("list=%s 应当合法: %v", c.cidr, err)
+			continue
+		}
+		if _, ok := l.Match(net.ParseIP(c.ip)); !ok {
+			t.Errorf("list=%s 应当匹配 ip=%s", c.cidr, c.ip)
+		}
+	}
+}
+
+// TestRouteACLEmptyAllowRejected：空白名单是三层里唯一「配了就出事」的写法。
+func TestRouteACLEmptyAllowRejected(t *testing.T) {
+	c := &Config{Routes: []RouteConfig{{
+		ID: "r", Target: "http://127.0.0.1:9000", PathPrefix: "/",
+		ACL: &RouteACLConfig{Allow: []IPRule{}}, // 显式空数组
+	}}}
+	if err := c.validate(); err == nil {
+		t.Error("acl.allow 写成空数组会让整条路由拒绝所有请求，必须在写盘前报错")
+	}
+
+	// 对照：完全不写 allow（nil）表示不限制来源，是合法的
+	c2 := &Config{Routes: []RouteConfig{{
+		ID: "r", Target: "http://127.0.0.1:9000", PathPrefix: "/",
+		ACL: &RouteACLConfig{Deny: []IPRule{{CIDR: "10.0.0.0/8"}}},
+	}}}
+	if err := c2.validate(); err != nil {
+		t.Errorf("只配 deny 应当合法: %v", err)
+	}
+
+	// 空的黑名单是合法的：什么都不禁，没有危害
+	c3 := &Config{GlobalIPDeny: []IPRule{}}
+	if err := c3.validate(); err != nil {
+		t.Errorf("空的 global_ip_deny 应当合法: %v", err)
+	}
+}
+
+// TestGlobalIPDenyValidated：全局黑名单里的坏 CIDR 必须在写盘前被拦下。
+//
+// 写接口的顺序是「先落盘、再 reload」。校验漏掉这一层的话，坏配置会先写进
+// 文件、然后 reload 才失败，进程停在一个半坏的状态上。
+func TestGlobalIPDenyValidated(t *testing.T) {
+	if err := (&Config{GlobalIPDeny: []IPRule{{CIDR: "300.1.1.1"}}}).validate(); err == nil {
+		t.Error("非法的 global_ip_deny CIDR 应当在校验时报错")
+	}
+	ok := &Config{GlobalIPDeny: []IPRule{{CIDR: "203.0.113.0/24", Note: "扫描源"}}}
+	if err := ok.validate(); err != nil {
+		t.Errorf("合法的 global_ip_deny 不应报错: %v", err)
+	}
+}
+
+// TestLegacyACLRejected：v0.6.x 的 acl.mode / acl.cidrs 必须显式报错。
+//
+// 这是本次改动里最要紧的一条防线。旧配置里 mode=allow 表达的是一条**白名单**；
+// 新结构没有 mode 字段，静默忽略的后果是白名单不再生效、所有来源都能访问 ——
+// 一次无声的安全降级。配置文件还在、启动也不报错，但防护已经没了，
+// 比启动失败危险得多。
+func TestLegacyACLRejected(t *testing.T) {
+	for _, mode := range []string{"allow", "deny"} {
+		raw := []byte(`{"routes":[{"id":"r","acl":{"mode":"` + mode + `","cidrs":["10.0.0.0/8"]}}]}`)
+		err := rejectLegacyACL(raw)
+		if err == nil {
+			t.Fatalf("旧的 acl.mode=%s + cidrs 必须报错，不能静默失效", mode)
+		}
+		if !strings.Contains(err.Error(), "acl.allow") {
+			t.Errorf("报错信息里应当给出迁移映射，实际: %v", err)
+		}
+	}
+
+	// 纯 mode=none 的残留是空操作，放行 —— 免得为一行无意义的遗留卡住升级
+	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r","acl":{"mode":"none"}}]}`)); err != nil {
+		t.Errorf("mode=none 的残留不应阻塞升级，实际报错: %v", err)
+	}
+	// 新写法当然要能过
+	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r","acl":{"allow":["10.0.0.0/8"]}}]}`)); err != nil {
+		t.Errorf("新写法不应被拦，实际报错: %v", err)
+	}
+	// 完全没有 acl 的路由
+	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r"}]}`)); err != nil {
+		t.Errorf("没有 acl 的路由不应被拦，实际报错: %v", err)
 	}
 }
 
@@ -396,8 +694,14 @@ func TestAuthConfigValidation(t *testing.T) {
 		}}},
 		{Routes: []RouteConfig{{
 			ID: "e", Target: "http://x",
-			ACL: &ACLConfig{Mode: "whatever", CIDRs: []string{"10.0.0.0/8"}},
+			ACL: &RouteACLConfig{Deny: []IPRule{{CIDR: "not-an-ip"}}}, // CIDR 非法
 		}}},
+		{Routes: []RouteConfig{{
+			ID: "f", Target: "http://x",
+			ACL: &RouteACLConfig{Allow: []IPRule{}}, // 空白名单 = 谁都进不来
+		}}},
+		// 顶层全局黑名单里的坏 CIDR 同样要在写盘前拦下
+		{GlobalIPDeny: []IPRule{{CIDR: "10.0.0.0/40"}}},
 	}
 	for i, c := range bad {
 		c.applyDefaults()

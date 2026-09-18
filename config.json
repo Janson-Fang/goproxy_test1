@@ -86,7 +86,7 @@
       "host": "",
       "path_prefix": "/",
       "target": "http://127.0.0.1:9001",
-      "acl": { "mode": "deny", "cidrs": ["127.0.0.1"] }
+      "acl": { "deny": [{ "cidr": "127.0.0.1", "note": "演示：把本机拉黑，用来观察拦截日志" }] }
     },
     {
       "id": "svc-cb",

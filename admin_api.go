@@ -458,6 +458,95 @@ func (a *App) trustedNets() []*net.IPNet {
 	return nil
 }
 
+// loopbackNets 返回回环网段。
+//
+// 单独列出来是给 consoleClientIPs 用的：判断「本进程自己的代理」这一跳时，
+// 回环当然可信，但用户配置的 trusted_proxies 里通常不会写 127.0.0.0/8
+// （那是给外部反代准备的），所以不能指望它。
+func loopbackNets() []*net.IPNet {
+	_, v4, _ := net.ParseCIDR("127.0.0.0/8")
+	_, v6, _ := net.ParseCIDR("::1/128")
+	return []*net.IPNet{v4, v6}
+}
+
+// consoleClientIPs 列出「正在改配置的这个请求」可能对应的客户端地址。
+//
+// 为什么要列多个：控制台有两种到达方式，看到的来源 IP 不一样。
+//
+//	① 直连管理端口：RemoteAddr 就是发起者。
+//	② 经自己的路由发布出去（比如把管理端口挂到公网 32000 上）：到达管理端口
+//	   这一跳来自本机反向代理，RemoteAddr 是 127.0.0.1；发起者的真实地址在
+//	   X-Forwarded-For 里。
+//
+// 情况 ② 里采信 X-Forwarded-For 是安全的：viaOwnProxy 为真说明这个头是本进程
+// 的代理写上去的（proxy.go 里用 Set 无条件覆盖，外部伪造的值活不到这里，
+// admin_api_test.go 有专门的用例守着这一点）。
+//
+// 实现上没有自己手写「取 XFF 最后一段」，而是把回环并进可信网段后重新调用
+// clientIP —— 复用那套「从右往左跳过可信跳数」的逻辑，免得两处实现悄悄走样。
+//
+// 只要其中任何一个地址会被新规则挡掉，这次保存就可能让自己失联，所以全都查。
+func (a *App) consoleClientIPs(r *http.Request) []string {
+	trusted := a.trustedNets()
+
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+
+	add(clientIP(r, trusted))
+	if viaOwnProxy(r) {
+		// 复制一份再追加：trustedNets() 返回的是共享切片，直接 append 有
+		// 写进它底层数组的风险（那时会静默改掉全局的可信网段）。
+		withLoopback := append(append([]*net.IPNet(nil), trusted...), loopbackNets()...)
+		add(clientIP(r, withLoopback))
+	}
+	return out
+}
+
+// guardSelfLockout 检查新配置会不会把「正在改配置的这个人」挡在外面。
+//
+// 为什么需要它：管理端口也在全局黑名单的管辖范围内（这是明确的设计选择，
+// 见 config.go 的 GlobalIPDeny 注释），而控制台正是改配置的地方。于是在控制台
+// 上加一条写错的网段，就能在点下保存的瞬间让自己失去控制台 —— 只能登机器
+// 改文件重启。这个组合必须有人兜住。
+//
+// 这是**护栏，不是权限**：它挡的是无心之失，不是禁止这么配。真要封掉自己
+// 所在的网段，改配置文件后重启即可 —— 那条路永远留着，也不该被这里限制。
+//
+// 只检查全局黑名单，不检查路由级名单：路由名单的锁定范围限于那条路由所挂的
+// 端口，界面上 target 和端口都摆在同一屏，属于「看得见」的风险；而全局名单
+// 会静默作用于所有入口，这才是容易误判的那个。路由级的风险交给前端的
+// 命中测试工具提示。
+func (a *App) guardSelfLockout(r *http.Request, next *Config) error {
+	global, err := NewIPList(next.GlobalIPDeny)
+	if err != nil {
+		return nil // 非法配置由 validate 负责报错，不在这里抢答
+	}
+	if global == nil {
+		return nil
+	}
+	ips := a.consoleClientIPs(r)
+	for _, ip := range ips {
+		m, ok := global.Match(net.ParseIP(ip))
+		if !ok {
+			continue
+		}
+		return &apiError{http.StatusConflict, "self_lockout", fmt.Sprintf(
+			"这条规则会把你关在门外，已拒绝保存：新的 global_ip_deny 命中 %s（来自规则 %s%s），"+
+				"而它同样作用于管理端口 —— 保存生效之后，你现在用的这个控制台就打不开了。\n\n"+
+				"如果确实要封这个网段：改配置文件后重启进程即可，那条路不受此检查限制。",
+			ip, m.Rule, noteSuffix(m.Note))}
+	}
+	return nil
+}
+
 func isLoopbackAddr(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -486,7 +575,10 @@ func bearerToken(r *http.Request) (string, bool) {
 //
 // ifMatch 非空时要求与当前 revision 一致，用来挡住两个页签互相覆盖（lost update）。
 // 返回写回后的 revision 与最终生效的配置。
-func (a *App) mutate(ifMatch string, fn func(cfg *Config) error) (rev string, out *Config, err error) {
+//
+// r 只用于自锁检查（guardSelfLockout）：判断这次改动会不会把发起者关在门外。
+// 传 nil 表示跳过该检查（测试里构造配置时用）。
+func (a *App) mutate(r *http.Request, ifMatch string, fn func(cfg *Config) error) (rev string, out *Config, err error) {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 
@@ -510,6 +602,17 @@ func (a *App) mutate(ifMatch string, fn func(cfg *Config) error) (rev string, ou
 
 	if err := cfg.validateWithDefaults(); err != nil {
 		return "", nil, badRequest("invalid_config", "%v", err)
+	}
+
+	// 落盘前的最后一道自检：这次改动会不会把发起者自己关在门外。
+	//
+	// 放在 mutate 里而不是各个处理器里，是为了让**所有**配置写入都必经此路 ——
+	// 将来新增一个写接口时不可能忘掉它。全局黑名单是唯一能让控制台彻底不可达
+	// 的配置，而控制台恰恰就是改配置的地方，这个组合必须有人兜住。
+	if r != nil {
+		if err := a.guardSelfLockout(r, cfg); err != nil {
+			return "", nil, err
+		}
 	}
 
 	_, newRev, err := saveConfig(a.cfgPath, cfg)
@@ -625,7 +728,7 @@ func (a *App) handleCreateRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var newID string
-	rev, out, err := a.mutate(ifMatchOf(r), func(cfg *Config) error {
+	rev, out, err := a.mutate(r, ifMatchOf(r), func(cfg *Config) error {
 		if rc.ID == "" {
 			rc.ID = nextRouteID(cfg)
 		}
@@ -659,7 +762,7 @@ func (a *App) handleReplaceRoute(w http.ResponseWriter, r *http.Request) {
 	// ID 以 URL 为准，body 里的 id 字段不作数
 	rc.ID = id
 
-	rev, out, err := a.mutate(ifMatchOf(r), func(cfg *Config) error {
+	rev, out, err := a.mutate(r, ifMatchOf(r), func(cfg *Config) error {
 		idx := indexRoute(cfg.Routes, id)
 		if idx < 0 {
 			return notFound(id)
@@ -687,7 +790,7 @@ func (a *App) handlePatchRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rev, out, err := a.mutate(ifMatchOf(r), func(cfg *Config) error {
+	rev, out, err := a.mutate(r, ifMatchOf(r), func(cfg *Config) error {
 		idx := indexRoute(cfg.Routes, id)
 		if idx < 0 {
 			return notFound(id)
@@ -708,7 +811,7 @@ func (a *App) handlePatchRoute(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleDeleteRoute(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rev, out, err := a.mutate(ifMatchOf(r), func(cfg *Config) error {
+	rev, out, err := a.mutate(r, ifMatchOf(r), func(cfg *Config) error {
 		idx := indexRoute(cfg.Routes, id)
 		if idx < 0 {
 			return notFound(id)
@@ -742,6 +845,103 @@ func (a *App) mutationResult(rev string, out *Config, id string) map[string]any 
 	return res
 }
 
+// ---------- 命中测试 ----------
+
+// handleACLTest 是「命中测试」：拿一个地址跑一遍三层名单，回答「它会被哪条
+// 规则拦下；如果拦不下，又是因为什么」。
+//
+// 为什么值得单独做一个接口：三层名单有明确的先后顺序，光盯着配置列表很难在
+// 脑子里模拟出结果 —— 尤其是「白名单里写了它，但全局黑名单也写了它」这种。
+// 一次误判就是线上事故（要么放进了不该放的，要么把办公网整个封掉）。
+// 让人在按保存之前先把待封的地址试一遍，比写十页文档管用。
+//
+// 只读接口：不改任何状态，也不依赖写权限。
+//
+// 不填 ip 即「测我自己」，见下面 self 的说明。
+func (a *App) handleACLTest(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IP      string `json:"ip"`
+		RouteID string `json:"route_id"`
+	}
+
+	// 同时支持 GET 查询串与 POST JSON：前者方便 curl 与脚本，
+	// 后者是控制台用的。两条路径解析到同一个结构，不许各写一套逻辑。
+	switch r.Method {
+	case http.MethodGet:
+		q := r.URL.Query()
+		in.IP, in.RouteID = q.Get("ip"), q.Get("route_id")
+	case http.MethodPost:
+		body, err := readBody(r)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := json.Unmarshal(body, &in); err != nil {
+			writeErr(w, badRequest("invalid_body", "%v", err))
+			return
+		}
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeErr(w, &apiError{http.StatusMethodNotAllowed, "method_not_allowed", "请用 GET 或 POST"})
+		return
+	}
+
+	ip := strings.TrimSpace(in.IP)
+	self := false
+	if ip == "" {
+		// 不填 = 「测我自己」。取 consoleClientIPs 的最后一个：经自己的代理
+		// 进来时它按「本机代理、真实来源」的顺序排列，后者才是使用者本人。
+		ips := a.consoleClientIPs(r)
+		if len(ips) == 0 {
+			writeErr(w, badRequest("ip_required", "无法确定你的来源 IP，请显式填写 ip"))
+			return
+		}
+		ip = ips[len(ips)-1]
+		self = true
+	}
+	if net.ParseIP(ip) == nil {
+		writeErr(w, badRequest("invalid_ip", "%q 不是合法的 IP 地址", ip))
+		return
+	}
+
+	// 名单读的是**磁盘上的配置**，不是内存里已生效的路由表。
+	// 命中测试要回答的是「保存之后会怎样」，所以必须和写路径看同一份源。
+	_, cfg, err := readConfigFile(a.cfgPath)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+
+	var routeACL *ACL
+	routeName := ""
+	if id := strings.TrimSpace(in.RouteID); id != "" {
+		i := indexRoute(cfg.Routes, id)
+		if i < 0 {
+			writeErr(w, notFound(id))
+			return
+		}
+		if routeACL, err = NewACL(cfg.Routes[i].ACL); err != nil {
+			writeErr(w, badRequest("invalid_config", "路由 %s 的名单配置有问题：%v", id, err))
+			return
+		}
+		routeName = cfg.Routes[i].Name
+	}
+
+	global, err := NewIPList(cfg.GlobalIPDeny)
+	if err != nil {
+		writeErr(w, badRequest("invalid_config", "global_ip_deny 配置有问题：%v", err))
+		return
+	}
+
+	dec := decideIP(global, routeACL, ip, true)
+	dec.RouteID = strings.TrimSpace(in.RouteID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"decision":   dec,
+		"self":       self,
+		"route_name": routeName,
+	})
+}
+
 // ---------- 全局配置 ----------
 
 // configView 是 GET /_goproxy/config 的返回体。
@@ -758,6 +958,10 @@ type configView struct {
 	AccessLog      bool     `json:"access_log"`
 	TrustedProxies []string `json:"trusted_proxies"`
 	RouteCount     int      `json:"route_count"`
+
+	// GlobalIPDeny 是全局黑名单的原始配置，供配置页展示与编辑。
+	// 它不含任何秘密（就是把配置文件里那一栏原样回显），所以直接给出去。
+	GlobalIPDeny []IPRule `json:"global_ip_deny"`
 
 	// AdminUsers 只给用户名，供界面展示「当前有哪些管理员」。
 	// 密码哈希绝不出现。
@@ -793,6 +997,7 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		RouteCount:            len(cfg.Routes),
 		AdminUsers:            names,
 		CredentialsConfigured: cfg.hasAdminCredentials(),
+		GlobalIPDeny:          cfg.GlobalIPDeny,
 	})
 }
 
@@ -801,6 +1006,9 @@ type configPatch struct {
 	AccessLog      *bool     `json:"access_log"`
 	TrustedProxies *[]string `json:"trusted_proxies"`
 	AdminToken     *string   `json:"admin_token"`
+	// GlobalIPDeny 用指针是为了区分「没提交这个字段」和「提交了一个空数组」：
+	// 前者保持原样，后者表示清空全局黑名单。
+	GlobalIPDeny *[]IPRule `json:"global_ip_deny"`
 }
 
 func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -834,7 +1042,7 @@ func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rev, _, err := a.mutate(ifMatchOf(r), func(cfg *Config) error {
+	rev, _, err := a.mutate(r, ifMatchOf(r), func(cfg *Config) error {
 		if p.DefaultPorts != nil {
 			cfg.DefaultPorts = *p.DefaultPorts
 		}
@@ -846,6 +1054,9 @@ func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.AdminToken != nil {
 			cfg.AdminToken = *p.AdminToken
+		}
+		if p.GlobalIPDeny != nil {
+			cfg.GlobalIPDeny = *p.GlobalIPDeny
 		}
 		return nil
 	})

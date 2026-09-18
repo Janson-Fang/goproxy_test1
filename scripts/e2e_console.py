@@ -9,6 +9,8 @@
   4. SSE 能收到 hello 握手和后续 access 事件
   5. 路由 CRUD 写接口 + ETag 乐观并发
   6. 全局配置读改、健康检查、Prometheus 指标
+  7. 认证与会话（用户名 + 密码登录、Cookie、CSRF 同源校验）
+  8. 三层 IP 名单（全局黑名单 / 路由白名单 / 路由黑名单）与命中测试接口
 
 用法（在仓库根目录或任意位置都行）：
 
@@ -600,6 +602,288 @@ def run_auth_section(tmp, bins):
             pass
 
 
+def run_acl_section(cfg_path):
+    """三层 IP 名单与命中测试的端到端验证。
+
+    v0.7.0 把原来「mode 二选一」的路由级 ACL 换成了三份可以并存的名单：
+    全局黑名单（对所有入口生效，含管理端口）→ 路由白名单 → 路由黑名单。
+    光看配置列表推不出结果，所以配套做了个只读的命中测试接口。
+
+    断言分两类，缺一不可：
+      · 判定类 —— 走 /_goproxy/acl/test，能精确到「被哪一层、哪条规则拦下」，
+        以及层级顺序（全局优先、白名单优先于黑名单）；
+      · 落地类 —— 把名单配到真实配置里再从真实端口打过去，确认 403 真的发生。
+    只做前者会漏掉「判定对了但请求管线没接上」；
+    只做后者则只能看到 403，看不出是哪一层拦的。
+    """
+    print("\n== 11. 三层 IP 名单与命中测试 ==")
+
+    # 命中测试要求填单个 IP（不是 CIDR）：它要回答「这个具体的来源会怎样」，
+    # 收 CIDR 反而会让人以为在配规则。
+    st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1", "route_id": "svc-acl"})
+    check("POST /_goproxy/acl/test -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+    dec = json.loads(b)["decision"]
+    check("命中路由黑名单 -> 拒绝", dec["allowed"] is False, str(dec))
+    check("  原因细分为 acl_route_deny", dec.get("reason") == "acl_route_deny", str(dec.get("reason")))
+    check("  层名是「黑名单」", dec.get("layer") == "黑名单", str(dec.get("layer")))
+    check("  带出命中的规则", dec.get("rule") == "127.0.0.1", str(dec.get("rule")))
+    check("  带出条目备注（回答「当初为什么封它」）",
+          bool(dec.get("note")), str(dec.get("note")))
+
+    steps = dec.get("steps") or []
+    check("  回放全部三层判定", len(steps) == 3, str(steps))
+    check("  顺序固定：全局黑名单 → 白名单 → 黑名单",
+          [s.get("layer") for s in steps] == ["全局黑名单", "白名单", "黑名单"],
+          str([s.get("layer") for s in steps]))
+    check("  全局黑名单未配置时不参与拦截",
+          steps and steps[0].get("configured") is False, str(steps[:1]))
+
+    # 没配任何名单的路由必须放行 —— 「没配」和「配了空白名单」是两件事，
+    # 后者是配置错误（validate 会拒），前者是完全不限制。
+    st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1", "route_id": "svc-a"})
+    dec = json.loads(b)["decision"]
+    check("没配名单的路由 -> 放行", dec["allowed"] is True, str(dec))
+
+    # 不指定路由：只判全局那一层。
+    st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1"})
+    dec = json.loads(b)["decision"]
+    check("不指定路由时只判全局层 -> 放行", dec["allowed"] is True, str(dec))
+    check("  路由级两层标注为未配置",
+          [s.get("configured") for s in dec.get("steps") or []] == [False, False, False],
+          str(dec.get("steps")))
+
+    # GET 查询串形式：给 curl 和运维脚本用，和 POST 必须解析到同一套逻辑。
+    st, h, b = get("/_goproxy/acl/test?ip=127.0.0.1&route_id=svc-acl")
+    check("GET 查询串形式同样可用",
+          st == 200 and json.loads(b)["decision"]["allowed"] is False, "实际 %s :: %s" % (st, b[:200]))
+
+    st, h, b = post("/_goproxy/acl/test", {"ip": "no-such-ip"})
+    check("非法 IP -> 400 invalid_ip", st == 400 and b"invalid_ip" in b, "实际 %s :: %s" % (st, b[:150]))
+
+    st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1", "route_id": "no-such-route"})
+    check("未知 route_id -> 404", st == 404, "实际 %s :: %s" % (st, b[:150]))
+
+    # ---- 自锁护栏 ----
+    # 全局黑名单同样作用于管理端口，所以「覆盖自己来源」的一次保存会把控制台关在门外。
+    # 后端必须在写路径上拦住它，而且**磁盘不能被动过** ——
+    # 否则用户以为没保存成功，实际已经写进去了，下一个请求就进不来。
+    st, h, b = post("/_goproxy/config", {"global_ip_deny": ["127.0.0.1"]}, method="PATCH")
+    check("全局黑名单覆盖自己来源 -> 409 拒绝保存", st == 409, "实际 %s :: %s" % (st, b[:220]))
+    check("  错误码是 self_lockout", b"self_lockout" in b, b[:220])
+    st, _h, b = get("/_goproxy/config")
+    check("  被拒后磁盘配置未被改动",
+          (json.loads(b).get("global_ip_deny") or []) == [],
+          str(json.loads(b).get("global_ip_deny")))
+
+    # ---- 正常写入：两种条目形态都要能存能读 ----
+    st, h, b = post(
+        "/_goproxy/config",
+        {
+            "global_ip_deny": [
+                {"cidr": "203.0.113.66", "note": "e2e 全局封禁"},
+                "203.0.113.99",
+                {"cidr": "198.51.100.0/24", "note": "e2e 封整段"},
+            ]
+        },
+        method="PATCH",
+    )
+    check("写入全局黑名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+
+    st, _h, b = get("/_goproxy/config")
+    gd = json.loads(b).get("global_ip_deny")
+    check("回显三条", isinstance(gd, list) and len(gd) == 3, str(gd))
+    check("  带备注的条目回写成对象", isinstance(gd[0], dict) and gd[0].get("note") == "e2e 全局封禁", str(gd[:1]))
+    # 这条是刻意的取舍：没有备注就走字符串简写，否则一次控制台保存会把
+    # config.json 里每条规则都撑成 {"cidr": …}，配置文件不再是给人读的。
+    check("  没备注的条目回写成字符串简写", gd[1] == "203.0.113.99", str(gd[1:2]))
+
+    # 给 svc-a 配一条白名单，让 203.0.113.66 同时出现在「白名单内」和「全局黑名单里」。
+    st, h, b = get("/_goproxy/routes")
+    etag = hdr(h, "ETag")
+    st, h, b = post(
+        "/_goproxy/routes/svc-a",
+        {"acl": {"allow": [{"cidr": "203.0.113.66", "note": "e2e 白名单"}]}},
+        method="PATCH",
+        headers={"If-Match": etag},
+    )
+    check("给路由配白名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+
+    st, h, b = post("/_goproxy/acl/test", {"ip": "203.0.113.66", "route_id": "svc-a"})
+    dec = json.loads(b)["decision"]
+    check("全局黑名单命中 -> 拒绝（先于白名单）", dec["allowed"] is False, str(dec))
+    check("  原因是 acl_global_deny，不是白名单没命中",
+          dec.get("reason") == "acl_global_deny", str(dec.get("reason")))
+    check("  层名是「全局黑名单」", dec.get("layer") == "全局黑名单", str(dec.get("layer")))
+
+    # 反证：把同一个地址从全局黑名单里摘掉，它在同一条路由上就放行了。
+    # 没有这一步，上一条可能只是「白名单没生效」造成的假象。
+    st, h, b = post(
+        "/_goproxy/config",
+        {"global_ip_deny": ["203.0.113.99", {"cidr": "198.51.100.0/24", "note": "e2e 封整段"}]},
+        method="PATCH",
+    )
+    check("从全局黑名单移除该地址 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+    st, h, b = post("/_goproxy/acl/test", {"ip": "203.0.113.66", "route_id": "svc-a"})
+    check("不在全局黑名单、但在白名单内 -> 放行",
+          json.loads(b)["decision"]["allowed"] is True, b[:200])
+
+    # 白名单一旦配置，名单外的地址就该被拒 —— 这是「收紧范围」而不是「额外放行」。
+    st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1", "route_id": "svc-a"})
+    dec = json.loads(b)["decision"]
+    check("白名单里的地址之外 -> 拒绝", dec["allowed"] is False, str(dec))
+    check("  原因是 acl_route_allow_miss", dec.get("reason") == "acl_route_allow_miss", str(dec.get("reason")))
+    check("  层名是「白名单」", dec.get("layer") == "白名单", str(dec.get("layer")))
+
+    # 两份名单并存：allow=10.0.0.0/8 里单独剔掉 10.0.0.5。
+    # 这正是旧版 mode 二选一表达不出来的配置。
+    st, h, b = get("/_goproxy/routes")
+    etag = hdr(h, "ETag")
+    st, h, b = post(
+        "/_goproxy/routes/svc-a",
+        {"acl": {"allow": ["10.0.0.0/8"], "deny": [{"cidr": "10.0.0.5", "note": "e2e 内部例外"}]}},
+        method="PATCH",
+        headers={"If-Match": etag},
+    )
+    check("白名单 + 黑名单并存 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+
+    st, h, b = post("/_goproxy/acl/test", {"ip": "10.0.0.5", "route_id": "svc-a"})
+    dec = json.loads(b)["decision"]
+    check("白名单内的地址仍可被黑名单剔掉",
+          dec["allowed"] is False and dec.get("reason") == "acl_route_deny", str(dec))
+    check("  备注来自黑名单那条", dec.get("note") == "e2e 内部例外", str(dec.get("note")))
+
+    st, h, b = post("/_goproxy/acl/test", {"ip": "10.0.0.9", "route_id": "svc-a"})
+    check("白名单内且未被黑名单命中 -> 放行",
+          json.loads(b)["decision"]["allowed"] is True, b[:200])
+
+    # ---- 落地验证：判定对了，真实请求也要真的被拦 ----
+    #
+    # 注意这里不能「PATCH 完立刻请求、一次定胜负」：写配置到新名单生效之间
+    # 隔着一次 mtime 轮询，中间那一小段请求打的还是旧路由表（200），
+    # 看起来就像断言写错了。所以统一用轮询等它生效。
+    def wait_port_status(url, want, timeout=8, marker=None):
+        """等某个地址真的返回 want；给了 marker 还要响应体里出现它。
+
+        两个都必须等，理由不同：
+          · 写配置到新名单生效之间隔着一次 1 秒的 mtime 轮询，中间那段请求
+            打的还是旧路由表 —— 一次定胜负会拿到旧结果，看着像断言写错了。
+          · 只看状态码会「假通过」：8081 本来就可能因为别的原因返回 403，
+            于是断言在名单还没生效时就绿了。marker 把「因为正确的原因 403」
+            也一起钉住。
+        """
+        end = time.time() + timeout
+        last, body = None, b""
+        while time.time() < end:
+            try:
+                with opener.open(url, timeout=3) as r:
+                    body = r.read()
+                    last = r.status
+            except urllib.error.HTTPError as e:
+                last, body = e.code, e.read()
+            except Exception:
+                last = None
+            if last == want and (marker is None or marker in body):
+                return last, body
+            time.sleep(0.3)
+        return last, body
+
+    # (a) 8081 上刚配的是一份「只允许 10.0.0.0/8」的白名单，请求来自 127.0.0.1。
+    st, body = wait_port_status("http://127.0.0.1:8081/whitelist-miss", 403,
+                                marker=b"acl_route_allow_miss")
+    check("业务端口白名单未命中 -> 403", st == 403, "实际 %s" % st)
+    check("  响应体带 reason=acl_route_allow_miss", b"acl_route_allow_miss" in body, body[:150])
+
+    # (b) 8088 挂的是 svc-acl（deny 127.0.0.1），同一个来源应当 403。
+    st, body = wait_port_status("http://127.0.0.1:8088/real-deny", 403,
+                                marker=b"acl_route_deny")
+    check("业务端口命中黑名单 -> 403", st == 403, "实际 %s" % st)
+    check("  响应体带 reason=acl_route_deny", b"acl_route_deny" in body, body[:150])
+
+    # (c) 对照组：8000 只命中兜底路由，那条路由没配任何名单，必须照常 200。
+    #     少了这一条，上面的 403 有可能只是「端口整个不通」造成的。
+    st, body = wait_port_status("http://127.0.0.1:8000/no-acl-here", 200)
+    check("没配名单的端口照常 200（不是全盘拒绝）", st == 200, "实际 %s" % st)
+
+    time.sleep(1.2)
+    st, h, b = get("/_goproxy/logs?limit=200")
+    reasons = {e["blocked"] for e in (json.loads(b).get("entries") or []) if e.get("blocked")}
+    check("访问日志里出现 acl_route_deny", "acl_route_deny" in reasons, str(sorted(reasons)))
+
+    # ---- 全局黑名单真的作用于所有入口（含管理端口）----
+    #
+    # 这件事**没法通过 PATCH 验证** —— 上面刚确认过自锁护栏会拦下它。
+    # 唯一的途径是改配置文件（护栏刻意留的退路），靠热重载生效。
+    # 所以这里直接写盘：这是唯一能观察到「业务端口 403 + 管理端口 403」的办法。
+    original = open(cfg_path, encoding="utf-8").read()
+    before_gd = json.loads(original).get("global_ip_deny") or []
+    try:
+        live = json.loads(original)
+        live["global_ip_deny"] = ["127.0.0.1/32"]
+        tmpf = cfg_path + ".e2e-tmp"
+        with open(tmpf, "w", encoding="utf-8") as f:
+            json.dump(live, f, ensure_ascii=False, indent=2)
+        os.replace(tmpf, cfg_path)
+
+        # 等**管理端口**自己被封。它同时是两个信号：
+        #   · 热重载真的把这版文件吃进去了（写盘 → 生效隔着一次 1s 的 mtime 轮询）
+        #   · 全局黑名单确实作用于管理端口，而不只是业务端口
+        # 必须给足时间。第一版写成「写完立刻查一次」，窗口只有零点几秒，
+        # 永远看不到生效 —— 现象是「功能没做」，实际是测试没等。
+        admin_body, st = None, None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            st, _h, b = get("/_goproxy/config")
+            if st == 403:
+                admin_body = b
+                break
+            time.sleep(0.3)
+        check("全局黑名单经热重载生效：管理端口 403", admin_body is not None,
+              "等了 15s 管理端口仍是 %s" % st)
+        if admin_body is not None:
+            check("  管理端口的 403 带 acl_global_deny",
+                  b"acl_global_deny" in admin_body, admin_body[:150])
+
+        # 业务端口同一份名单同样生效。故意打 8081：它此刻配着
+        # 「只允许 10.0.0.0/8」的白名单，而返回的原因必须是 acl_global_deny ——
+        # 这一条顺带证明了「全局黑名单排在路由匹配之前」，连路由级名单都不看一眼。
+        st, body = wait_port_status("http://127.0.0.1:8081/global-deny", 403,
+                                    marker=b"acl_global_deny", timeout=10)
+        check("业务端口同样 403，且原因来自全局层",
+              b"acl_global_deny" in body, body[:180])
+    finally:
+        # 务必恢复：不恢复的话后面（以及人工接手时的）任何请求都进不来。
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(original)
+
+    # 恢复同样要等热重载生效 —— 管理端口回到 200 才算真的恢复。
+    st, b = None, b""
+    end = time.time() + 15
+    while time.time() < end:
+        st, _h, b = get("/_goproxy/config")
+        if st == 200:
+            break
+        time.sleep(0.4)
+    check("清掉全局黑名单后管理端口恢复（热重载）", st == 200, "等了 15s 仍是 %s" % st)
+    gd = (json.loads(b).get("global_ip_deny") or []) if st == 200 else None
+    check("  恢复后的名单回到写盘前那一份（没被临时规则污染）",
+          gd == before_gd, "%s != %s" % (gd, before_gd))
+
+    # 清干净：把全局黑名单显式清空，验证「传空数组 = 清空」这条语义。
+    st, h, b = post("/_goproxy/config", {"global_ip_deny": []}, method="PATCH")
+    check("清空全局黑名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+    st, _h, b = get("/_goproxy/config")
+    check("  global_ip_deny 已清空",
+          (json.loads(b).get("global_ip_deny") or []) == [],
+          str(json.loads(b).get("global_ip_deny")))
+
+    # 收尾：把 svc-a 的名单清掉，别把临时配置改得和原样差太远。
+    st, h, b = get("/_goproxy/routes")
+    etag = hdr(h, "ETag")
+    st, h, b = post("/_goproxy/routes/svc-a", {"acl": None}, method="PATCH",
+                    headers={"If-Match": etag})
+    check("清掉临时路由的名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+
+
 def main():
     if shutil.which("go") is None:
         print("PATH 里找不到 go，无法编译测试二进制")
@@ -623,6 +907,10 @@ def main():
         # 所以复制一份到临时目录里跑，别把仓库里的演示配置改脏。
         cfg = os.path.join(tmp, "config.json")
         shutil.copyfile(os.path.join(ROOT, "config.json"), cfg)
+        # 第 8 节会把 cfg 重新绑定成「解析出来的配置 dict」，而第 11 节需要的是路径
+        # （它要直接写盘来验证全局黑名单对管理端口生效，那条路没法走 PATCH）。
+        # 在这里先留一份，别指望几十行之后还分得清 cfg 是哪一层的。
+        cfg_path = cfg
 
         # 管理地址以临时配置为准，别写死 9080。
         global ADMIN, AUTH_HEADERS
@@ -808,7 +1096,10 @@ def main():
         reasons = {e["blocked"] for e in ents if e.get("blocked")}
         print("    拦截原因：%s" % reasons)
         check("出现 rate_limited", "rate_limited" in reasons, str(reasons))
-        check("出现 acl", "acl" in reasons, str(reasons))
+        # v0.7.0 把笼统的 acl 拆成了三个标签，路由级黑名单现在是 acl_route_deny。
+        # 断言用精确值而不是 "acl" —— 后者在拆分之后永远不成立，
+        # 而且就算成立也说明不了是哪一层拦的。
+        check("出现 acl_route_deny", "acl_route_deny" in reasons, str(reasons))
         check("出现 auth_missing_credentials", "auth_missing_credentials" in reasons, str(reasons))
         check("seq 单调递增", all(ents[i]["seq"] < ents[i + 1]["seq"] for i in range(len(ents) - 1)))
 
@@ -972,6 +1263,10 @@ def main():
 
         print("\n== 10. 认证与会话 ==")
         run_auth_section(tmp, bins)
+
+        # 放在最后：这一节会（刻意地）把管理端口也一起封掉，再恢复回来。
+        # 后面若还有用例，就会撞在「刚被自己封掉的管理接口」上。
+        run_acl_section(cfg_path)
 
     finally:
         for p in procs:

@@ -17,6 +17,7 @@
  */
 
 import type {
+  ACLDecision,
   CertsResponse,
   ConfigPatch,
   ConfigView,
@@ -310,6 +311,31 @@ export async function patchConfig(patch: ConfigPatch, ifMatch: string | null): P
     ifMatch,
   })
   return data.revision
+}
+
+// ---------- IP 名单命中测试 ----------
+
+export interface ACLTestResult {
+  decision: ACLDecision
+  /** true 表示这次测的是「我自己」（调用方没指定 IP） */
+  self: boolean
+  route_name: string
+}
+
+/**
+ * 拿一个地址跑一遍三层名单，看它会不会被拦、被哪一层拦。
+ *
+ * **不传 ip 就是「测我自己」**：服务端用本次请求的来源地址来判。
+ * 这一问在改名单时最常用 —— 「我加完这条还能不能进得来」，
+ * 后端在保存路径上也做了同一件事（自锁检查），这里只是让人能提前看到。
+ *
+ * 只读接口，不改任何状态，也不依赖写权限。
+ */
+export async function testACL(ip: string, routeId?: string): Promise<ACLTestResult> {
+  const { data } = await raw<ACLTestResult>('POST', '/_goproxy/acl/test', {
+    body: { ip, route_id: routeId || '' },
+  })
+  return data
 }
 
 // ---------- 状态与日志 ----------

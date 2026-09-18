@@ -119,14 +119,16 @@ export function Field({
 
 export function Note({
   kind = 'info',
+  span,
   children,
 }: {
   kind?: 'info' | 'warn' | 'err' | 'ok'
+  span?: boolean
   children: ReactNode
 }) {
   const mark: Record<string, string> = { info: 'i', warn: '!', err: '✕', ok: '✓' }
   return (
-    <div className={`note ${kind}`}>
+    <div className={`note ${kind}`} style={span ? { gridColumn: '1 / -1' } : undefined}>
       <span className="ico">{mark[kind]}</span>
       <div style={{ flex: 1 }}>{children}</div>
     </div>

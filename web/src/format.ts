@@ -1,5 +1,7 @@
 /** 格式化小工具。集中放一起，免得每个页面各写一套，数字风格不统一。 */
 
+import type { IPRule, RawIPRule } from './types'
+
 const nf = new Intl.NumberFormat('zh-CN')
 
 /** 整数千分位。 */
@@ -88,11 +90,45 @@ export function statusClass(status: number): 'ok' | 'redirect' | 'client' | 'ser
   return 'none'
 }
 
-/** 拦截原因 → 中文说明。后端返回的是 acl / rate_limited / circuit_open / auth_xxx。 */
+/**
+ * 粗校验：看起来是不是「IP」或「IP/前缀长度」。
+ *
+ * 刻意只做形状检查 —— 真正的判定（能不能解析、前缀长度对不对称）交给后端，
+ * 因为那里才是唯一权威。这里的作用是在表单上早一步拦住手滑（少写一段、
+ * 多打一个字符），而不是替代后端校验。
+ */
+export function looksLikeCIDR(s: string): boolean {
+  const m = /^([0-9a-fA-F:.]+)(?:\/(\d{1,3}))?$/.exec(s.trim())
+  if (!m) return false
+  const host = m[1]
+  if (m[2] !== undefined) {
+    const bits = Number(m[2])
+    if (bits < 0 || bits > 128) return false
+  }
+  if (host.includes(':')) {
+    // IPv6：只确认字符集与至少两个冒号段，逐段值域交给后端
+    return host.split(':').length >= 3
+  }
+  const parts = host.split('.')
+  return parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)
+}
+
+/**
+ * 拦截原因 → 中文说明。
+ *
+ * 后端把「IP 名单」这一层拆成了三个独立的标签（v0.7.0）。拆开是有必要的：
+ * 以前只有一个笼统的 acl，看到它只能知道「被名单拦了」，但不知道是哪一层 ——
+ * 而「全局封禁」和「白名单没配全」的处理方式完全不同，前者要去全局名单里
+ * 解除，后者是补一条白名单。见 acl.go 的 decideIP。
+ */
 export function blockedLabel(reason: string): string {
   if (!reason) return ''
   const map: Record<string, string> = {
-    acl: 'IP 不在白名单 / 命中黑名单',
+    acl_global_deny: '命中全局黑名单（对所有入口生效，白名单不可豁免）',
+    acl_route_allow_miss: '不在该路由的白名单内',
+    acl_route_deny: '命中该路由的黑名单',
+    // v0.6.x 的老标签。老版本的日志还在环形缓冲里，不认它就显示成裸字符串。
+    acl: '被 IP 名单拦下（旧版标签）',
     rate_limited: '触发限流',
     circuit_open: '熔断打开，快速失败',
     auth_missing_credentials: '缺少 Basic 凭据',
@@ -107,12 +143,102 @@ export function blockedLabel(reason: string): string {
   return map[reason] ?? reason
 }
 
-/** 把多行文本按逗号/换行/空格切成去重后的列表。CIDR 列表、端口列表都用它。 */
+/**
+ * 把多行文本按逗号/换行/空格切成去重后的列表。CIDR 列表、端口列表都用它。
+ *
+ * 注意：IP 名单**不用**它。名单条目带备注，而备注里可以合法地出现逗号，
+ * 用这个切会把备注切碎。名单走 parseIPRules / ipRulesToText。
+ */
 export function splitList(raw: string): string[] {
   return raw
     .split(/[\s,，;；]+/)
     .map((s) => s.trim())
     .filter(Boolean)
+}
+
+/* ---------- IP 名单的文本形态 ---------- */
+
+/**
+ * 名单在界面上的文本约定（和 /etc/hosts 一个思路，运维不用学新东西）：
+ *
+ *     # 以 # 开头的整行是注释
+ *     203.0.113.0/24 已知扫描源
+ *     198.51.100.7
+ *     10.0.0.0/8,10.1.0.0/16        ← 同一行逗号分隔，等价于两行
+ *
+ * 规则：第一个空白分隔的 token 是 CIDR，剩下的整段是备注。
+ * 如果这个 token 里带逗号，就按逗号拆成多条（此时不给备注）——
+ * 这样从旧版本粘一串逗号分隔的 CIDR 过来不会报错。
+ */
+export function parseIPRules(raw: string): IPRule[] {
+  const out: IPRule[] = []
+  const seen = new Set<string>()
+  for (const line of raw.split('\n')) {
+    const t = line.trim()
+    if (!t || t.startsWith('#')) continue
+
+    const sp = t.search(/\s/)
+    const head = sp < 0 ? t : t.slice(0, sp)
+    const tail = sp < 0 ? '' : t.slice(sp).trim()
+
+    // 逗号分隔的简写（不带备注）
+    if (head.includes(',') || head.includes('，')) {
+      for (const piece of head.split(/[,，]/)) {
+        const c = piece.trim()
+        if (c && !seen.has(c)) {
+          seen.add(c)
+          out.push({ cidr: c })
+        }
+      }
+      continue
+    }
+    if (head && !seen.has(head)) {
+      seen.add(head)
+      out.push(tail ? { cidr: head, note: tail } : { cidr: head })
+    }
+  }
+  return out
+}
+
+/** parseIPRules 的反向：条目 → 文本。没备注的只写 CIDR。 */
+export function ipRulesToText(rules: IPRule[] | null | undefined): string {
+  return (rules ?? [])
+    .filter((r) => r && r.cidr)
+    .map((r) => (r.note ? `${r.cidr} ${r.note}` : r.cidr))
+    .join('\n')
+}
+
+/**
+ * 后端回传的混合形态（字符串或对象）→ 统一的 IPRule。
+ *
+ * 后端刻意让「没备注的条目」序列化成字符串简写，否则一次保存就会把配置文件
+ * 撑满 {"cidr": ...}。所以前端读到的必然是两种混着的，这里统一收口，
+ * 免得每个调用点各写一遍兼容逻辑。
+ */
+export function normalizeIPRules(raw: RawIPRule[] | null | undefined): IPRule[] {
+  const out: IPRule[] = []
+  for (const item of raw ?? []) {
+    if (typeof item === 'string') {
+      const c = item.trim()
+      if (c) out.push({ cidr: c })
+      continue
+    }
+    const c = (item?.cidr ?? '').trim()
+    if (!c) continue
+    const note = (item?.note ?? '').trim()
+    out.push(note ? { cidr: c, note } : { cidr: c })
+  }
+  return out
+}
+
+/**
+ * 提交给后端的形态：没备注的还原成字符串。
+ *
+ * 和后端的 MarshalJSON 保持同一个取舍 —— 配置文件是人要读的，
+ * 别让一次界面保存把它变得啰嗦。
+ */
+export function ipRulesToPayload(rules: IPRule[]): (string | IPRule)[] {
+  return rules.map((r) => (r.note ? { cidr: r.cidr, note: r.note } : r.cidr))
 }
 
 /** 解析端口列表（逗号/空格分隔）。返回 null 表示有非法项。 */

@@ -72,6 +72,14 @@ type RouteTable struct {
 	// 单独放就得加锁（或原子指针），而放进快照后天然随表一起原子换掉。
 	// 之前就是放在 App 上无锁读取的 —— 真跑起来 reload 与请求并发时是 data race，
 	// 只是单测没覆盖到并发才一直没炸。
+	// 全局黑名单：对所有入口生效，含管理端口。
+	//
+	// 和 trusted 一样必须挂在快照里 —— 请求路径读、reload 写，
+	// 放进快照才能跟着原子替换一起换掉，不必额外加锁。
+	// （trusted 当初放在 App 上无锁读取，真跑起来是 data race，
+	// 单测因为没覆盖并发才一直没炸。这里不重蹈覆辙。）
+	globalDeny *IPList
+
 	trusted []*net.IPNet
 }
 
@@ -176,6 +184,14 @@ func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable
 	t := &RouteTable{byPort: make(map[int]*portIndex)}
 	var routes []*Route
 
+	// 全局黑名单先建。放最前面是为了让「全局配置写错了」在同一次构建里
+	// 立刻暴露，而不是等某个路由恰好走到它才发现。
+	globalDeny, err := NewIPList(cfg.GlobalIPDeny)
+	if err != nil {
+		return nil, fmt.Errorf("global_ip_deny: %w", err)
+	}
+	t.globalDeny = globalDeny
+
 	for _, rc := range cfg.Routes {
 		if !rc.enabled() {
 			continue
@@ -230,13 +246,11 @@ func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable
 			r.cbFP = fp
 		}
 
-		if rc.ACL != nil && !isNoneMode(rc.ACL.Mode) {
-			acl, err := NewACL(rc.ACL.Mode, rc.ACL.CIDRs)
-			if err != nil {
-				return nil, fmt.Errorf("路由 %s: %w", r.ID, err)
-			}
-			r.acl = acl
+		acl, err := NewACL(rc.ACL)
+		if err != nil {
+			return nil, fmt.Errorf("路由 %s: %w", r.ID, err)
 		}
+		r.acl = acl
 
 		if rc.Auth != nil && !isNoneMode(rc.Auth.Mode) {
 			fp := fingerprint(rc.Auth)

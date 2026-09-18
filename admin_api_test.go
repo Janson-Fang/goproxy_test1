@@ -706,7 +706,7 @@ func TestMutationPreservesOmittedTopLevelFields(t *testing.T) {
 		t.Fatalf("内存里管理地址应为默认值，实际 %q", got)
 	}
 
-	if _, _, err := a.mutate("", func(cfg *Config) error {
+	if _, _, err := a.mutate(nil, "", func(cfg *Config) error {
 		cfg.Routes = append(cfg.Routes, RouteConfig{
 			ID: "added", PathPrefix: "/x", Target: "http://127.0.0.1:9000",
 		})
@@ -742,5 +742,272 @@ func TestAdminAddrOffSentinel(t *testing.T) {
 	c.applyTopDefaults()
 	if c.adminEnabled() {
 		t.Fatalf("admin_addr=off 应彻底关闭管理端口，实际 %q", c.AdminAddr)
+	}
+}
+
+// ---------- 全局黑名单：自锁护栏 / 管理端口 / 命中测试 ----------
+
+// patchGlobalDeny 用当前 revision 提交一份全局黑名单，返回响应。
+func patchGlobalDeny(t *testing.T, e *testEnv, body string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	rr := e.do(t, "GET", "/_goproxy/config", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("读配置失败: %d %s", rr.Code, rr.Body.String())
+	}
+	rev := strings.Trim(rr.Header().Get("ETag"), `"`)
+	return e.do(t, "PATCH", "/_goproxy/config", body, append([]func(*http.Request){
+		header("If-Match", `"`+rev+`"`),
+	}, opts...)...)
+}
+
+// TestSelfLockoutGuard 守住「别在控制台里把自己关在门外」这道护栏。
+//
+// 管理端口也在全局黑名单的管辖范围内（这是明确的设计选择），所以在控制台上
+// 加一条覆盖自己来源的规则，保存生效后这个控制台就再也打不开了 ——
+// 只能登机器改文件重启。写路径必须在落盘之前把它拦下来。
+//
+// 同时要守住边界：护栏只拦「会锁死自己」的那一条，封别人的地址必须照常能存。
+func TestSelfLockoutGuard(t *testing.T) {
+	e := newTestEnv(t, testToken, "")
+
+	// 用例里客户端来源固定是 127.0.0.1（见 testEnv.do），所以封回环 = 锁死自己
+	rr := patchGlobalDeny(t, e, `{"global_ip_deny": ["127.0.0.0/8"]}`)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("会锁死自己的规则应当被拒绝（409），实际 %d :: %s", rr.Code, rr.Body.String())
+	}
+	var bad map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &bad); err != nil {
+		t.Fatal(err)
+	}
+	if bad["error"] != "self_lockout" {
+		t.Errorf("错误码应当是 self_lockout，实际 %q", bad["error"])
+	}
+	// 提示里必须给出退路，否则用户只会觉得「工具不让我干活」
+	if !strings.Contains(bad["message"], "配置文件") {
+		t.Errorf("提示里应当给出「改配置文件后重启」的退路，实际：%s", bad["message"])
+	}
+
+	// 关键：护栏必须在落盘之前生效。落盘了再报错等于已经写坏了。
+	raw, _ := os.ReadFile(e.path)
+	if strings.Contains(string(raw), "127.0.0.0/8") {
+		t.Error("被拒绝的配置不应落盘")
+	}
+
+	// 封一个跟客户端无关的地址是合法操作，不能被护栏误伤
+	rr = patchGlobalDeny(t, e, `{"global_ip_deny": ["203.0.113.0/24"]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("封别人的地址应当能保存，实际 %d :: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestGlobalDenyAppliesToAdminPort 验证「全局黑名单也作用于管理端口」。
+//
+// 这是用户明确选定的行为：管理端口不是法外之地。
+func TestGlobalDenyAppliesToAdminPort(t *testing.T) {
+	e := newTestEnv(t, testToken, "")
+	if rr := patchGlobalDeny(t, e, `{"global_ip_deny": ["203.0.113.0/24"]}`); rr.Code != http.StatusOK {
+		t.Fatalf("配置全局黑名单失败: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// 被封的地址：连管理接口都进不去，连凭据都不必看
+	rr := e.do(t, "GET", "/_goproxy/config", "", remote("203.0.113.9:40000"))
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("全局黑名单必须作用于管理端口，期望 403，实际 %d :: %s", rr.Code, rr.Body.String())
+	}
+	// 响应体不该回显命中的具体规则：那等于告诉扫描器「你踩到哪条线了」
+	if strings.Contains(rr.Body.String(), "203.0.113.0/24") {
+		t.Errorf("403 响应不应泄露命中的规则，实际：%s", rr.Body.String())
+	}
+
+	// 未被封的地址照常访问
+	if rr := e.do(t, "GET", "/_goproxy/config", "", remote("198.51.100.9:40000")); rr.Code != http.StatusOK {
+		t.Fatalf("未被封的地址应当正常访问，实际 %d :: %s", rr.Code, rr.Body.String())
+	}
+
+	// 静态控制台页面同样在管辖范围内 —— 「作用于管理端口」不能只管接口
+	if rr := e.do(t, "GET", "/_goproxy/ui/", "", remote("203.0.113.9:40000")); rr.Code != http.StatusForbidden {
+		t.Errorf("控制台静态资源也应被全局黑名单拦住，实际 %d", rr.Code)
+	}
+}
+
+// TestGlobalDenyBeatsAllRoutes 验证全局黑名单在**业务端口**上的位置：
+// 它排在路由匹配之前，所以连匹配不到路由的请求也会被拦。
+//
+// 这正是「全局」二字的关键：扫描器挨个端口扫过来时压根不会命中任何路由，
+// 如果排查放在路由匹配之后，这类流量永远碰不到这份名单 ——
+// 而那恰恰是最需要拦下的。
+func TestGlobalDenyBeatsAllRoutes(t *testing.T) {
+	e := newTestEnv(t, testToken, "")
+	if rr := patchGlobalDeny(t, e, `{"global_ip_deny": ["203.0.113.0/24"]}`); rr != nil && rr.Code != 200 {
+		t.Fatalf("配置全局黑名单失败: %d %s", rr.Code, rr.Body.String())
+	}
+
+	tbl := e.app.table.Load()
+	if tbl == nil {
+		t.Fatal("路由表未就绪")
+	}
+	if tbl.globalDeny == nil {
+		t.Fatal("全局黑名单没有进入路由表快照")
+	}
+	// 用业务端口的 handler 打一个**匹配不到路由**的端口/路径组合
+	req := httptest.NewRequest("GET", "/whatever", nil)
+	req.RemoteAddr = "203.0.113.9:40000"
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPort{}, 65535))
+	rr := httptest.NewRecorder()
+	e.app.handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("未匹配路由的请求也应被全局黑名单拦下，期望 403，实际 %d :: %s",
+			rr.Code, rr.Body.String())
+	}
+	// 确认拦它的是全局黑名单而不是 404 分支
+	if !strings.Contains(rr.Body.String(), reasonACLGlobalDeny) {
+		t.Errorf("拦截原因应当是 %s，实际：%s", reasonACLGlobalDeny, rr.Body.String())
+	}
+}
+
+// TestACLTestEndpoint 覆盖命中测试接口：GET / POST 两种形式、三层判定结果、
+// 以及「不填 ip 就测我自己」。
+func TestACLTestEndpoint(t *testing.T) {
+	e := newTestEnv(t, testToken,
+		`{"id":"guarded","listen_port":0,"path_prefix":"/g","target":"http://127.0.0.1:1",
+		  "acl":{"allow":["10.0.0.0/8","203.0.113.66"],"deny":["10.0.0.66"]}}`)
+
+	// 先配一条全局黑名单（封的地址与客户端无关，不会被自锁护栏挡下）
+	rr := patchGlobalDeny(t, e,
+		`{"global_ip_deny":[{"cidr":"203.0.113.0/24","note":"已知扫描源"}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("配置全局黑名单失败: %d %s", rr.Code, rr.Body.String())
+	}
+
+	cases := []struct {
+		ip      string
+		allowed bool
+		layer   string
+		rule    string
+		note    string
+	}{
+		{"10.1.2.3", true, "", "", ""},
+		{"10.0.0.66", false, layerDeny, "10.0.0.66", ""},
+		{"203.0.113.66", false, layerGlobalDeny, "203.0.113.0/24", "已知扫描源"},
+		{"192.168.1.9", false, layerAllow, "", ""},
+	}
+	for _, c := range cases {
+		rr := e.do(t, "GET", "/_goproxy/acl/test?ip="+c.ip+"&route_id=guarded", "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("ip=%s 命中测试失败: %d %s", c.ip, rr.Code, rr.Body.String())
+		}
+		var got struct {
+			Decision ACLDecision `json:"decision"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		d := got.Decision
+		if d.Allowed != c.allowed || d.Layer != c.layer || d.Rule != c.rule {
+			t.Errorf("ip=%s：期望 allowed=%v layer=%q rule=%q，实际 allowed=%v layer=%q rule=%q",
+				c.ip, c.allowed, c.layer, c.rule, d.Allowed, d.Layer, d.Rule)
+		}
+		if c.note != "" && d.Note != c.note {
+			t.Errorf("ip=%s：备注应当回显以便排查，期望 %q，实际 %q", c.ip, c.note, d.Note)
+		}
+		if d.RouteID != "guarded" {
+			t.Errorf("ip=%s：应当回显套用的路由，实际 %q", c.ip, d.RouteID)
+		}
+		// 命中测试的价值在于「说清楚为什么」，所以必须带判定过程
+		if len(d.Steps) == 0 {
+			t.Errorf("ip=%s：命中测试应当带上判定过程", c.ip)
+		}
+		if d.Message == "" {
+			t.Errorf("ip=%s：应当给出给人看的一句话", c.ip)
+		}
+	}
+
+	// 不填 ip = 测我自己。客户端是 127.0.0.1，三层名单都不拦它。
+	rr = e.do(t, "GET", "/_goproxy/acl/test?route_id=guarded", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("测自己失败: %d %s", rr.Code, rr.Body.String())
+	}
+	var self struct {
+		Self     bool        `json:"self"`
+		Decision ACLDecision `json:"decision"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &self); err != nil {
+		t.Fatal(err)
+	}
+	if !self.Self {
+		t.Error("不填 ip 时应当标记 self=true，界面据此提示「这是你自己」")
+	}
+	if self.Decision.IP != "127.0.0.1" {
+		t.Errorf("测自己应当用请求来源 IP，实际 %q", self.Decision.IP)
+	}
+
+	// POST 与 GET 必须等价 —— 两条路径解析到同一个结构，不许各写一套逻辑
+	rr = e.do(t, "POST", "/_goproxy/acl/test", `{"ip":"10.0.0.66","route_id":"guarded"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST 形式失败: %d %s", rr.Code, rr.Body.String())
+	}
+	var viaPost struct {
+		Decision ACLDecision `json:"decision"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &viaPost); err != nil {
+		t.Fatal(err)
+	}
+	if viaPost.Decision.Reason != reasonACLRouteDeny ||
+		viaPost.Decision.Layer != layerDeny {
+		t.Errorf("POST 结果应与 GET 一致，实际 %+v", viaPost.Decision)
+	}
+
+	// 不存在的路由要明确 404，不能悄悄按「只测全局」给出一个看似正确的结果
+	if rr := e.do(t, "GET", "/_goproxy/acl/test?ip=10.0.0.1&route_id=nope", ""); rr.Code != http.StatusNotFound {
+		t.Errorf("不存在的路由应当 404，实际 %d", rr.Code)
+	}
+	// 非法 IP 要明确 400
+	if rr := e.do(t, "GET", "/_goproxy/acl/test?ip=not-an-ip", ""); rr.Code != http.StatusBadRequest {
+		t.Errorf("非法 IP 应当 400，实际 %d", rr.Code)
+	}
+	// 不指定路由 = 只测全局黑名单，这是合法的用法
+	rr = e.do(t, "GET", "/_goproxy/acl/test?ip=203.0.113.7", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("只测全局失败: %d %s", rr.Code, rr.Body.String())
+	}
+	var onlyGlobal struct {
+		Decision ACLDecision `json:"decision"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &onlyGlobal)
+	if onlyGlobal.Decision.Allowed || onlyGlobal.Decision.Layer != layerGlobalDeny {
+		t.Errorf("只测全局时也应被全局黑名单拦下，实际 %+v", onlyGlobal.Decision)
+	}
+	// 而只测全局时，一个白名单外的地址应当是放行的 —— 因为没有套路由名单
+	rr = e.do(t, "GET", "/_goproxy/acl/test?ip=192.168.1.9", "")
+	json.Unmarshal(rr.Body.Bytes(), &onlyGlobal)
+	if !onlyGlobal.Decision.Allowed {
+		t.Errorf("不指定路由时不应套用任何路由名单，实际 %+v", onlyGlobal.Decision)
+	}
+}
+
+// TestLegacyACLBlocksStartup 从「读文件」这一层确认旧写法会被拦下。
+//
+// 上面 TestLegacyACLRejected 直接调了 rejectLegacyACL，这里走完整链路
+// （写一个旧格式的配置文件 → 启动），确保它在真实启动路径上确实生效。
+func TestLegacyACLBlocksStartup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	legacy := `{
+	  "admin_addr": "127.0.0.1:19099",
+	  "routes": [{
+	    "id": "old", "path_prefix": "/", "target": "http://127.0.0.1:9000",
+	    "acl": {"mode": "allow", "cidrs": ["10.0.0.0/8"]}
+	  }]
+	}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatal("旧格式 acl.mode 必须让加载失败，否则白名单会静默失效")
+	}
+	if !strings.Contains(err.Error(), "acl.allow") {
+		t.Errorf("报错应当给出迁移映射，实际：%v", err)
 	}
 }

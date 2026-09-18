@@ -58,6 +58,22 @@ type Config struct {
 	// TrustedProxies 里的项是 IP 或 CIDR。
 	TrustedProxies []string `json:"trusted_proxies,omitempty"`
 
+	// GlobalIPDeny 是全局黑名单：命中的来源在**所有**入口上一律拒绝，
+	// 包括管理端口，也不受任何路由白名单的豁免。
+	//
+	// 它是三层名单里优先级最高的一层（见 acl.go 的 decideIP）。典型用途是
+	// 发现攻击源之后立刻全网封禁 —— 紧急处置时不该还要逐个路由核对
+	// 「我到底封干净了没有」。
+	//
+	// 留空/nil 表示没有全局封禁。写成 [] 也合法（等于没配），
+	// 与白名单不同：空白名单会让所有人都进不来，是配置错误；
+	// 空黑名单只是什么都不禁，没有危害。
+	//
+	// 注意它**作用于管理端口**。因此在控制台里保存一条会挡住自己的规则是
+	// 危险的，写接口会先做一次自检并拒绝（见 admin_api.go 的 guardSelfLockout）。
+	// 万一从别的途径写死了，仍然可以手工改配置文件后重启恢复。
+	GlobalIPDeny []IPRule `json:"global_ip_deny,omitempty"`
+
 	// TLS 是全局 TLS/ACME 配置。默认 enabled=false，即完全保持历史行为：
 	// 所有端口跑明文 HTTP。打开后路由默认走 ACME 自动证书，可逐条覆盖。
 	TLS TLSConfig `json:"tls,omitzero"`
@@ -113,8 +129,11 @@ type RouteConfig struct {
 	CircuitBreaker *CBConfig `json:"circuit_breaker,omitempty"`
 	// Auth 不配或 mode=none 则不做认证
 	Auth *RouteAuthConfig `json:"auth,omitempty"`
-	// ACL IP 白/黑名单，不配则不限制
-	ACL *ACLConfig `json:"acl,omitempty"`
+	// ACL 这条路由的 IP 白名单 / 黑名单，不配则不按 IP 限制。
+	//
+	// 与 v0.6.x 的区别：以前是 mode 二选一（要么白名单要么黑名单），
+	// 现在两者并存 —— allow 收紧范围，deny 在范围内开例外。
+	ACL *RouteACLConfig `json:"acl,omitempty"`
 }
 
 type RouteAuthConfig struct {
@@ -125,10 +144,22 @@ type RouteAuthConfig struct {
 	JWT   *JWTConfig       `json:"jwt"`
 }
 
-type ACLConfig struct {
-	// Mode: none（默认）| allow（白名单）| deny（黑名单）
-	Mode  string   `json:"mode"`
-	CIDRs []string `json:"cidrs"`
+// RouteACLConfig 是一条路由上的 IP 名单。
+//
+// 两份名单的语义（判定顺序见 acl.go 的 decideIP）：
+//
+//   - Allow 是白名单。**一旦配置就只有一个含义：只允许名单内的地址**。
+//     它的存在是在「收紧」，不是在「额外放行」—— 所以它没有「与黑名单谁优先」
+//     的问题，白名单只负责划定范围。
+//   - Deny 是黑名单。在白名单划定的范围内再剔掉若干地址；
+//     如果没配白名单，就是在全部来源里剔掉这些地址。
+//
+// 两者都可以为 nil（表示没配这份名单）。但**显式写成空数组**只有 Deny 是
+// 合法的：Allow 配成 [] 意味着「谁的请求都不允许」，那是配置事故而不是意图，
+// validate 阶段会直接报错。
+type RouteACLConfig struct {
+	Allow []IPRule `json:"allow,omitempty"`
+	Deny  []IPRule `json:"deny,omitempty"`
 }
 
 type RateLimitConfig struct {
@@ -171,9 +202,63 @@ func parseConfigFile(path string) (raw []byte, cfg *Config, err error) {
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return nil, nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
+	// 旧写法必须在这里就拦住，不能等到用了才发现在静默失效。
+	if err := rejectLegacyACL(raw); err != nil {
+		return nil, nil, err
+	}
 	// 证书相对路径的解析基准。反序列化完成后再设，避免被 JSON 里的同名字段覆盖。
 	cfg.cfgPath = path
 	return raw, cfg, nil
+}
+
+// rejectLegacyACL 拦住 v0.6.x 的旧 acl 写法（mode + cidrs）。
+//
+// 为什么必须显式报错，而不是让不认识的字段静默落空：旧配置里 acl.mode=allow
+// 表达的是一条**白名单**。新结构没有 mode 字段，静默忽略的后果是白名单不再生效、
+// 所有来源都能访问 —— 这是一次无声的安全降级。配置文件还在、启动日志也不报错，
+// 但防护已经没了，比启动失败危险得多。
+//
+// 纯 mode=none 且没有 cidrs 的残留是空操作（新结构里删掉即可），
+// 这种情况放行，免得为一行无意义的遗留卡住升级。
+func rejectLegacyACL(raw []byte) error {
+	var probe struct {
+		Routes []struct {
+			ID  string `json:"id"`
+			ACL *struct {
+				Mode  *string   `json:"mode"`
+				CIDRs *[]string `json:"cidrs"`
+			} `json:"acl"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil // 解析失败会有更准确的报错，不在这里抢答
+	}
+	for i, r := range probe.Routes {
+		if r.ACL == nil {
+			continue
+		}
+		// 用指针是为了区分「文件里写了 mode」和「压根没这个键」。
+		mode := ""
+		if r.ACL.Mode != nil {
+			mode = strings.ToLower(strings.TrimSpace(*r.ACL.Mode))
+		}
+		hasCIDRs := r.ACL.CIDRs != nil && len(*r.ACL.CIDRs) > 0
+		if !hasCIDRs && (mode == "" || mode == "none") {
+			continue
+		}
+		id := r.ID
+		if id == "" {
+			id = "未命名"
+		}
+		return fmt.Errorf("routes[%d] (%s): acl.mode / acl.cidrs 是 v0.6.x 的旧写法，"+
+			"v0.7.0 起已换成两份可并存的名单。迁移映射：\n"+
+			"      acl.mode=allow + cidrs   →   acl.allow\n"+
+			"      acl.mode=deny  + cidrs   →   acl.deny\n"+
+			"    两者现在可以同时配置：allow 收紧来源范围，deny 在范围内开例外。\n"+
+			"    另有顶层 global_ip_deny，作为对所有入口（含管理端口）生效的全局黑名单。",
+			i, id)
+	}
+	return nil
 }
 
 // applyTopDefaults 给顶层字段补默认值。
@@ -340,6 +425,15 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	// 全局黑名单里的 CIDR 也要在写盘前解析通过。
+	//
+	// 写接口的顺序是「先落盘、再 reload」，校验漏掉这一层的话，
+	// 坏配置会先写进文件、然后 reload 才失败 —— 进程停在一个半坏的状态上，
+	// 而且文件里已经留下了错误内容。
+	if _, err := NewIPList(c.GlobalIPDeny); err != nil {
+		return fmt.Errorf("global_ip_deny: %w", err)
+	}
+
 	seen := make(map[string]struct{}, len(c.Routes))
 	for i, r := range c.Routes {
 		if _, dup := seen[r.ID]; dup {
@@ -393,10 +487,19 @@ func (c *Config) validate() error {
 		}
 
 		if acl := r.ACL; acl != nil {
-			switch strings.ToLower(acl.Mode) {
-			case "", "none", "allow", "deny":
-			default:
-				return fmt.Errorf("routes[%d] (%s): acl.mode 必须是 none|allow|deny，当前 %q", i, r.ID, acl.Mode)
+			// 空白名单要单独拦。它是三层名单里唯一一个「配了就出事」的写法：
+			// 白名单一旦存在就表示「只允许名单内的地址」，空数组等于谁都拒绝。
+			// 这和「没配白名单 = 不限制」只差一个字符，必须报错而不是让它生效。
+			if acl.Allow != nil && len(acl.Allow) == 0 {
+				return fmt.Errorf("routes[%d] (%s): acl.allow 是空数组。白名单一旦配置就意味着"+
+					"「只允许名单内的地址」，空数组会让这条路由拒绝所有请求；想取消限制请删掉 allow 字段本身",
+					i, r.ID)
+			}
+			if _, err := NewIPList(acl.Allow); err != nil {
+				return fmt.Errorf("routes[%d] (%s): acl.allow: %w", i, r.ID, err)
+			}
+			if _, err := NewIPList(acl.Deny); err != nil {
+				return fmt.Errorf("routes[%d] (%s): acl.deny: %w", i, r.ID, err)
 			}
 		}
 	}

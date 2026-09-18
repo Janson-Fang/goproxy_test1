@@ -6,11 +6,21 @@ import type {
   JWTConfig,
   RateLimitScope,
   Route,
+  RouteACLConfig,
   RouteAuthConfig,
   TLSMode,
 } from '../types'
-import { Checkbox, Field, Modal, Note, Switch, toast } from '../ui'
-import { pairList, parsePairs, parsePorts, splitList } from '../format'
+import { Badge, Checkbox, Field, Modal, Note, Switch, toast } from '../ui'
+import {
+  ipRulesToText,
+  looksLikeCIDR,
+  normalizeIPRules,
+  pairList,
+  parseIPRules,
+  parsePairs,
+  parsePorts,
+  splitList,
+} from '../format'
 
 /* ============ 表单状态 ============ */
 
@@ -61,8 +71,8 @@ interface FormState {
   jwtLeeway: string
   jwtForward: string
 
-  aclMode: 'none' | 'allow' | 'deny'
-  aclCidrs: string
+  aclAllow: string
+  aclDeny: string
 }
 
 function emptyForm(): FormState {
@@ -101,8 +111,8 @@ function emptyForm(): FormState {
     jwtAudience: '',
     jwtLeeway: '',
     jwtForward: '',
-    aclMode: 'none',
-    aclCidrs: '',
+    aclAllow: '',
+    aclDeny: '',
   }
 }
 
@@ -163,10 +173,11 @@ function fromRoute(r: Route): FormState {
     }
   }
 
-  if (r.acl && r.acl.mode && r.acl.mode !== 'none') {
-    f.aclMode = r.acl.mode === 'allow' ? 'allow' : 'deny'
-    f.aclCidrs = (r.acl.cidrs ?? []).join('\n')
-  }
+  // 两份名单并存（v0.7.0）。空文本 = 这份名单没配，和「配了但是空的」是两件事，
+  // 后者会让白名单拒绝所有请求，所以在界面上根本无法表达 —— 只有配置文件能写出来，
+  // 后端在校验阶段会拦下它。
+  f.aclAllow = ipRulesToText(normalizeIPRules(r.acl?.allow))
+  f.aclDeny = ipRulesToText(normalizeIPRules(r.acl?.deny))
 
   return f
 }
@@ -245,8 +256,16 @@ function toRoute(f: FormState): Route {
     route.auth = auth
   }
 
-  if (f.aclMode !== 'none') {
-    route.acl = { mode: f.aclMode, cidrs: splitList(f.aclCidrs) }
+  // 名单只在真的配了内容时才写进 route —— 两边都是空 = 这条路由不做 IP 限制。
+  // 留空（而不是写成 allow: []）是必须的：显式空数组在白名单那一侧意味着
+  // 「谁都进不来」，后端会当成配置错误直接拒绝。
+  const aclAllow = parseIPRules(f.aclAllow)
+  const aclDeny = parseIPRules(f.aclDeny)
+  if (aclAllow.length > 0 || aclDeny.length > 0) {
+    const acl: RouteACLConfig = {}
+    if (aclAllow.length > 0) acl.allow = aclAllow
+    if (aclDeny.length > 0) acl.deny = aclDeny
+    route.acl = acl
   }
 
   return route
@@ -349,8 +368,15 @@ function validate(f: FormState, isCreate: boolean, adminPort: number): Record<st
     if (algs.length === 0 && f.jwtPublicKey.trim() === '' && !f.jwtSecret) e.jwtSecret = '缺少验签凭据'
   }
 
-  if (f.aclMode !== 'none' && splitList(f.aclCidrs).length === 0) {
-    e.aclCidrs = '白名单/黑名单不能为空，否则会拒绝或放行所有请求'
+  // 名单条目的形状检查。刻意只做「像不像 IP/CIDR」，真正的解析交给后端 ——
+  // 前端不该有一套自己的 CIDR 语法，那种重复最终一定会和后端跑偏。
+  const badAllow = parseIPRules(f.aclAllow).filter((r) => !looksLikeCIDR(r.cidr))
+  if (badAllow.length > 0) {
+    e.aclAllow = `这些看起来不是 IP 或 CIDR：${badAllow.map((r) => r.cidr).join('、')}`
+  }
+  const badDeny = parseIPRules(f.aclDeny).filter((r) => !looksLikeCIDR(r.cidr))
+  if (badDeny.length > 0) {
+    e.aclDeny = `这些看起来不是 IP 或 CIDR：${badDeny.map((r) => r.cidr).join('、')}`
   }
 
   return e
@@ -398,7 +424,7 @@ export function RouteForm({
         tls: ['tlsMode', 'certFile', 'keyFile'],
         limit: ['rlRps', 'rlBurst'],
         breaker: ['cbErrorRate', 'cbMinCalls', 'cbOpenSecs', 'cbHalfOpenCalls', 'cbWindowSecs'],
-        guard: ['accounts', 'jwtSecret', 'jwtPublicKey', 'jwtAlgs', 'aclCidrs'],
+        guard: ['accounts', 'jwtSecret', 'jwtPublicKey', 'jwtAlgs', 'aclAllow', 'aclDeny'],
       }
       for (const t of order) {
         const keys = where[t]
@@ -458,7 +484,7 @@ export function RouteForm({
           aria-selected={tab === 'guard'}
           onClick={() => setTab('guard')}
         >
-          认证与 ACL{flag(form.authMode !== 'none' || form.aclMode !== 'none')}
+          认证与 ACL{flag(form.authMode !== 'none' || form.aclAllow.trim() !== '' || form.aclDeny.trim() !== '')}
         </button>
       </div>
 
@@ -938,40 +964,72 @@ export function RouteForm({
             </fieldset>
           )}
 
-          <Field label="IP 访问控制 ACL" hint="不在名单里的请求返回 403">
-            <select
-              className="select"
-              value={form.aclMode}
-              onChange={(e) => set('aclMode', e.target.value as 'none' | 'allow' | 'deny')}
-            >
-              <option value="none">不限制</option>
-              <option value="allow">白名单（只有名单内放行）</option>
-              <option value="deny">黑名单（名单内拒绝）</option>
-            </select>
+          <Field
+            label={
+              <>
+                白名单 acl.allow{' '}
+                {parseIPRules(form.aclAllow).length > 0 ? (
+                  <Badge kind="info">{parseIPRules(form.aclAllow).length} 条</Badge>
+                ) : (
+                  <Badge kind="muted">不限制</Badge>
+                )}
+              </>
+            }
+            error={err('aclAllow')}
+            hint="一行一条：CIDR [备注]。单个 IP 会自动按 /32 处理，# 开头是注释。留空 = 不限制来源。"
+            span
+          >
+            <textarea
+              className={`textarea mono${err('aclAllow') ? ' invalid' : ''}`}
+              value={form.aclAllow}
+              placeholder={'10.0.0.0/8 办公网\n203.0.113.66'}
+              onChange={(e) => set('aclAllow', e.target.value)}
+            />
           </Field>
 
-          {form.aclMode !== 'none' && (
-            <Field
-              label="IP / CIDR 列表"
-              error={err('aclCidrs')}
-              hint="一行一条，也支持逗号分隔。单个 IP 会自动按 /32 处理"
-            >
-              <textarea
-                className={`textarea mono${err('aclCidrs') ? ' invalid' : ''}`}
-                value={form.aclCidrs}
-                placeholder={'10.0.0.0/8\n192.168.1.5'}
-                onChange={(e) => set('aclCidrs', e.target.value)}
-              />
-            </Field>
-          )}
+          <Field
+            label={
+              <>
+                黑名单 acl.deny{' '}
+                {parseIPRules(form.aclDeny).length > 0 ? (
+                  <Badge kind="warn">{parseIPRules(form.aclDeny).length} 条</Badge>
+                ) : (
+                  <Badge kind="muted">未启用</Badge>
+                )}
+              </>
+            }
+            error={err('aclDeny')}
+            hint="在白名单划定的范围内再剔掉若干地址。没配白名单时，就是从全部来源里剔掉它们。"
+            span
+          >
+            <textarea
+              className={`textarea mono${err('aclDeny') ? ' invalid' : ''}`}
+              value={form.aclDeny}
+              placeholder={'10.0.0.66 老是有异常流量'}
+              onChange={(e) => set('aclDeny', e.target.value)}
+            />
+          </Field>
 
-          {form.aclMode !== 'none' && form.listen_port.trim() === '' && (
-            <Note kind="warn">
-              ACL 是按<b>客户端 IP</b>判断的。这条路由挂在所有端口上，而客户端 IP 的取值受
-              <code>trusted_proxies</code> 影响 —— 如果代理前面还有一层反代，记得在「配置」页把它加进可信代理，
-              否则看到的会是上一跳的地址。
-            </Note>
-          )}
+          <Note kind="info" span>
+            <b>两份名单可以并存，判定顺序是固定的：</b>
+            <br />
+            ① 全局黑名单命中 → 拒绝（在「配置」页维护，对<b>所有</b>入口生效，这里的白名单救不回来）
+            <br />
+            ② 白名单已填但没命中 → 拒绝（<b>填了白名单就等于「只允许名单内」</b>，不是额外放行）
+            <br />
+            ③ 本路由黑名单命中 → 拒绝（所以白名单里的地址也能被黑名单单独剔掉）
+            <br />
+            ④ 都通过 → 放行
+            <br />
+            想确认某个地址会被哪一层拦下，用「配置」页的<b>命中测试</b>先试一遍。
+          </Note>
+
+          <Note kind="warn" span>
+            IP 名单是按<b>客户端 IP</b>判断的，而这个取值受 <code>trusted_proxies</code> 影响 ——
+            如果前面还有一层反代（或 CDN）没被加进可信代理，名单看到的会是<b>上一跳的地址</b>：
+            按它封禁会误伤整条链路，按它做白名单则会连自己都进不来。
+            {form.listen_port.trim() === '' && ' 这条路由挂在所有端口上，尤其要注意这一点。'}
+          </Note>
         </div>
       )}
     </Modal>
@@ -984,7 +1042,13 @@ export function summarize(r: Route): string[] {
   if (r.rate_limit) tags.push(`限流 ${r.rate_limit.rps}/s`)
   if (r.circuit_breaker) tags.push(`熔断 ${Math.round((r.circuit_breaker.error_rate ?? 0) * 100)}%`)
   if (r.auth && r.auth.mode && r.auth.mode !== 'none') tags.push(`认证 ${r.auth.mode}`)
-  if (r.acl && r.acl.mode && r.acl.mode !== 'none') tags.push(`ACL ${r.acl.mode}`)
+  if (r.acl) {
+    const allow = normalizeIPRules(r.acl.allow).length
+    const deny = normalizeIPRules(r.acl.deny).length
+    if (allow > 0 && deny > 0) tags.push(`名单 白${allow}/黑${deny}`)
+    else if (allow > 0) tags.push(`白名单 ${allow}`)
+    else if (deny > 0) tags.push(`黑名单 ${deny}`)
+  }
   return tags
 }
 

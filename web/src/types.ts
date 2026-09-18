@@ -44,12 +44,69 @@ export interface RouteAuthConfig {
   jwt?: JWTConfig | null
 }
 
-export type ACLMode = '' | 'none' | 'allow' | 'deny'
+/**
+ * 名单里的一条：CIDR（或单个 IP）+ 可选备注。
+ *
+ * 备注只用于展示与排查 —— 它会出现在命中测试的「命中依据」里，
+ * 用来回答「这个地址当初到底是为什么被封的」。
+ */
+export interface IPRule {
+  cidr: string
+  note?: string
+}
 
-export interface ACLConfig {
-  mode: ACLMode
-  /** IP 或 CIDR */
-  cidrs?: string[]
+/**
+ * 后端回传的名单条目是**两种形态混在一起**的：
+ *   ["10.0.0.0/8", {"cidr": "1.2.3.4", "note": "爬虫"}]
+ *
+ * 没有备注的条目会走字符串简写 —— 后端 MarshalJSON 刻意这么做的，
+ * 否则一次控制台保存就会把配置文件撑得满屏都是 {"cidr": ...}。
+ * 界面读进来统一归一化成 IPRule，写回去时没备注的再还原成字符串。
+ */
+export type RawIPRule = string | { cidr?: string; note?: string }
+
+/**
+ * 一条路由上的 IP 名单。两份名单**可以并存**，这是 v0.7.0 与之前最大的不同
+ * （以前是 mode 二选一，表达不出「只允许办公网、但把其中一台机器剔掉」）。
+ *
+ *   - allow 是白名单。**一旦配置就只有一个含义：只允许名单内的地址。**
+ *     它是在收紧范围，不是在额外放行 —— 所以不存在「和黑名单谁优先」的问题。
+ *   - deny 是黑名单。在白名单划定的范围内再剔掉若干地址；
+ *     没配白名单时，就是从全部来源里剔掉这些地址。
+ *
+ * 完整判定顺序：全局黑名单 → 白名单已启用但未命中 → 本路由黑名单 → 放行。
+ * 后端实现见 acl.go 的 decideIP，前端只是照抄这个顺序做提示。
+ */
+export interface RouteACLConfig {
+  allow?: IPRule[]
+  deny?: IPRule[]
+}
+
+/** 命中测试里单层的判定结果。 */
+export interface ACLStep {
+  layer: string
+  configured: boolean
+  matched: boolean
+  rule?: string
+  note?: string
+  detail: string
+}
+
+/** 一次 IP 名单判定的完整结论（对应后端 acl.go 的 ACLDecision）。 */
+export interface ACLDecision {
+  ip: string
+  allowed: boolean
+  /** 拦下它的那一层；放行时为空。 */
+  layer?: string
+  /** 命中的具体规则与备注。 */
+  rule?: string
+  note?: string
+  /** 给 blocked / 指标用的短标签，放行时为空。 */
+  reason?: string
+  /** 给人看的一句话。 */
+  message: string
+  steps?: ACLStep[]
+  route_id?: string
 }
 
 export type RateLimitScope = '' | 'ip' | 'global'
@@ -119,7 +176,7 @@ export interface Route {
   rate_limit?: RateLimitConfig | null
   circuit_breaker?: CBConfig | null
   auth?: RouteAuthConfig | null
-  acl?: ACLConfig | null
+  acl?: RouteACLConfig | null
   /** 服务端附带的实时观测值，提交时会被忽略 */
   live?: RouteLive | null
 }
@@ -245,6 +302,15 @@ export interface ConfigView {
   admin_users: string[]
   /** 是否至少有一种可用凭据（admin_users 或 admin_token） */
   credentials_configured: boolean
+  /**
+   * 全局黑名单：命中的来源在**所有**入口上一律拒绝，包括管理端口，
+   * 也不受任何路由白名单的豁免。
+   *
+   * 注意它**作用于管理端口** —— 在这里加一条覆盖自己来源的规则，
+   * 保存生效后这个控制台就打不开了。后端因此在写路径上有一道自锁检查
+   * （guardSelfLockout），会直接拒绝这类保存。
+   */
+  global_ip_deny: RawIPRule[] | null
 }
 
 export interface ConfigPatch {
@@ -252,6 +318,14 @@ export interface ConfigPatch {
   access_log?: boolean
   trusted_proxies?: string[]
   admin_token?: string
+  /**
+   * 全局黑名单。传空数组表示清空；不传表示保持现状。
+   *
+   * 类型是 RawIPRule 而不是 IPRule：没备注的条目要走字符串简写，
+   * 否则一次控制台保存就会把 config.json 里每条规则都撑成 {"cidr": …}。
+   * 后端 IPRule.UnmarshalJSON 两种形态都收。
+   */
+  global_ip_deny?: RawIPRule[]
 }
 
 // ---------- 状态 ----------
