@@ -212,7 +212,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # fetch-depth: 0 是**必须**的：下面「生成 Release 说明」要读 annotated tag 的
+      # message（`git for-each-ref refs/tags/$TAG`）。浅克隆下 tag 对象拿不到，
+      # 结果是静默回退成只有 auto changelog —— 正是这个步骤要避免的事。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -235,17 +240,52 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 独立生成 release notes，失败不阻断发布（产物已经挂好了）
+      # ⚠ 这一步的语义是「把说明拼起来」，不是「用生成的说明覆盖掉」。
+      #
+      # 踩过两次：
+      #   1. 用 softprops/action-gh-release 的 generate_release_notes（v0.5.0），
+      #      它会让 release 只有一行 auto changelog；
+      #   2. 用 `gh release edit --notes "$notes"`（v0.6.0），**同样是整体替换** ——
+      #      亲手写在 tag 上的说明被 88 字节的 "Full Changelog" 冲掉。
+      #
+      # 现在的约定：**手写的发布说明写在 annotated tag 的 message 里**
+      # （`git tag -a v0.6.0 -F notes.md`，第一行会被 git 当成标题丢掉，
+      #   所以正文从第二行起）。CI 把它取出来当正文，auto changelog 只作附录。
+      # 这样发布说明跟着 tag 走、有版本控制、且不依赖任何手动点击。
       - name: 生成 Release 说明
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          notes=$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
-            -f tag_name="$TAG" --jq .body) || exit 0
-          [ -n "$notes" ] || exit 0
-          gh release edit "$TAG" --notes "$notes" || true
+          set -eu
+          repo="${{ github.repository }}"
+
+          # tag 的 message：git 会去掉开头的标题行，剩下的就是手写正文。
+          # 用 --format 而不是给 git 加参数，避免掉进 shell 引号地狱。
+          tag_notes=$(git for-each-ref "refs/tags/$TAG" \
+            --format='%(contents:body)' 2>/dev/null || true)
+
+          changelog=$(gh api "repos/$repo/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body 2>/dev/null || true)
+
+          # 拼装：手写正文在前，auto changelog 作为附录在后。
+          if [ -n "${tag_notes:-}" ] && [ -n "${changelog:-}" ]; then
+            body=$(printf '%s\n\n---\n\n%s\n' "$tag_notes" "$changelog")
+          elif [ -n "${tag_notes:-}" ]; then
+            body="$tag_notes"
+          elif [ -n "${changelog:-}" ]; then
+            body="$changelog"
+          else
+            echo "tag 没有说明、auto changelog 也拿不到，保留 Release 现状"
+            exit 0
+          fi
+
+          printf '%s' "$body" > /tmp/relnotes.md
+          # 用 --notes-file 而不是 --notes：正文里有表格、代码块、反引号，
+          # 直接当参数传会被 shell 吃掉引号。
+          gh release edit "$TAG" --notes-file /tmp/relnotes.md
+          echo "Release 说明已更新，正文 $(wc -c < /tmp/relnotes.md) 字节"
 
       # 断言产物真的挂上去了 —— 否则「发布成功」只是自我感觉良好
       - name: 校验 Release 产物齐全
