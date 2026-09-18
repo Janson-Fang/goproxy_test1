@@ -22,10 +22,34 @@ import (
 
 // ---------- 会话存储 ----------
 
+// constFP 返回一个「永远算出同一个指纹」的回调。
+//
+// lookup 的第二个参数是回调而不是字符串，是因为两种登录方式的指纹算法不同
+// （用户名密码登录绑账号密码哈希，Bearer 登录绑令牌）。会话存的是指纹结果，
+// 不记得当初用的是哪种方式，所以由调用方按会话里记的用户名决定怎么算。
+//
+// 对「只测会话存储本身」的用例来说，指纹怎么算无关紧要 —— 重要的是
+// 「当前算出来的值」和「创建时存下的值」是否相同。所以这里固定返回一个值，
+// 就能精确模拟「凭据没变」（返回值不变）和「凭据变了」（换成另一个值）两种情况。
+func constFP(v string) func(string) string {
+	return func(string) string { return v }
+}
+
+// sessionValid 是 lookup 的单值封装，只关心「有没有通过」。
+//
+// lookup 本身返回 (是否有效, 用户名)，因为鉴权之后还要知道「是谁」。
+// 会话存储这层的用例大多只关心前者，用这个封装能让断言保持原来的写法：
+//
+//	s.lookup(...)  ->  sessionValid(s, ...)
+func sessionValid(s *sessionStore, handle string, fp func(string) string) bool {
+	ok, _ := s.lookup(handle, fp)
+	return ok
+}
+
 func TestSessionCreateAndLookup(t *testing.T) {
 	s := newSessionStore()
 
-	handle, expires, err := s.create("tok", "1.2.3.4", "test-ua")
+	handle, expires, err := s.create("", "tok", "1.2.3.4", "test-ua")
 	if err != nil {
 		t.Fatalf("create 失败: %v", err)
 	}
@@ -39,13 +63,13 @@ func TestSessionCreateAndLookup(t *testing.T) {
 		t.Errorf("会话数应为 1，实际 %d", got)
 	}
 
-	if !s.lookup(handle, "tok") {
+	if !sessionValid(s, handle, constFP("tok")) {
 		t.Error("刚创建的会话应该校验通过")
 	}
-	if s.lookup("not-a-real-handle", "tok") {
+	if sessionValid(s, "not-a-real-handle", constFP("tok")) {
 		t.Error("不存在的句柄不该通过")
 	}
-	if s.lookup("", "tok") {
+	if sessionValid(s, "", constFP("tok")) {
 		t.Error("空句柄不该通过")
 	}
 }
@@ -53,7 +77,7 @@ func TestSessionCreateAndLookup(t *testing.T) {
 // 服务端只存 sha256(handle)：内存被读走也不能直接拿来冒用。
 func TestSessionStoresOnlyHandleHash(t *testing.T) {
 	s := newSessionStore()
-	handle, _, err := s.create("tok", "1.2.3.4", "ua")
+	handle, _, err := s.create("", "tok", "1.2.3.4", "ua")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,14 +97,14 @@ func TestSessionStoresOnlyHandleHash(t *testing.T) {
 // 改 admin_token = 所有会话立即下线（不需要额外的吊销机制）。
 func TestSessionInvalidatedByTokenChange(t *testing.T) {
 	s := newSessionStore()
-	handle, _, err := s.create("old-token", "1.2.3.4", "ua")
+	handle, _, err := s.create("", "old-token", "1.2.3.4", "ua")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s.lookup(handle, "old-token") {
+	if !sessionValid(s, handle, constFP("old-token")) {
 		t.Fatal("换令牌前应该有效")
 	}
-	if s.lookup(handle, "new-token") {
+	if sessionValid(s, handle, constFP("new-token")) {
 		t.Error("换了 admin_token 之后旧会话必须失效 —— 这是「改令牌即全员下线」的全部实现")
 	}
 }
@@ -90,20 +114,20 @@ func TestSessionIdleTimeout(t *testing.T) {
 	s := newSessionStore()
 	s.now = func() time.Time { return now }
 
-	handle, _, err := s.create("tok", "1.2.3.4", "ua")
+	handle, _, err := s.create("", "tok", "1.2.3.4", "ua")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// 空闲但没超时：一轮「用一下 → 等」应该能一直续下去
 	now = now.Add(sessionIdleTimeout - time.Minute)
-	if !s.lookup(handle, "tok") {
+	if !sessionValid(s, handle, constFP("tok")) {
 		t.Fatal("空闲未超时应仍然有效")
 	}
 
 	// 超过空闲上限
 	now = now.Add(sessionIdleTimeout + time.Minute)
-	if s.lookup(handle, "tok") {
+	if sessionValid(s, handle, constFP("tok")) {
 		t.Error("空闲超过 30 分钟必须失效")
 	}
 }
@@ -114,7 +138,7 @@ func TestSessionAbsoluteTimeout(t *testing.T) {
 	s := newSessionStore()
 	s.now = func() time.Time { return now }
 
-	handle, _, err := s.create("tok", "1.2.3.4", "ua")
+	handle, _, err := s.create("", "tok", "1.2.3.4", "ua")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,14 +152,14 @@ func TestSessionAbsoluteTimeout(t *testing.T) {
 	steps := int(sessionAbsoluteTimeout/(sessionIdleTimeout/2)) + 2
 	for i := 0; i < steps; i++ {
 		now = now.Add(sessionIdleTimeout / 2)
-		s.lookup(handle, "tok")
+		sessionValid(s, handle, constFP("tok"))
 	}
 	elapsed := time.Duration(steps) * (sessionIdleTimeout / 2)
 	if elapsed <= sessionAbsoluteTimeout {
 		t.Fatalf("测试自身有误：累计 %v 未超过绝对上限 %v，"+
 			"这个用例证明不了任何事", elapsed, sessionAbsoluteTimeout)
 	}
-	if s.lookup(handle, "tok") {
+	if sessionValid(s, handle, constFP("tok")) {
 		t.Errorf("累计活跃 %v 超过绝对上限 %v 后必须失效，不能靠活跃无限续期",
 			elapsed, sessionAbsoluteTimeout)
 	}
@@ -143,19 +167,19 @@ func TestSessionAbsoluteTimeout(t *testing.T) {
 
 func TestSessionRevoke(t *testing.T) {
 	s := newSessionStore()
-	h1, _, _ := s.create("tok", "1.2.3.4", "ua")
-	h2, _, _ := s.create("tok", "1.2.3.4", "ua")
+	h1, _, _ := s.create("", "tok", "1.2.3.4", "ua")
+	h2, _, _ := s.create("", "tok", "1.2.3.4", "ua")
 
 	s.revoke(h1)
-	if s.lookup(h1, "tok") {
+	if sessionValid(s, h1, constFP("tok")) {
 		t.Error("被登出的会话必须立即失效")
 	}
-	if !s.lookup(h2, "tok") {
+	if !sessionValid(s, h2, constFP("tok")) {
 		t.Error("登出一个会话不该影响另一个")
 	}
 
 	s.revokeAll()
-	if s.lookup(h2, "tok") {
+	if sessionValid(s, h2, constFP("tok")) {
 		t.Error("revokeAll 之后所有会话都该失效")
 	}
 }
@@ -166,7 +190,7 @@ func TestSessionSweepRemovesExpired(t *testing.T) {
 	s.now = func() time.Time { return now }
 
 	for i := 0; i < 5; i++ {
-		if _, _, err := s.create("tok", "1.2.3.4", "ua"); err != nil {
+		if _, _, err := s.create("", "tok", "1.2.3.4", "ua"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -186,7 +210,7 @@ func TestSessionCountCap(t *testing.T) {
 	s := newSessionStore()
 	created := 0
 	for i := 0; i < maxSessions+20; i++ {
-		if _, _, err := s.create("tok", "1.2.3.4", "ua"); err == nil {
+		if _, _, err := s.create("", "tok", "1.2.3.4", "ua"); err == nil {
 			created++
 		}
 	}
@@ -335,9 +359,13 @@ func TestSessionRejectedAfterLogout(t *testing.T) {
 		t.Fatalf("登出应成功，实际 %d：%s", rr.Code, rr.Body.String())
 	}
 
-	// 同一个 Cookie 再用一次必须失效
+	// 同一个 Cookie 再用一次必须失效。
+	//
+	// 必须显式 noAuth()：e.do 默认会带上 Bearer 令牌，
+	// 那样请求会靠令牌通过，就测不出「会话有没有真的被吊销」了。
 	rr = e.do(t, "GET", "/_goproxy/routes", "",
 		remote("203.0.113.9:5000"),
+		noAuth(),
 		func(r *http.Request) { r.AddCookie(c) })
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("登出后旧会话必须失效，实际 %d", rr.Code)
@@ -356,6 +384,7 @@ func TestSessionRejectedAfterTokenRotated(t *testing.T) {
 
 	rr := e.do(t, "GET", "/_goproxy/routes", "",
 		remote("203.0.113.9:5000"),
+		noAuth(),
 		func(r *http.Request) { r.AddCookie(c) })
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("换令牌后旧会话必须失效，实际 %d", rr.Code)
@@ -368,6 +397,7 @@ func TestForgedSessionRejected(t *testing.T) {
 	for _, bad := range []string{"", "deadbeef", strings.Repeat("a", 43)} {
 		rr := e.do(t, "GET", "/_goproxy/routes", "",
 			remote("203.0.113.9:5000"),
+			noAuth(), // 否则会靠默认带的 Bearer 令牌通过，掩盖伪造会话被判定的结果
 			func(r *http.Request) {
 				r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: bad})
 			})
@@ -510,7 +540,9 @@ func TestLoginReachableWithoutCredentials(t *testing.T) {
 func TestSessionStateReachableWithoutCredentials(t *testing.T) {
 	e := newTestEnv(t, "s3cret", "")
 
-	rr := e.do(t, "GET", "/_goproxy/session", "", remote("203.0.113.78:5000"))
+	// noAuth() 是这条用例成立的前提：e.do 默认带 Bearer 令牌，
+	// 不停用的话请求就是「已认证」，永远测不到未登录分支。
+	rr := e.do(t, "GET", "/_goproxy/session", "", remote("203.0.113.78:5000"), noAuth())
 
 	// 被 adminGuard 挡掉的话是「需要登录，或带 Bearer」那条 401；
 	// 走通到 handler 的话是「尚未登录。」—— 两者状态码相同但 body 不同。
@@ -653,23 +685,40 @@ func TestLoginBlockedAfterRepeatedFailures(t *testing.T) {
 
 // ---------- 会话状态接口 ----------
 
+// /session 要如实报告「这次请求是靠什么通过认证的」——前端据此决定
+// 显示用户名还是「令牌模式」，也用来判断要不要渲染登出按钮。
+//
+// v0.6.0 的 via 取值只剩三个：session / bearer / ""（未认证）。
+// 「loopback」这个值随回环免认证一起去掉了 —— 本机直连现在也必须有凭据，
+// 因此它要么是 bearer（配了令牌的脚本）、要么是 session（浏览器登录过）。
 func TestSessionEndpointReportsVia(t *testing.T) {
-	e := newTestEnv(t, "s3cret", "")
+	e := newTestEnv(t, testToken, "")
 
-	// 回环直连：免认证放行，但没有会话
-	rr := e.do(t, "GET", "/_goproxy/session", "")
+	// 未认证：via 应该是空的，且明确回 401
+	rr := e.do(t, "GET", "/_goproxy/session", "", noAuth())
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("未认证时 /session 应 401，实际 %d", rr.Code)
+	}
 	got := decode[map[string]any](t, rr)
-	if got["via"] != "loopback" {
-		t.Errorf("回环直连的 via 应为 loopback，实际 %v", got["via"])
+	if got["via"] != nil && got["via"] != "" {
+		t.Errorf("未认证时不该报告 via，实际 %v", got["via"])
+	}
+
+	// Bearer 直连：via 是 bearer，且不该被当成有会话
+	rr = e.do(t, "GET", "/_goproxy/session", "")
+	got = decode[map[string]any](t, rr)
+	if got["via"] != "bearer" {
+		t.Errorf("带令牌直连的 via 应为 bearer，实际 %v", got["via"])
 	}
 	if got["has_session"] != false {
-		t.Errorf("回环直连不该被当成有会话，实际 %v", got["has_session"])
+		t.Errorf("带令牌直连不该被当成有会话，实际 %v", got["has_session"])
 	}
 
-	// 登录之后
-	c := loginAndGetCookie(t, e, "s3cret")
+	// 登录之后：via 是 session，并且带得出用户名
+	c := loginAndGetCookie(t, e, testToken)
 	rr = e.do(t, "GET", "/_goproxy/session", "",
 		remote("203.0.113.9:5000"),
+		noAuth(), // 只靠 Cookie，不带 Bearer —— 否则测的是令牌那条路
 		func(r *http.Request) { r.AddCookie(c) })
 	got = decode[map[string]any](t, rr)
 	if got["via"] != "session" {

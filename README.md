@@ -3,9 +3,12 @@
 一个用 Go 写的 L7 HTTP 反向代理，核心验证 **「同一 IP 不同端口 → 不同后端」**（场景 C）以及按域名/路径分流。
 
 demo 已经做到 M4：转发、多端口分流、热重载、限流、**熔断**、**访问控制（IP 黑白名单 / Basic / JWT）**、
-**TLS / ACME 自动证书**，外加**管理写接口、监控数据源和网页版管理控制台**。
+**TLS / ACME 自动证书**，外加**多用户登录、会话保护、管理写接口、监控数据源和网页版管理控制台**。
 
 仍然**故意不做**：SQLite（配置仍用 JSON 文件）、泛域名自动证书、mTLS。这些按正式方案的 M5–M7 迭代。
+
+> **v0.6.0 是破坏性变更**：管理控制台改为**用户名 + 密码**登录，并且**本机访问也不再免认证**。
+> 升级前请先看[从 v0.5.x 升级](#从-v05x-升级破坏性变更)，照着做一遍，否则控制台会打不开。
 
 ---
 
@@ -18,7 +21,11 @@ go run ./backend -port 9002 -name 服务B &
 go run ./backend -port 9003 -name 服务C &
 go run ./backend -port 9004 -name 服务D &
 
-# 2. 启动反代
+# 2. 给控制台设一个管理员账号（用户名 + 密码）
+./goproxy -hash-password '你的密码'
+# → $2a$10$....  把这行填进 config.json 的 admin_users
+
+# 3. 启动反代
 go run . -c config.json -text-log
 ```
 
@@ -31,8 +38,60 @@ INFO 管理端口已启动 addr=127.0.0.1:9080
 
 注意 `ports` 里没有 9001–9004 —— 那是后端，不是监听端口。反代监听的是 **8000/8081/8082/8083**。
 
-浏览器打开 **<http://127.0.0.1:9080/>** 就是管理控制台（路由增删改、实时日志、指标看板都在那里，
-详见[管理控制台](#管理控制台网页版)）。
+浏览器打开 **<http://127.0.0.1:9080/>** 就是管理控制台，会先跳到登录页。
+**没有配任何凭据时会看到一张「还没有配置管理员账号」的指引页**（含可直接照抄的命令），
+而不是空白或 401（详见[管理端认证](#管理端认证)）。
+
+---
+
+## 从 v0.5.x 升级（破坏性变更）
+
+v0.6.0 动了三件**会让老环境无法照常使用**的事，升级前逐条对照：
+
+| 变更 | 现象 | 怎么办 |
+|---|---|---|
+| **本机访问不再免认证** | 以前 `curl http://127.0.0.1:9080/_goproxy/routes` 直接 200，现在 **401** | 管理接口一律要凭据。脚本改用 `Authorization: Bearer <admin_token>`，浏览器去控制台登录 |
+| **登录方式从「贴令牌」改成「用户名 + 密码」** | 原来贴在浏览器里的 `admin_token` 输入框没有了 | 在 `config.json` 里加 `admin_users`（用户名 + bcrypt 哈希），见下 |
+| **`/healthz`、`/readyz`、`/metrics` 现在也要认证** | 监控探针、`docker-compose` 的健康检查开始报 401/403 | 探针带上 `Authorization: Bearer <admin_token>`；compose 的健康检查已改好，见[探针与健康检查](#探针与健康检查) |
+
+错误码也从 `admin_token_not_set` 改名成 **`admin_credentials_not_set`** —— 因为令牌不再是唯一的凭据来源。
+如果你有脚本/告警规则在匹配这个字符串，需要一起改。
+
+### 最小升级步骤
+
+```bash
+# 1. 升级二进制（重跑安装脚本就是升级，配置文件不会被覆盖）
+curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh | sudo bash
+
+# 2. 加一个管理员账号。脚本升级时会检测到「一个凭据都没有」
+#    并弹出交互提示；没弹出来就手动做：
+goproxy -hash-password '你的密码'      # → $2a$10$...
+```
+
+```jsonc
+// config.json
+{
+  "admin_users": [
+    { "username": "admin", "password_hash": "$2a$10$..." }
+  ]
+}
+```
+
+保存即热重载，**不用重启**。此时浏览器打开 `http://<你的地址>:9080/` 就有登录页了。
+
+> **老会话不会被立刻踢掉。** 会话绑定的是「账号的当前密码哈希 + 令牌指纹」。
+> 只加 `admin_users`、不动 `admin_token` 的话，靠令牌指纹建立的旧会话仍然有效，
+> 直到它自己超时（空闲 30 分钟 / 绝对 12 小时）。想把所有人立刻下线，
+> 改一下 `admin_token` 即可 —— 令牌一变，靠它绑定的会话全部立刻失效。
+
+### 只用了 `admin_token` 的环境
+
+**不配 `admin_users` 也能正常用**，两条凭据路径是并列的：
+
+- 浏览器：登录页会提示「还没有配置管理员账号」，可点「仍然尝试登录」用令牌登录；
+- 脚本 / Prometheus：`Authorization: Bearer <admin_token>` 一直有效。
+
+但推荐**两个都配**：给人用的走账号，给机器用的走令牌，职责分开。
 
 ---
 
@@ -116,6 +175,8 @@ curl -X POST http://127.0.0.1:9080/_goproxy/reload
 open http://127.0.0.1:9080/            # 等价于 http://127.0.0.1:9080/_goproxy/ui/
 ```
 
+**第一次打开会让你登录**（用户名 + 密码）。没配账号的话看到的是配置指引页，不是登录表单。
+
 四个页签：
 
 | 页签 | 能做什么 |
@@ -123,16 +184,16 @@ open http://127.0.0.1:9080/            # 等价于 http://127.0.0.1:9080/_goprox
 | **总览** | 请求量 / 5xx 错误率 / P95 / 在途 / 限流与拒绝计数；最近 5 分钟的 QPS 与错误曲线；熔断器概况；状态码分布；监听端口与运行信息 |
 | **路由** | 路由列表（三级匹配规则、实时请求数、熔断状态），一键启停；新建 / 编辑 / 删除；表单分「基础 · 转发 · 限流 · 熔断 · 认证与 ACL」五组 |
 | **日志** | 最近 500 条访问记录，按状态 / 路由 / 方法 / 关键字过滤，被拦截的请求单独标色；SSE 实时追加，可暂停、可跟随滚动 |
-| **配置** | `default_ports` / `access_log` / `trusted_proxies` / `admin_token` 的读写与手动重载；`admin_addr` 只读并说明原因 |
+| **配置** | `default_ports` / `access_log` / `trusted_proxies` / `admin_token` 的读写与手动重载；`admin_users` 与 `admin_addr` 只读并说明原因 |
 
 几个和权限有关的点，部署前值得看一眼：
 
 - **控制台的静态页面不鉴权。** 它只是一堆公开的前端代码，不含任何机密；但它必须能先加载出来，
-  你才有机会输入 `admin_token`。如果连页面壳都要鉴权，就成了「要令牌才能打开页面、
-  要页面才能填令牌」的死循环。真正敏感的操作全在 `/_goproxy/*` 接口上，那些**一律**受令牌保护。
-- 管理端口监听在**非回环地址**时没有配 `admin_token`，后端会拒绝所有外部管理请求
-  ——这是防止管理接口裸奔的闸门。控制台会识别这种情况并给出处理指引。
-- 令牌只存在浏览器的 `localStorage` 里，以 `Authorization: Bearer` 发出，不发给任何第三方。
+  你才有机会登录。如果连页面壳都要鉴权，就成了「要登录才能打开页面、要页面才能登录」的死循环。
+  真正敏感的操作全在 `/_goproxy/*` 接口上，那些**一律**要凭据（本机访问也一样）。
+- **`admin_users` 只以用户名形式出现在界面上**，`password_hash` 从来不回传。
+  「配置」页里那一排用户名标签只是让你确认「有哪些账号」，具体哈希在服务器上的 `config.json` 里。
+- 会话凭据只存在 `HttpOnly` Cookie 里，脚本读不到，也不发给任何第三方。
 
 ### 自己构建控制台
 
@@ -179,10 +240,10 @@ cd web && npm run dev
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
-| `/_goproxy/ui/` | GET | 管理控制台（静态页面，**不需要令牌**；见上一节） |
-| `/healthz` | GET | 存活探针 |
-| `/readyz` | GET | 就绪探针（路由表未加载时 503） |
-| `/metrics` | GET | Prometheus 文本格式指标 |
+| `/_goproxy/ui/` | GET | 管理控制台（静态页面，**不需要凭据**；见上一节） |
+| `/healthz` | GET | 存活探针（**需要凭据**） |
+| `/readyz` | GET | 就绪探针，路由表未加载时 503（**需要凭据**） |
+| `/metrics` | GET | Prometheus 文本格式指标（**需要凭据**） |
 | `/_goproxy/routes` | GET | 路由列表，带实时观测值；响应带 `ETag` |
 | `/_goproxy/routes` | POST | 新建路由，`id` 可省略（自动生成 `rt-xxxxxx`） |
 | `/_goproxy/routes/{id}` | GET | 单条路由 |
@@ -191,45 +252,96 @@ cd web && npm run dev
 | `/_goproxy/routes/{id}` | DELETE | 删除 |
 | `/_goproxy/ports` | GET | 当前实际监听的端口，以及每个端口是否走 TLS |
 | `/_goproxy/certs` | GET | 证书状态：域名、来源、签发者、到期时间、剩余天数、状态 |
-| `/_goproxy/config` | GET | 全局配置（**不回传 `admin_token` 明文**） |
-| `/_goproxy/config` | PATCH | 改 `default_ports` / `access_log` / `trusted_proxies` / `admin_token` / `admin_trust_loopback` |
+| `/_goproxy/config` | GET | 全局配置（**不回传 `admin_token` 明文、不回传 `password_hash`**） |
+| `/_goproxy/config` | PATCH | 改 `default_ports` / `access_log` / `trusted_proxies` / `admin_token` / `admin_users` |
 | `/_goproxy/stats` | GET | 聚合状态：版本、uptime、指标汇总、熔断计数、采样曲线 |
 | `/_goproxy/logs` | GET | 最近 N 条访问记录，`?limit=200`（上限 1000） |
 | `/_goproxy/events` | GET | 实时访问日志，SSE 推送 |
 | `/_goproxy/reload` | POST | 手动触发重载 |
-| `/_goproxy/login` | POST | 用 `admin_token` 换取会话 Cookie（**在鉴权闸门之外**，见下节） |
-| `/_goproxy/session` | GET | 当前会话状态：`authenticated` / `via` / `has_session` / `token_set` |
+| `/_goproxy/login` | POST | 用 `{"username","password"}` 或 `{"token"}` 换取会话 Cookie（**在鉴权闸门之外**，见下节） |
+| `/_goproxy/session` | GET | 当前会话状态：`authenticated` / `via` / `has_session` / `username` / `token_set` |
 | `/_goproxy/session` | DELETE | 登出（吊销会话 + 清 Cookie；也接受 `POST`） |
+| 其余 `/_goproxy/` 下的路径 | 任意 | 通过认证后 404；**没配任何凭据时一律 403**，见下 |
 
-### 认证
+> **表里除了控制台静态页面，其余全部需要凭据**，包括三个探针 —— 本机访问也不例外。
+>
+> 为什么不给探针留豁免：探针一旦免认证，就等于给了未认证调用者一个「服务端是否活着、
+> 有哪些路由、错误率多少」的观测窗口，`/metrics` 更是把全部指标摊开。
+> 想给 Prometheus 用就配 `admin_token`，那是它本来就该有的配置项。
+
+### 管理端认证
 
 管理接口能改路由，等于能改流量走向，**不能裸奔**。
 
-控制台是网页，让用户把 `admin_token` 贴在浏览器里既不安全也不好用，
-所以管理端提供**三条**鉴权路径，任一通过即放行：
+v0.6.0 起管理端有**两条并列的凭据**，任一通过即放行：
 
-| 来源 | 要求 |
-|---|---|
-| 1. 回环地址（`127.0.0.1` / `::1`），且**不是经本进程代理转发进来的** | 免认证 |
-| 2. `Authorization: Bearer <admin_token>` | curl / 脚本 / Prometheus 用 |
-| 3. 会话 Cookie（控制台登录后拿到） | 浏览器用，`HttpOnly`，脚本读不到 |
+| 凭据 | 给谁用 | 怎么配 |
+|---|---|---|
+| **`admin_users`** —— 用户名 + bcrypt 密码哈希 | **给人**用，浏览器登录控制台 | `goproxy -hash-password '你的密码'` 生成哈希，填进 `admin_users[].password_hash` |
+| **`admin_token`** —— 一个 Bearer 令牌 | **给机器**用，脚本 / Prometheus / 监控探针 | `admin_token` 直接写字符串 |
 
-`admin_addr` 监听了非回环地址但没配 `admin_token` 时，**所有外部请求一律 403** ——
-宁可打不开，也不能让人随便改配置。
+两者可以同时配，也可以只配一个。**一个都不配时，所有管理接口（含三个探针）返回 403
+`admin_credentials_not_set`**，控制台会显示配置指引页。
 
-> 判断来源只认 `RemoteAddr`。`X-Forwarded-For` 是客户端随手就能写的头，
-> 拿它判断「是不是本机」等于把认证决定权交给攻击者。这条有单测和端到端验证盯着。
+> 改配置保存后**自动热重载，不用重启**。账号表是热重载时重建的，
+> 所以加账号、改密码、删账号都是保存即生效。
+
+#### 登录：从「贴令牌」改成「用户名 + 密码」
+
+v0.5.x 的做法是让用户在浏览器里贴 `admin_token`。这有两个问题：
+令牌是**机器凭据**，贴在浏览器里一旦泄露就是全权；而且它没法区分「谁」在操作。
+
+现在浏览器登录走真实的账号密码：
+
+```bash
+curl -s -X POST http://127.0.0.1:9080/_goproxy/login \
+  -d '{"username":"admin","password":"你的密码"}' -i
+# → 200，Set-Cookie: goproxy_admin_session=...
+```
+
+脚本仍然可以走令牌（`{"token":"..."}` 或直接 `Authorization: Bearer`），那条路没变。
+
+同时**回环免认证被彻底移除**：以前来自 `127.0.0.1` 的请求无条件放行，
+现在本机访问一样要凭据。这一条是「能看见登录页」的前提 ——
+只要还有免认证的回环路径，从本机打开控制台就永远绕过登录页，
+而线上排障又总是在本机做。
+
+#### 凭据合法性与会话有效性是同一件事
+
+会话里记的是**「哪个账号 + 该账号当前密码哈希」算出的指纹**：
+
+```go
+sessionFingerprintForUser(username, passwordHash)   // sha256("admin-user\0<name>\0<hash>")
+```
+
+于是：
+
+- **改密码 → 该账号所有会话立刻失效**（指纹变了），不需要额外的吊销机制；
+- **删账号 → 该账号所有会话立刻失效**（账号查不到，指纹为空）；
+- **两个账号碰巧同密码也不会串**（指纹里带了用户名）。
+
+令牌那条路同理，指纹是 `sha256(admin_token)`。
+
+> 热重载会重建账号表，这正是「改密码不用重启」生效的机制。
+
+#### 未知用户名也走一次 bcrypt
+
+用户名不存在时，服务端**仍然对一个固定的占位哈希跑一次 bcrypt 比对**才返回错误。
+
+不这么做的话，「用户名不存在」会立刻返回，而「密码错误」要等几十毫秒的 bcrypt ——
+攻击者用响应时间就能枚举出哪些用户名是真的。登录接口本身有恒定 ~400ms 的兜底延时，
+但那是**总时长**的兜底，挡不住「先返回 vs 后返回」这种更细的差异，所以这一层必须自己做。
+
+实测：**错密码与不存在的用户名返回的 401 响应体逐字节相同**（端到端测试里断言了这一点，
+不是靠"看着差不多"）。
 
 #### 控制台登录（会话）
 
-浏览器打开控制台时，如果没有会话，会看到一个令牌输入框：
+浏览器打开控制台时，如果没有会话，会看到**用户名 + 密码**的登录表单：
 
-1. `POST /_goproxy/login`，body `{"token":"<admin_token>"}`
-2. 校验通过 → 下发 `HttpOnly` 会话 Cookie，**前端立刻丢弃内存里的令牌**
-3. 之后所有请求靠 Cookie 鉴权；用户再也看不到、也不需要持有令牌
-
-令牌本身**不落任何持久化存储**：前端只放在模块级内存变量里，
-刷新页面即丢失，所以每次刷新都要重新登录（对单机自托管是可接受的取舍）。
+1. `POST /_goproxy/login`，body `{"username":"admin","password":"..."}`
+2. 校验通过 → 下发 `HttpOnly` 会话 Cookie，**前端不保留任何密码**
+3. 之后所有请求靠 Cookie 鉴权；密码用完即从组件状态里清掉
 
 会话的几个关键设计：
 
@@ -244,9 +356,10 @@ cd web && npm run dev
 | 绝对超时 | 12 小时（不延长） | 不能靠「一直点」无限续期 |
 | 服务端存储 | 只存 `sha256(handle)` | 内存被 dump 也拿不到可用句柄 |
 | 上限 | 128 条 | 防内存无限增长 |
-| 绑定令牌指纹 | `sha256(admin_token)` | **改 `admin_token` 即全部会话立刻失效**，不需要额外的吊销机制 |
+| 绑定 | 账号密码哈希指纹，或令牌指纹 | 改密码 / 改令牌即相关会话立刻失效 |
 
 登出走 `DELETE /_goproxy/session`（也接受 `POST`），会吊销会话并清 Cookie。
+控制台顶栏会显示当前登录的用户名，旁边就是登出按钮。
 
 ##### 登录防爆破
 
@@ -255,7 +368,7 @@ cd web && npm run dev
 | 单 IP 失败封禁 | 5 次 → 10 分钟 |
 | 全局失败封禁 | 50 次 → 1 分钟（挡换 IP 池） |
 | 响应时间 | 恒定 ~400ms，抹平时序侧信道 |
-| 失败响应 | 空令牌与错令牌**完全一致**（否则等于告诉攻击者服务端有没有配令牌） |
+| 失败响应 | 用户名不存在 / 密码错误 / 空凭据**完全一致** |
 
 `429` 会带 `Retry-After`（加了抖动，避免所有客户端同时重试）。
 
@@ -270,7 +383,7 @@ cd web && npm run dev
 | 场景 | 策略 | 理由 |
 |---|---|---|
 | 会话写请求 | **fail-closed**：缺头即拒 | 能走到这里说明带了 Cookie，而浏览器跨站写请求**一定**会发 `Origin`；缺头就可疑 |
-| 登录请求 | **fail-open**：缺头放行 | 登录本来就没有 Cookie，curl/脚本也不发这两个头。跨站攻击**一定**会发 `Origin`/`Sec-Fetch-Site`，所以放行的只是「本来就非浏览器」的请求，不构成 CSRF 面。一律 fail-closed 会让 `curl -d '{"token":...}' /_goproxy/login` 直接 403 |
+| 登录请求 | **fail-open**：缺头放行 | 登录本来就没有 Cookie，curl/脚本也不发这两个头。跨站攻击**一定**会发 `Origin`/`Sec-Fetch-Site`，所以放行的只是「本来就非浏览器」的请求，不构成 CSRF 面。一律 fail-closed 会让 `curl -d '{"username":...,"password":...}' /_goproxy/login` 直接 403 |
 
 ##### 为什么 `/login` 必须在鉴权闸门**之外**
 
@@ -282,6 +395,26 @@ cd web && npm run dev
 
 放行不等于不设防，两条路径各自带完整防护（见上面的防爆破与 CSRF 表）。
 其余所有管理接口仍然一律经过 `adminGuard`，没有任何豁免。
+
+##### 没有凭据时控制台看到什么
+
+「有意拒绝」和「配置漏了」在现象上一样，都是打不开，所以这里把两者分开：
+
+| 状态 | HTTP | 错误码 | 控制台 |
+|---|---|---|---|
+| 凭据已配、未登录 | 401 | `unauthorized` | 用户名 + 密码登录表单 |
+| 凭据已配、登录中填错 | 401 | `unauthorized` | 表单 + 错误提示 |
+| **一个凭据都没配** | **403** | **`admin_credentials_not_set`** | **配置指引页**（含 `config.json` 片段和生成哈希的命令） |
+
+`GET /_goproxy/session` 在未登录时也会带上 `"credentials_configured": false`，
+前端靠它决定显示表单还是指引页 —— 只用状态码判断的话，这两种情况都是「没登录」。
+
+`POST /_goproxy/login` 在没配凭据时同样返回 **403 而不是 401**：
+401 意味着「你密码错了」，会让人一直重试一个根本不存在的账号；
+403 才能让前端正确地切到「去配置」那条路。
+
+启动时也会打四条明确的 WARN，把 `admin_addr`、控制台路径、两种凭据的区别、
+以及生成哈希的命令一次说清楚，不用去翻文档。
 
 #### 安全响应头
 
@@ -316,51 +449,41 @@ cd web && npm run dev
 
 详情只进服务端日志（带同一个 `error_id`），排查时按编号对账。
 
-#### 为什么「回环免认证」还要额外加一个条件
+#### 为什么不再有「回环免认证」
 
-光看 `RemoteAddr` 是不够的，因为**代理转发到管理端口时，源地址就是 `127.0.0.1`**。
-于是「把某条路由的 `target` 指向管理端口」就等于给外部客户端开了一道免认证的后门：
+v0.5.x 有一条「来自回环地址的请求免认证」的捷径，并且额外加了一个条件来堵它的洞
+（因为**代理转发到管理端口时源地址就是 `127.0.0.1`**，把某条路由的 `target` 指向管理端口
+就等于给外部客户端开了一道免认证后门）。那个条件本身是对的，但整个前提在 v0.6.0 被删掉了：
 
-```jsonc
-// 危险配置示例：外部访问 8081 就能白拿全部管理权限
-{ "id": "bad", "listen_port": 8081, "path_prefix": "/",
-  "target": "http://127.0.0.1:9080" }
-```
+**只要还存在任何一条免认证路径，控制台的登录页就永远可能被绕过去。**
 
-实测确认过：这样经代理访问 `/_goproxy/config`、甚至 `POST /_goproxy/reload`
-都是 `200`，等于完全接管（改路由 = 劫持全部流量）。
+这条捷径的问题不在安全性（后门已经堵上），而在可用性：
 
-所以代理转发时会写入一个标记头，管理端**只要看到这个头就按外部请求处理**，
-不再因为来源是回环而放行。这个头不需要保密，也不靠保密生效：
+- 从本机浏览器打开控制台 → 直接进界面，**永远看不到登录页**，用户会以为「没有登录功能」；
+- 而线上排障、装机自检又总是在本机做，于是**这个 bug 只在别人从局域网访问时才暴露**；
+- 排障时你会看到「本机好的、别人 401」，很容易去怀疑网络或防火墙。
 
-- 伪造它只会让判断更严，对攻击者不利；
-- 省略它也躲不开 —— 经代理进来的请求，代理一定会写进去。
+现在一律要凭据，路径只有一条，行为在任何来源下都一致。
 
-反过来，用一条 TLS 路由把管理面板发布出去（比如 `host: admin.example.com`）
-**是完全可行的**，只是访问它时必须带令牌（或先登录）—— 因为那确实是一次外部访问。
+> 判断来源仍然只认 `RemoteAddr`，`X-Forwarded-For` 依旧被无视 ——
+> 那条头是客户端随手就能写的，拿它判断「是不是本机」等于把认证决定权交给攻击者。
+> 相关断言保留在测试里，作用是**防止有人日后悄悄把基于来源的判断加回来**。
 
-#### `admin_trust_loopback`
-
-```jsonc
-{ "admin_trust_loopback": false }
-```
-
-默认 `true`（保持本机 curl / 脚本免令牌的习惯）。当管理端口前面**还挂着别的本地反向代理**
-（nginx、Caddy 等）时应当设为 `false`：那种转发同样来自 `127.0.0.1`，
-且不会带本进程的标记头，「回环 = 本机运维」这个前提就不成立了。
-
-可以运行时改（`PATCH /_goproxy/config`），不用重启。
+把控制台通过一条 TLS 路由发布出去（比如 `host: admin.example.com`）**仍然可行**，
+访问它时正常登录即可 —— 那就是一次普通的外部访问，和本机访问没有任何区别。
 
 ### 用法
 
 ```bash
 A=http://127.0.0.1:9080
+# 管理接口一律要凭据，本机也一样。脚本用令牌最省事：
+T='Authorization: Bearer 你的 admin_token'
 
 # 看路由（含熔断状态、请求数、在途数等实时值）
-curl -s $A/_goproxy/routes | jq .
+curl -s -H "$T" $A/_goproxy/routes | jq .
 
 # 新建：同一个 IP 再开一个端口指向别的后端
-curl -s -X POST $A/_goproxy/routes -d '{
+curl -s -H "$T" -X POST $A/_goproxy/routes -d '{
   "id": "svc-e", "name": "服务E",
   "listen_port": 8090, "path_prefix": "/",
   "target": "http://127.0.0.1:9005"
@@ -368,23 +491,31 @@ curl -s -X POST $A/_goproxy/routes -d '{
 # → 端口 8090 立刻开始监听，不用重启也不用改启动参数
 
 # 停用 / 启用（PATCH 只覆盖你写了的字段）
-curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"enabled": false}'
-curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"enabled": true}'
+curl -s -H "$T" -X PATCH $A/_goproxy/routes/svc-e -d '{"enabled": false}'
+curl -s -H "$T" -X PATCH $A/_goproxy/routes/svc-e -d '{"enabled": true}'
 
 # 改限流，其它字段原样保留
-curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"rate_limit": {"rps": 20, "burst": 40}}'
+curl -s -H "$T" -X PATCH $A/_goproxy/routes/svc-e -d '{"rate_limit": {"rps": 20, "burst": 40}}'
 
 # 清掉某项嵌套配置：显式传 null
-curl -s -X PATCH $A/_goproxy/routes/svc-e -d '{"rate_limit": null}'
+curl -s -H "$T" -X PATCH $A/_goproxy/routes/svc-e -d '{"rate_limit": null}'
 
 # 删除
-curl -s -X DELETE $A/_goproxy/routes/svc-e
+curl -s -H "$T" -X DELETE $A/_goproxy/routes/svc-e
 ```
 
-管理端口开到外网时：
+没有配 `admin_token` 时（只用了 `admin_users`），要么给脚本也配一个令牌，要么用会话 Cookie：
 
 ```bash
-# config.json 里设置 admin_token 后
+# 登录拿 Cookie，之后 -b 带上
+curl -s -c /tmp/gp.jar -X POST $A/_goproxy/login \
+  -d '{"username":"admin","password":"你的密码"}'
+curl -s -b /tmp/gp.jar $A/_goproxy/routes | jq .
+```
+
+管理端口开到外网时同理，认证和来源无关：
+
+```bash
 curl -s -H "Authorization: Bearer $TOKEN" http://10.0.0.5:9080/_goproxy/routes
 ```
 
@@ -395,9 +526,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://10.0.0.5:9080/_goproxy/routes
 写请求带上 `If-Match` 即可让服务端把过期写拒掉：
 
 ```bash
-ETAG=$(curl -sI $A/_goproxy/routes | tr -d '\r' | awk '/^Etag:/ {print $2}')
+ETAG=$(curl -sI -H "$T" $A/_goproxy/routes | tr -d '\r' | awk '/^Etag:/ {print $2}')
 
-curl -s -X POST $A/_goproxy/routes \
+curl -s -H "$T" -X POST $A/_goproxy/routes \
   -H "If-Match: $ETAG" \
   -d '{"id":"new","listen_port":8091,"target":"http://127.0.0.1:9006"}'
 # 若期间已有别人改过配置 → 409 revision_mismatch
@@ -419,13 +550,17 @@ curl -s -X POST $A/_goproxy/routes \
 - **`admin_addr` 不能通过接口改**（启动期就绑定了套接字，改了不生效），改它请编辑文件后重启；
   显式返回 400 而不是假装成功。
 - **`admin_addr` 写 `off` / `none` / `disabled` 可彻底关闭管理端口**；留空表示用默认值。
+- **`admin_users` 读得到、写也写得进，但回显里没有密码材料**：
+  `GET /_goproxy/config` 只返回用户名列表（`admin_users: ["admin"]`），
+  `password_hash` 从不回传 —— 它是可以直接拿去爆破的东西，没有理由发到浏览器。
+  通过 PATCH 提交 `admin_users` 会整表替换，记得把哈希一起带上。
 
 > **破坏性变更**：`GET /_goproxy/routes` 现在返回**完整路由配置**（加上 `live` 实时字段），
 > 不再是早先那个只有几个计算字段的精简形状。编辑界面需要拿到可回写的完整字段。
 
 ```bash
-curl -s http://127.0.0.1:9080/_goproxy/routes | jq .
-curl -s http://127.0.0.1:9080/metrics | grep goproxy_requests_total
+curl -s -H "$T" http://127.0.0.1:9080/_goproxy/routes | jq .
+curl -s -H "$T" http://127.0.0.1:9080/metrics | grep goproxy_requests_total
 ```
 
 ---
@@ -434,10 +569,14 @@ curl -s http://127.0.0.1:9080/metrics | grep goproxy_requests_total
 
 管理台需要的数据在这一层就取全了，前端不必去解析 Prometheus 文本。
 
+> 下面三条**都要认证**，示例里统一用 `T='Authorization: Bearer <admin_token>'`。
+> Prometheus 抓取 `/metrics` 同理，在 scrape config 里配 `authorization: {credentials: <token>}`。
+
 ### `GET /_goproxy/stats` —— 一次拿全所有看板数字
 
 ```bash
-curl -s http://127.0.0.1:9080/_goproxy/stats | jq '{uptime_seconds, routes_active, ports, summary, circuit}'
+curl -s -H "$T" http://127.0.0.1:9080/_goproxy/stats \
+  | jq '{uptime_seconds, routes_active, ports, summary, circuit}'
 ```
 
 关键字段：
@@ -459,7 +598,8 @@ curl -s http://127.0.0.1:9080/_goproxy/stats | jq '{uptime_seconds, routes_activ
 ### `GET /_goproxy/logs` —— 最近 N 条
 
 ```bash
-curl -s "http://127.0.0.1:9080/_goproxy/logs?limit=20" | jq '.entries[] | {seq, status, path, blocked}'
+curl -s -H "$T" "http://127.0.0.1:9080/_goproxy/logs?limit=20" \
+  | jq '.entries[] | {seq, status, path, blocked}'
 ```
 
 返回结构化字段（不是格式化好的日志文本，省得前端再解析一遍）。`blocked` 非空表示
@@ -469,7 +609,7 @@ curl -s "http://127.0.0.1:9080/_goproxy/logs?limit=20" | jq '.entries[] | {seq, 
 ### `GET /_goproxy/events` —— SSE 实时推送
 
 ```bash
-curl -N http://127.0.0.1:9080/_goproxy/events
+curl -N -H "$T" http://127.0.0.1:9080/_goproxy/events
 ```
 
 ```
@@ -491,6 +631,41 @@ data: {"seq":129,"time":"2026-09-15T22:44:49.284+08:00","route":"r1","port":8081
 >
 > 订阅者慢（标签页切到后台、网络卡住）时消息**直接丢**并计数，不会阻塞请求路径 ——
 > 访问日志这种顺手做的事，绝不该有能力把整个代理拖死。
+
+---
+
+## 探针与健康检查
+
+`/healthz`、`/readyz`、`/metrics` 三条路径**都要求凭据**（v0.6.0 起，本机访问也不例外）。
+
+这几条配起来比业务接口更容易踩坑，因为**配置它们的地方往往不支持自定义请求头**：
+
+| 场景 | 怎么配 |
+|---|---|
+| Prometheus | scrape config 里加 `authorization: {type: Bearer, credentials: <admin_token>}` |
+| Kubernetes 探针 | `httpGet` 支持 `httpHeaders`，带上 `Authorization: Bearer <token>` |
+| `docker-compose` | 健康检查是 `CMD-SHELL`，直接写 `wget --header=...`（见下） |
+| systemd / 简单脚本 | 用 `nc -z 127.0.0.1 9080` 只探端口是否在听，绕开 HTTP 认证 |
+
+`docker-compose.yml` 里的健康检查已经改好，写法值得抄：
+
+```yaml
+test:
+  - CMD-SHELL
+  - >-
+    wget -qO- --header="Authorization: Bearer $$GPROXY_ADMIN_TOKEN"
+    http://127.0.0.1:9080/healthz | grep -q '^ok'
+environment:
+  GPROXY_ADMIN_TOKEN: ${GPROXY_ADMIN_TOKEN:-}
+```
+
+> **`$$` 是必须的**：compose 先把 `$` 当变量插值处理，写单个 `$` 的话
+> `$GPROXY_ADMIN_TOKEN` 会在 compose 解析阶段就被替换成宿主机的值（没设就是空串），
+> 到容器里就变成 `Authorization: Bearer ` —— 探针恒定 401，而 `docker ps` 只显示 unhealthy，
+> 看不出是变量没传进去。`$$` 才是「交给容器内部展开」。
+>
+> 只用 `admin_users`、没有 `admin_token` 的部署，`environment` 里那行拿不到值，
+> 健康检查会失败 —— 那就改用 `nc -z 127.0.0.1 9080`（探端口，不探 HTTP）。
 
 ---
 
@@ -775,7 +950,9 @@ curl -s http://127.0.0.1:9080/_goproxy/certs | jq .
 | 路由变更审计 | 写接口目前不记录「谁在什么时候改了哪条路由」。多人共用管理端时会需要 |
 | 多实例共享状态 | 限流和熔断都是进程内内存，多副本各算各的。另外**写配置也是单机行为**，两个实例各写各的会互相覆盖，多副本场景需要换成共享存储 + 一致性协议。预留了接口，后续换 Redis / SQLite |
 | 会话持久化 | 会话存在进程内存里，**重启即全部失效**。对单机自托管是可接受的取舍（换来的是「不引入存储依赖」）。要跨重启保持登录就得引入存储 |
-| 多用户 / 权限分级 | 只有「知道 `admin_token` 就能全权操作」这一档。没有只读账号、没有按路由授权 |
+| 权限分级 | 有多个账号了，但**账号之间没有权限差别** —— 任一账号登录后都是全权。没有只读账号、没有按路由授权 |
+| 改密码要手工 | 没有「修改密码」界面。靠 `goproxy -hash-password` 生成哈希再改 `config.json`（保存即生效）。加界面要引入「改密时验证旧密码」「强制复杂度」等一串决策，暂不做 |
+| 账号数量无上限但也没约束 | `admin_users` 里放多少人都行，不过它是配置文件里的明文结构 —— 适合 1~5 个运维账号，不是给终端用户用的用户体系 |
 | CSP 的 `style-src` 内联 | 保留 `'unsafe-inline'`，因为 React 的 `style={{...}}` 产出内联样式属性。去掉需要把动态样式全改成 CSS 变量，收益不抵成本 |
 
 ---
@@ -827,16 +1004,72 @@ curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh
 > 用 jsdelivr 取脚本而不是 `raw.githubusercontent.com`，因为后者在国内经常连不上。
 > 脚本内部下载 Release 时也会自动挑加速通道，见下。
 
-脚本做的事：自动识别 amd64/arm64、校验 sha256（对不上直接中止）、**已存在的 `config.json` 不会被覆盖**、创建 `goproxy` 系统用户并以非 root 运行。装完按提示改配置，然后：
+脚本做的事：自动识别 amd64/arm64、校验 sha256（对不上直接中止）、**已存在的 `config.json` 不会被覆盖**、
+创建 `goproxy` 系统用户并以非 root 运行、**交互式引导你设置一个管理员账号**。
+装完按提示改配置，然后：
 
 ```bash
 sudo systemctl enable --now goproxy
 sudo journalctl -u goproxy -f
 ```
 
-起来之后浏览器打开 **`http://<服务器IP>:9080/`** 就是管理控制台。
-如果要把控制台开放到非本机访问，记得先改 `admin_addr` 并设置 `admin_token`
-（默认的 `127.0.0.1:9080` 只有本机能连，最安全）。
+**从 v0.6.0 起安装过程会多问一步**（这是用户反馈「没见到登录界面」之后加的）：
+
+```
+----------------------------------------
+ 设置管理控制台的登录账号
+----------------------------------------
+控制台现在需要用户名 + 密码登录。请现在设置一个，
+否则从浏览器打开会看到「还没有配置管理员账号」。
+（以后也可以用: goproxy -hash-password '密码' 自己改）
+
+用户名 [admin]: 
+密码: 
+再输一次: 
+ OK 已设置管理账号「admin」（密码只以 bcrypt 哈希形式保存，脚本不留副本）
+```
+
+几个细节：
+
+- **密码不回显、要输两次**。它要进 bcrypt，打错了自己看不出来，只能靠登录失败才发现。
+- **哈希由二进制自己算**（调 `goproxy -hash-password`），不在脚本里重新实现一遍 bcrypt ——
+  服务端用什么校验、这里就生成什么，不可能出现「算出来的哈希验不过」这种极难排查的故障。
+- **不用 sudo 跑也能问**；非交互环境（`curl | sudo bash` 在 CI 里、容器里）读不到 `/dev/tty`，
+  会**跳过提问并打印手动补法**，不会把你挂在那儿等输入。
+- **升级时只在「一个凭据都没有」才问**。已经有 `admin_token` 或者 `admin_users` 的环境
+  不会被反复打扰（`admin_token` 依然有效，老的脚本不用改）。
+
+装完的收尾提示会直接把控制台地址和「有没有账号能进去」写出来：
+
+```
+  二进制    /usr/local/bin/goproxy
+  配置文件  /etc/goproxy/config.json
+  控制台    http://127.0.0.1:9080/_goproxy/ui/
+
+控制台登录：用刚才设置的用户名 + 密码。
+```
+
+> 别指望「装完就能从浏览器进去」这件事自动成立 —— 收尾提示里这句话是有意加的。
+> 之前装完只说二进制和配置文件路径，用户打开管理端口看到的是「已拒绝所有外部请求」，
+> 完全不知道下一步该干什么。
+
+起来之后浏览器打开 **`http://<服务器IP>:9080/`** 就是管理控制台（要先登录）。
+默认的 `admin_addr` 是 `127.0.0.1:9080`，只有本机能连；要开放到局域网/公网就改 `admin_addr`，
+并**建议同时配一个 `admin_token`** 给探针用 —— 探针不方便走账号登录。
+
+### 无人值守安装
+
+CI / 容器 / 批量部署跳过交互提问：
+
+```bash
+curl -fsSL .../install.sh | sudo bash -s -- --no-admin-prompt
+# 或
+curl -fsSL .../install.sh | sudo NO_ADMIN_PROMPT=1 bash
+```
+
+这样装出来的环境**一个凭据都没有**，管理接口全部 403。要注意这是**预期行为**而不是坏了 ——
+装完记得用 `goproxy -hash-password` 补账号，或者准备好 `admin_token`。
+（脚本收尾也会提醒这一条。）
 
 ### 国内网络：脚本会自动走加速镜像
 
@@ -873,6 +1106,9 @@ curl -fsSL .../install.sh | sudo MIRROR=https://gh-proxy.com/ bash
 ```bash
 # 指定版本（推荐，避免 latest 解析依赖网络）
 curl -fsSL .../install.sh | sudo VERSION=v0.3.0 bash
+
+# 无人值守：跳过设置管理员账号那一步
+curl -fsSL .../install.sh | sudo bash -s -- --no-admin-prompt
 
 # 容器里用：只装二进制，不碰 systemd
 curl -fsSL .../install.sh | sudo bash -s -- --no-service
@@ -970,6 +1206,43 @@ systemctl show -p ExecMainStartTimestamp goproxy   # 重启时间应该是刚刚
 
 ---
 
+## 命令行
+
+```bash
+goproxy [-c 配置文件] [-log-level 级别] [-text-log] [-version] [-hash-password 密码]
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-c <路径>` | `config.json` | 配置文件路径（**是 `-c`，不是 `-config`**） |
+| `-log-level <级别>` | `info` | `debug` / `info` / `warn` / `error` |
+| `-text-log` | 关 | 输出人类可读的文本日志。默认是 JSON，方便接日志系统 |
+| `-version` | — | 打印版本与 commit 后退出 |
+| `-hash-password <密码>` | — | 把密码算成 bcrypt 哈希后退出，用于填进 `config.json` |
+
+**`goproxy -hash-password` 是设置/修改管理密码的唯一入口**：
+
+```bash
+goproxy -hash-password '你的新密码'
+# stdout 只有哈希本身：$2a$10$...
+# 提示语走 stderr，所以可以直接 $(...) 取用，不会被污染
+```
+
+```jsonc
+// 把输出填进这里，保存后自动热重载（不用重启）
+{ "admin_users": [{ "username": "admin", "password_hash": "$2a$10$..." }] }
+```
+
+> 为什么不在文档里教你装个 `htpasswd` 或写段 Python 算 bcrypt：
+> cost 参数、salt 生成、编码任意一处不一致，症状都是「登录永远失败」而没有任何报错。
+> 用这个命令拿到的哈希，和**服务端校验用的是同一个库、同一份实现**，不可能对不上。
+> `install.sh` 生成哈希走的也是这一条路。
+
+也可以直接在 `config.json` 里写明文 `"password": "..."`（和路由的 Basic 认证一致），
+启动时会打一条 WARN 并把算好的哈希打印出来，粘回去即可。
+
+---
+
 ## 手动编译部署
 
 ```bash
@@ -1060,6 +1333,7 @@ docker build -t goproxy:demo . && docker run --network host \
 | `main.go` | 组装、请求入口、管理端点注册、配置热重载、优雅停机 |
 | `config.go` | 配置结构与校验、配置文件的原子写入与 revision |
 | `admin_api.go` | 管理接口：认证闸门、路由 CRUD、全局配置读写、登录与会话端点 |
+| `admin_users.go` | 管理端账号表：bcrypt 校验、按账号算会话指纹、未知用户名的恒定耗时兜底 |
 | `session.go` | 控制台登录会话：只存句柄哈希、空闲/绝对过期、登录限流、CSRF 同源校验 |
 | `secheaders.go` | 安全响应头与 CSP（控制台与接口用两套策略） |
 | `router.go` | 三级匹配表（端口 → host → path），不可变快照 |
@@ -1081,12 +1355,12 @@ docker build -t goproxy:demo . && docker run --network host \
 | `governance_test.go` | 熔断、ACL、JWT、Basic 单测 |
 | `admin_api_test.go` | 管理接口单测：CRUD、并发写冲突、认证、坏配置不落盘 |
 | `stats_test.go` | 环形缓冲、采样序列、SSE、并发重载单测 |
-| `webui_test.go` | 控制台托管单测：内嵌资源、缓存头、SPA 回落、静态壳免鉴权但接口仍鉴权 |
+| `webui_test.go` | 控制台托管单测：内嵌资源、缓存头、SPA 回落、静态壳免鉴权但接口一律鉴权 |
 | `tls_test.go` | TLS 单测：按 SNI 分发、通配匹配、热加载、续期告警阈值、跳转逻辑、ACME 约束 |
 | `example_config_test.go` | 守卫测试：`config.example.json` 必须能加载，部署文件必须暴露 443 |
 | `deploy_test.go` | 部署守卫：单元 `ReadWritePaths` 含配置目录、`install.sh` 改属主、Dockerfile `chown`、compose 挂目录而非单文件 |
-| `session_test.go` | 会话与登录单测：存储哈希、过期、限流、Cookie 属性、CSRF、端点可达性、恒定耗时 |
-| `scripts/e2e_console.py` | 端到端自检：真实后端 + 真实反代，107 项断言（含认证与会话一节） |
+| `session_test.go` | 会话与登录单测：存储哈希、过期、限流、Cookie 属性、CSRF、端点可达性、恒定耗时、账号指纹失效 |
+| `scripts/e2e_console.py` | 端到端自检：真实后端 + 真实反代，**121 项断言**（含认证、账号登录、负向验证） |
 
 ```bash
 go test ./...   # 跑测试
@@ -1095,7 +1369,10 @@ go vet ./...    # 静态检查
 # 端到端自检：会用真实二进制起 4 个测试后端 + 反代，
 # 覆盖控制台依赖的全部接口（静态资源、根路径分流、限流/认证真实流量、
 # stats/logs、SSE、路由 CRUD + ETag 并发、全局配置、Prometheus 指标、
-# 以及三条鉴权路径 / 登录 / CSRF / 登出 / 安全响应头）。
+# 以及「无凭据一律拒绝」/ 账号密码登录 / CSRF / 登出 / 安全响应头）。
+# 里面有几条是**负向断言**，值得单独提一句：
+#   · 错密码与「用户名不存在」的 401 响应体必须逐字节相同（防用户名枚举）
+#   · 一个凭据都没配时，回环地址访问三个探针也必须 403（防回环豁免复活）
 # 需要 PATH 里有 go 和 python3；产物都落在临时目录，不污染工作区。
 python scripts/e2e_console.py
 ```
@@ -1117,14 +1394,19 @@ TLS 另有两个实机端到端脚本（在仓库外的开发目录里，自签�
 
 ## 下一步
 
-已完成 M1–M4（含 TLS / ACME 自动证书）、管理写接口、监控数据源、管理控制台前端，
-以及**登录 / 会话 / 安全加固**（三条鉴权路径、会话 Cookie、防爆破、CSRF、安全响应头）。
+已完成 M1–M4（含 TLS / ACME 自动证书）、管理写接口、监控数据源、管理控制台前端、
+**登录 / 会话 / 安全加固**（会话 Cookie、防爆破、CSRF、安全响应头），
+以及**多用户账号体系与强制登录**（用户名 + 密码、本机不再豁免、探针也要认证）。
 
 接下来：
 
 - **配置源换成 SQLite（M5 正式版）** —— `loadConfig` 换掉即可，HTTP 层与前端不动
-- 审计日志：记录「谁在什么时候改了哪条路由」
-- 多用户与权限分级（现在只有「知道 `admin_token` 即全权」一档）
+- 审计日志：记录「谁在什么时候改了哪条路由」（多账号之后这件事才有意义，见下）
+- 权限分级：账号之间现在没有区别，任一账号都是全权
+
+> 提到审计日志是因为它和多账号是同一件事的两半：有了 `admin_users` 之后，
+> 写接口已经知道「是谁在操作」了，缺的只是把 `username` 记进审计记录。
+> 现在多个账号能登录，但**改了什么、谁改的**依然查不到。
 
 > 完整的架构方案、数据模型与里程碑计划不在这个仓库里。
 

@@ -11,13 +11,18 @@ package main
 //
 //	HttpOnly  → JS 读不到（XSS 也偷不走）
 //	短寿命    → 空闲 30 分钟、绝对 12 小时，被偷了也只在一个窗口内有效
-//	可吊销    → 登出即失效；改 admin_token 可以让全部会话立即下线
+//	可吊销    → 登出即失效；改密码 / 删账号 / 改 admin_token 都能让相关会话立即下线
 //
-// 三条鉴权路径并存，任一通过即放行（见 adminGuard）：
+// 两条鉴权路径并存，任一通过即放行（见 adminGuard）：
 //
-//	回环直连（且非经本进程代理转发）｜ Bearer <admin_token> ｜ 会话 Cookie
+//	Bearer <admin_token> ｜ 会话 Cookie
 //
-// Bearer 保留是为了 curl / 脚本 / Prometheus 这些非浏览器客户端，不打算废弃。
+// v0.6.0 起**回环地址不再免认证**。以前「回环直连」是第三条路径，代价是同一个
+// 配置在本机访问和外部访问下表现完全不同（本机直接进、外部被拒或被要求登录），
+// 很难排查，也让「登录页到底会不会出现」取决于你从哪台机器打开 —— 用户实际
+// 反馈过「没见到登录界面」，根因就在这里。现在一律要凭据，行为各处一致。
+//
+// Bearer 保留是为了 curl / 脚本 / Prometheus 这些非浏览器客户端。
 
 import (
 	"crypto/rand"
@@ -65,8 +70,8 @@ const (
 
 // 登录接口的加固参数
 const (
-	// loginConstantDelay 固定响应耗时。令牌比对本身是 constant time，
-	// 但「格式明显不对」和「比对到最后一个字节才失败」的耗时仍然不同，
+	// loginConstantDelay 固定响应耗时。密码比对走 bcrypt，本身就比字符串比对慢得多，
+	// 但「用户名不存在」「密码错」「限流拒绝」这些分支的耗时依然不同，
 	// 用固定延迟把这类时序侧信道抹平。
 	loginConstantDelay = 400 * time.Millisecond
 
@@ -83,12 +88,21 @@ const (
 // session 是一条登录态。handle 的明文只存在于客户端 Cookie 里，
 // 服务端只存 sha256(handle)，所以内存被读走也无法直接冒用。
 type session struct {
-	// tokenFingerprint 是登录时的 sha256(admin_token)。
+	// fingerprint 是这条会话的「绑定指纹」，登录时算好。
 	//
-	// 会话与令牌绑定：每个请求都会拿当前 admin_token 的指纹和它比对，
-	// 不一致即失效。这样「改 admin_token」天然就等于「所有会话立即下线」，
-	// 不需要单独实现一套吊销机制，也不会出现「改了令牌但旧会话还活着」的窗口。
-	tokenFingerprint string
+	// 两种登录方式指纹来源不同：
+	//   - 用户名密码登录：sessionFingerprintForUser(用户名, 该账号当前密码哈希)
+	//   - Bearer 令牌登录：tokenFingerprint(admin_token)
+	//
+	// 每个请求都会拿**当前配置**重算一次指纹并比对，不一致即失效。于是：
+	//   - 改某账号密码 / 删该账号 → 该账号所有会话立刻下线
+	//   - 改 admin_token        → 用令牌登录的会话立刻下线
+	// 不需要另写一套吊销机制，也不会出现「改了密码但旧会话还活着」的窗口。
+	fingerprint string
+
+	// username 是登录者。令牌登录时为空串。
+	// 只用于展示（控制台显示「当前登录：alice」）与日志，不参与鉴权判断。
+	username string
 
 	createdAt time.Time
 	lastSeen  time.Time
@@ -97,6 +111,15 @@ type session struct {
 	ip string
 	ua string
 }
+
+// authVia 说明一个请求是靠什么通过鉴权的。
+type authVia string
+
+const (
+	viaNone    authVia = "none"
+	viaSession authVia = "session"
+	viaBearer  authVia = "bearer"
+)
 
 type loginAttempt struct {
 	failures int
@@ -149,7 +172,7 @@ func hashHandle(handle string) string {
 //
 // 登录即轮换句柄：不复用任何客户端提供的值，所以不存在会话固定攻击
 // （攻击者先给受害者塞一个自己知道的句柄，等对方登录后被自己接管）。
-func (s *sessionStore) create(token, ip, ua string) (string, time.Time, error) {
+func (s *sessionStore) create(username, fingerprint, ip, ua string) (string, time.Time, error) {
 	handle, err := newSessionHandle()
 	if err != nil {
 		return "", time.Time{}, err
@@ -168,21 +191,28 @@ func (s *sessionStore) create(token, ip, ua string) (string, time.Time, error) {
 	}
 
 	s.sessions[hashHandle(handle)] = &session{
-		tokenFingerprint: tokenFingerprint(token),
-		createdAt:        now,
-		lastSeen:         now,
-		ip:               ip,
-		ua:               ua,
+		fingerprint: fingerprint,
+		username:    username,
+		createdAt:   now,
+		lastSeen:    now,
+		ip:          ip,
+		ua:          ua,
 	}
 	return handle, now.Add(sessionAbsoluteTimeout), nil
 }
 
-// lookup 校验句柄，返回是否有效。有效时顺带滑动续期。
+// lookup 校验句柄，返回 (是否有效, 登录用户名)。有效时顺带滑动续期。
 //
-// token 是**当前**的 admin_token：指纹不一致说明令牌被换过，这条会话作废。
-func (s *sessionStore) lookup(handle, token string) bool {
+// fingerprintOf 是由调用方传入的**当前指纹回调**，而不是直接传一个字符串。
+// 原因是两种登录方式的指纹算法不同（用户名密码 vs Bearer 令牌），
+// 而会话里只存了结果、没存它当初用的是哪种方式；把它做成回调，
+// 由 adminGuard 按「会话里记的用户名」决定怎么算，这里的校验逻辑就与方式无关了。
+//
+// 回调返回空串表示「该凭据在当前配置下已不存在」（账号被删了 / 令牌被清空了），
+// 这时会话一律拒绝 —— 不需要额外判断。
+func (s *sessionStore) lookup(handle string, fingerprintOf func(string) string) (bool, string) {
 	if handle == "" {
-		return false
+		return false, ""
 	}
 	now := s.now()
 	key := hashHandle(handle)
@@ -192,29 +222,30 @@ func (s *sessionStore) lookup(handle, token string) bool {
 
 	sess, ok := s.sessions[key]
 	if !ok {
-		return false
+		return false, ""
 	}
 
 	// 绝对上限：到点就作废，不因为「一直在用」而无限续命
 	if now.Sub(sess.createdAt) > sessionAbsoluteTimeout {
 		delete(s.sessions, key)
-		return false
+		return false, ""
 	}
 	// 空闲上限
 	if now.Sub(sess.lastSeen) > sessionIdleTimeout {
 		delete(s.sessions, key)
-		return false
+		return false, ""
 	}
-	// 令牌被换过 → 全部会话下线
-	if subtle.ConstantTimeCompare([]byte(sess.tokenFingerprint), []byte(tokenFingerprint(token))) != 1 {
+	// 凭据变了（改密码 / 删账号 / 换令牌）→ 这条会话下线
+	want := fingerprintOf(sess.username)
+	if want == "" || subtle.ConstantTimeCompare([]byte(sess.fingerprint), []byte(want)) != 1 {
 		delete(s.sessions, key)
-		return false
+		return false, ""
 	}
 
 	if now.Sub(sess.lastSeen) > sessionTouchInterval {
 		sess.lastSeen = now
 	}
-	return true
+	return true, sess.username
 }
 
 // revoke 立即失效一条会话（登出）。
@@ -461,12 +492,17 @@ func parseOrigin(origin string) (string, error) {
 
 // loginFailureBody 是所有登录失败共用的响应体。
 //
-// 刻意不区分「令牌错」「令牌为空」「被限流之外的其它原因」：
-// 区分开来等于告诉攻击者哪一步猜对了。细节只进服务端日志。
+// 刻意不区分「用户名不存在」「密码错」「令牌错」「凭据为空」：
+// 区分开来等于告诉攻击者哪一步猜对了 —— 尤其「用户名不存在」这一条，
+// 一旦单独报出来，就能被用来枚举系统里有哪些账号。
+// 细节（用了哪个用户名、是走的密码还是令牌）只进服务端日志。
+//
+// v0.6.0 改文案：以前是「管理令牌不正确」，但那时令牌是唯一凭据。
+// 现在主路径是用户名+密码，再这么说会让用户去找一个他根本没设过的令牌。
 func loginFailureBody() map[string]string {
 	return map[string]string{
 		"error":   "invalid_credentials",
-		"message": "管理令牌不正确",
+		"message": "用户名或密码不正确",
 	}
 }
 

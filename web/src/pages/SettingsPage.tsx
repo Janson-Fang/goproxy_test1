@@ -67,7 +67,10 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
   const adminHost = adminParsed ? adminParsed[1] : cfg.admin_addr
   const adminPort = adminParsed ? adminParsed[2] : ''
   const isLoopbackOnly = adminHost === '127.0.0.1' || adminHost === 'localhost' || adminHost === '::1'
-  const exposedWithoutToken = cfg.admin_enabled && !isLoopbackOnly && !cfg.admin_token_set
+  // v0.6.0：凭据不再只有 admin_token，admin_users 同样算数。
+  // 用后端给的 credentials_configured 而不是自己拼条件 —— 判断「算不算配好了」
+  // 这件事只应该有一个权威来源，前端猜一遍迟早和后端跑偏。
+  const exposedWithoutCredentials = cfg.admin_enabled && !isLoopbackOnly && !cfg.credentials_configured
 
   const save = async () => {
     if (portsError) {
@@ -114,12 +117,16 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
 
   return (
     <div className="stack">
-      {exposedWithoutToken && (
+      {exposedWithoutCredentials && (
         <Note kind="err">
-          <b>管理端口正在监听非回环地址（{cfg.admin_addr}），但没有设置 admin_token。</b>
+          <b>管理端口正在监听非回环地址（{cfg.admin_addr}），但没有任何管理员凭据。</b>
           <br />
-          后端会拒绝所有来自外部的管理请求，也就是说你现在这个页面上的操作在别的机器上都会失败。
-          要么设置一个令牌，要么把 <code>admin_addr</code> 改回 <code>127.0.0.1:8080</code> 只允许本机访问。
+          后端会拒绝所有管理请求 —— 包括从本机发出的。也就是说你现在这个页面上的操作
+          在你刷新后都会失败。
+          <br />
+          请配置 <code>admin_users</code>（用户名 + bcrypt 密码哈希，推荐），
+          或者给脚本/探针用的 <code>admin_token</code>；也可以把 <code>admin_addr</code>
+          改回 <code>127.0.0.1:8080</code> 只允许本机访问。
         </Note>
       )}
 
@@ -184,14 +191,55 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
               />
             </Field>
 
+            {/*
+              管理员账号只读展示。
+              故意不做成可编辑的：账号要在配置文件里 + 用命令行生成 bcrypt 哈希，
+              在网页上改密码意味着要在这里收明文密码再算哈希 ——
+              那条路会让密码经过一个本该只读的接口，不值得。
+            */}
             <Field
               label={
                 <>
-                  管理令牌 admin_token{' '}
-                  {cfg.admin_token_set ? <Badge kind="ok">已设置</Badge> : <Badge kind="muted">未设置</Badge>}
+                  管理员账号 admin_users{' '}
+                  {cfg.admin_users?.length ? (
+                    <Badge kind="ok">{cfg.admin_users.length} 个</Badge>
+                  ) : (
+                    <Badge kind="muted">未配置</Badge>
+                  )}
                 </>
               }
-              hint="留空表示不修改。后端永远不会把令牌明文回传，所以这里只能覆盖，不能查看。"
+              hint={
+                <>
+                  「用户名 + 密码」登录用的账号。只读 —— 增删改请在服务器的{' '}
+                  <code>config.json</code> 里操作，密码哈希用{' '}
+                  <code>goproxy -hash-password '密码'</code> 生成，保存后会自动热重载。
+                  出于安全考虑，密码哈希永远不会被这个页面读到。
+                </>
+              }
+              span
+            >
+              {cfg.admin_users?.length ? (
+                <div className="tag-list">
+                  {cfg.admin_users.map((u) => (
+                    <Badge key={u} kind="info">
+                      {u}
+                    </Badge>
+                  ))}
+                </div>
+              ) : (
+                <span className="faint small">还没有配置任何账号，登录页会引导你去添加。</span>
+              )}
+            </Field>
+
+            <Field
+              label="管理令牌 admin_token"
+              hint={
+                <>
+                  给脚本 / 监控探针用的 Bearer 令牌，<b>不是给人登录用的</b> ——
+                  人用上面的用户名 + 密码。留空表示不修改；后端永远不会把令牌明文回传，
+                  所以这里只能覆盖，不能查看。
+                </>
+              }
               span
             >
               <div className="row tight">

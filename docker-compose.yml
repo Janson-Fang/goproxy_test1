@@ -27,6 +27,11 @@ services:
       # 为什么必须持久化：Let's Encrypt 对「同一域名重复签发」有每周限额，
       # 冷启动反复申请会直接被限流，把站点证书搞成长期不可用。
       - ./data:/etc/goproxy/data:rw
+    # 健康检查要用到 admin_token（见下面的 healthcheck 说明）。
+    # environment 只把这一条传进容器；令牌本体在宿主机的环境变量里，
+    # 不进这个文件，所以它可以安全地提交到版本库。
+    environment:
+      GPROXY_ADMIN_TOKEN: ${GPROXY_ADMIN_TOKEN:-}
     # 容器内以 uid 10001 运行，绑定 80/443 这类特权端口依赖 CAP_NET_BIND_SERVICE。
     # Docker 默认已授予，这里显式声明一份，避免落到更严格的默认策略上时莫名 listen 失败。
     cap_add:
@@ -39,7 +44,27 @@ services:
     #   - "8082:8082"
     #   - "9080:9080"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9080/healthz"]
+      # v0.6.0 起 /healthz 也在鉴权后面（探针和指标一律要凭据），
+      # 所以健康检查必须自己带上 admin_token。
+      #
+      # 令牌从环境变量读，不写死在这里 —— compose 文件经常进版本库，
+      # 把令牌明文提交进去等于把它公开了。启动前先 export：
+      #   export GPROXY_ADMIN_TOKEN='...'    # 与 config.json 里的 admin_token 一致
+      #
+      # 注意 $$ 是 compose 的转义：它会把 $$ 还原成 $，交给容器内的 sh 展开。
+      # 写单个 $ 的话 compose 会在宿主机上就把它展开掉，容器里拿到的是空值。
+      #
+      # 如果你的部署里不用 admin_token（只配了 admin_users），就把这条换成
+      # 一个不带认证的 TCP 探测，例如：
+      #   test: ["CMD-SHELL", "nc -z 127.0.0.1 9080 || exit 1"]
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- --header="Authorization: Bearer $$GPROXY_ADMIN_TOKEN"
+          http://127.0.0.1:9080/healthz | grep -q '^ok'
       interval: 30s
       timeout: 3s
       retries: 3
+      # 冷启动要多等一会儿：容器起来后要先读配置、拉起监听端口。
+      # 给得短会把「还在启动」误判成「不健康」。
+      start_period: 10s

@@ -2,16 +2,18 @@
  * 管理接口客户端。
  *
  * 几个刻意的设计：
- *  1. 控制台静态页面本身不需要令牌（否则浏览器打不开页面就没法输入令牌了），
+ *  1. 控制台静态页面本身不需要凭据（否则浏览器打不开页面就没法登录），
  *     但所有 /_goproxy/* 接口都受 adminGuard 保护。
  *  2. **默认走会话 Cookie**（登录后由服务端下发 HttpOnly Cookie，JS 读不到），
- *     所以所有请求要带 credentials: 'same-origin'。Bearer 令牌作为回退路径保留，
- *     给不方便登录的场景（比如把控制台嵌进自己的运维脚本）用。
+ *     所以所有请求要带 credentials: 'same-origin'。
+ *     Bearer 令牌作为回退路径保留，给不方便登录的场景（监控探针、运维脚本）用。
  *  3. 写接口支持 If-Match（后端用配置文件的 sha256 当 revision 做乐观并发）。
  *     两个页签同时编辑时，后提交的那个会拿到 409，而不是静默覆盖对方的改动。
  *  4. 实时日志走 fetch + ReadableStream 而不是 EventSource ——
  *     EventSource 不能自定义请求头，带不了 Bearer 令牌。
  *     （Cookie 模式下其实可以，但为了保留令牌回退路径，继续用 fetch。）
+ *  5. v0.6.0 起用户登录是**用户名 + 密码**，不再是粘贴 admin_token。
+ *     密码只在登录请求体里出现一次，服务端校验后下发 Cookie，密码不留任何痕迹。
  */
 
 import type {
@@ -63,27 +65,53 @@ export interface ApiErrorInit {
   status: number
   code: string
   message: string
+  /** 仅 /_goproxy/session 的 401 会带：服务端有没有配过凭据 */
+  credentialsConfigured?: boolean
 }
 
 export class ApiError extends Error {
   status: number
   code: string
 
-  constructor({ status, code, message }: ApiErrorInit) {
+  /**
+   * 服务端是否配过凭据。undefined 表示这次响应没说（绝大多数接口都不说，
+   * 只有 /_goproxy/session 的 401 会带）。
+   *
+   * 前端拿它来区分「该显示登录表单」和「该引导去改配置」——
+   * 后者对一个从没设过密码的人来说才是真正有用的信息。
+   */
+  credentialsConfigured?: boolean
+
+  constructor({ status, code, message, credentialsConfigured }: ApiErrorInit) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.credentialsConfigured = credentialsConfigured
   }
 
-  /** 需要用户输入/更正管理令牌 */
+  /** 需要用户输入/更正凭据 */
   get isUnauthorized(): boolean {
     return this.status === 401
   }
 
-  /** 管理端口对外监听但没设 admin_token，后端会拒绝所有外部请求 */
+  /**
+   * 服务端一个凭据都没配（admin_users 和 admin_token 都空）。
+   *
+   * 这是**独立于 401 的一个错误码**，不是「密码错了」的另一种说法。
+   * 前端必须据此显示「去 config.json 配一个管理员账号」，
+   * 否则用户会对着一个从来没设过的密码反复试。
+   *
+   * v0.6.0 从 admin_token_not_set 改名为 admin_credentials_not_set ——
+   * 令牌不再是唯一凭据，旧名字会误导人以为「必须去配个令牌」。
+   */
+  get isCredentialsNotSet(): boolean {
+    return this.status === 403 && this.code === 'admin_credentials_not_set'
+  }
+
+  /** 兼容旧名。只在 403 时可能为真。 */
   get isTokenNotSet(): boolean {
-    return this.status === 403 && this.code === 'admin_token_not_set'
+    return this.isCredentialsNotSet
   }
 
   /** 配置已被别处修改，需要重新读取 */
@@ -164,11 +192,20 @@ async function raw<T>(
   }
 
   if (!res.ok) {
-    const obj = (payload ?? {}) as { error?: string; message?: string }
+    const obj = (payload ?? {}) as {
+      error?: string
+      message?: string
+      credentials_configured?: unknown
+    }
+    // credentials_configured 只有 /_goproxy/session 的 401 会给。
+    // 非布尔值一律当「没说」，不要把 "false" 这种字符串当成假值带下去。
+    const creds =
+      typeof obj.credentials_configured === 'boolean' ? obj.credentials_configured : undefined
     throw new ApiError({
       status: res.status,
       code: obj.error || `http_${res.status}`,
       message: obj.message || `HTTP ${res.status}`,
+      credentialsConfigured: creds,
     })
   }
 
@@ -181,9 +218,9 @@ async function raw<T>(
 /**
  * 查询当前登录状态。
  *
- * 这个接口在 adminGuard 之内 —— 能正常返回 200 就说明已经通过了鉴权
- * （可能是会话、回环直连、或 Bearer 令牌）。`has_session` 才表示
- * 真正的登录态，前端据此决定要不要显示「登出」按钮。
+ * 这个接口在 adminGuard 之外（见后端 isAuthPath），未登录时返回 401，
+ * 前端据此切到登录页。**不要**把它包在 try/catch 里当成错误处理 ——
+ * 401 在这里是正常流程的一部分。
  */
 export async function getSession(): Promise<SessionInfo> {
   const { data } = await raw<SessionInfo>('GET', '/_goproxy/session')
@@ -191,13 +228,19 @@ export async function getSession(): Promise<SessionInfo> {
 }
 
 /**
- * 用管理令牌换一个会话。
+ * 用**用户名 + 密码**登录。
  *
- * 成功后服务端下发 HttpOnly Cookie，令牌本身**不留在浏览器里** ——
- * 换完就把内存里的副本清掉。这是这套机制的核心收益。
+ * 成功后服务端下发 HttpOnly Cookie，密码**不留在浏览器里** ——
+ * 它只在这个请求体里出现过一次，之后就只剩服务端算出的 bcrypt 比对结果。
+ * 这是这套机制的核心收益：XSS 也偷不到一个长期有效的秘密。
+ *
+ * 失败时抛 ApiError：
+ *   - 401 → 用户名或密码错误（后端刻意不区分，避免枚举出有哪些账号）
+ *   - 403 admin_credentials_not_set → 服务端压根没配账号，要去改 config.json
+ *   - 429 → 失败次数过多，被临时封禁
  */
-export async function login(token: string): Promise<void> {
-  await raw<{ ok: boolean }>('POST', '/_goproxy/login', { body: { token } })
+export async function login(username: string, password: string): Promise<void> {
+  await raw<{ ok: boolean }>('POST', '/_goproxy/login', { body: { username, password } })
 }
 
 export async function logout(): Promise<void> {

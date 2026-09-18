@@ -16,6 +16,15 @@ import (
 // 一律 403 —— 用它来测「本机免鉴权」会得到完全对不上的结果。
 func doAdmin(t *testing.T, env *testEnv, method, target, accept, remoteAddr, token string) *httptest.ResponseRecorder {
 	t.Helper()
+	return doAdminOpt(t, env, method, target, accept, remoteAddr, token)
+}
+
+// doAdminOpt 是 doAdmin 的可变参版本：token 之外还能再挂 header、改 RemoteAddr。
+// v0.6.0 起「认证」和「路由」是两件事，写路由相关的用例时经常需要
+// 「带凭据，但行为上想验别的」——多一个 token 形参在各调用点噪声太大，
+// 所以保留 doAdmin 的旧签名（几十处调用不用动），新增这一个。
+func doAdminOpt(t *testing.T, env *testEnv, method, target, accept, remoteAddr, token string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(method, target, nil)
 	if accept != "" {
 		req.Header.Set("Accept", accept)
@@ -26,6 +35,9 @@ func doAdmin(t *testing.T, env *testEnv, method, target, accept, remoteAddr, tok
 	req.RemoteAddr = remoteAddr
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for _, o := range opts {
+		o(req)
 	}
 	rec := httptest.NewRecorder()
 	env.app.adminHandler().ServeHTTP(rec, req)
@@ -55,7 +67,7 @@ func findAsset(t *testing.T) string {
 }
 
 func TestUIConsoleIsEmbeddedAndServed(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 
 	rec := doAdmin(t, env, http.MethodGet, uiPrefix, "", "", "")
 	if rec.Code != http.StatusOK {
@@ -75,7 +87,7 @@ func TestUIConsoleIsEmbeddedAndServed(t *testing.T) {
 }
 
 func TestUIAssetsHaveContentHashCacheHeaders(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 	asset := findAsset(t)
 
 	rec := doAdmin(t, env, http.MethodGet, uiPrefix+asset, "", "", "")
@@ -97,7 +109,7 @@ func TestUIAssetsHaveContentHashCacheHeaders(t *testing.T) {
 // 刷新页面时停在 /_goproxy/ui/routes 这种路径是很正常的操作，
 // 不能因为磁盘上没有同名文件就 404。
 func TestUISpaFallback(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 
 	rec := doAdmin(t, env, http.MethodGet, uiPrefix+"routes", "", "", "")
 	if rec.Code != http.StatusOK {
@@ -110,7 +122,7 @@ func TestUISpaFallback(t *testing.T) {
 
 // 浏览器打管理端口根路径要看到界面，curl 要看到接口清单。
 func TestRootServesRedirectForBrowserAndTextForCurl(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 
 	rec := doAdmin(t, env, http.MethodGet, "/", "text/html,application/xhtml+xml", "", "")
 	if rec.Code != http.StatusFound {
@@ -175,20 +187,27 @@ func TestUIStaticShellIsOpenButAPIsStayGuarded(t *testing.T) {
 	}
 }
 
-func TestAdminTokenNotSetRejectsExternal(t *testing.T) {
-	env := newTestEnv(t, "", "") // 非回环 + 没配令牌
+// 一份凭据都没配时，管理接口对所有来源都返回 403 + 专门的错误码。
+//
+// 这个错误码必须和「密码错了」的 401 区分开：前端拿到 403 才知道要提示
+// 「去 config.json 配一个账号」，而不是让运维反复怀疑自己密码打错了。
+// 旧版本这里叫 admin_token_not_set，v0.6.0 起令牌不再是唯一凭据，故改名。
+func TestNoCredentialsConfiguredRejectsEverySource(t *testing.T) {
+	env := newTestEnv(t, "", "")
 
-	rec := doAdmin(t, env, http.MethodGet, "/_goproxy/routes", "", "203.0.113.9:45678", "")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("未配令牌时外部请求应被拒（403），实际 %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "admin_token_not_set") {
-		t.Errorf("应返回可识别的错误码，实际 %s", rec.Body.String())
+	for _, addr := range []string{"203.0.113.9:45678", "127.0.0.1:34567"} {
+		rec := doAdmin(t, env, http.MethodGet, "/_goproxy/routes", "", addr, "")
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s 未配凭据时应被拒（403），实际 %d", addr, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "admin_credentials_not_set") {
+			t.Errorf("%s 应返回可识别的错误码，实际 %s", addr, rec.Body.String())
+		}
 	}
 }
 
 func TestRootPlainTextListsUIPath(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 	rec := doAdmin(t, env, http.MethodGet, "/", "", "", "")
 	if !strings.Contains(rec.Body.String(), uiPrefix) {
 		t.Errorf("接口清单里应提示控制台地址 %s", uiPrefix)
@@ -201,7 +220,7 @@ func TestRootPlainTextListsUIPath(t *testing.T) {
 // /index.html 和 /dashboard 是顺手敲的，以前全部落进纯文本接口清单，
 // 表现就是「控制台明明做好了，直接访问却没有」。
 func TestAdminPrefixPathsSendBrowserToConsole(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 	const html = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
 	for _, p := range []string{"/_goproxy/", "/_goproxy", "/index.html", "/dashboard", "/anything"} {
@@ -243,11 +262,14 @@ func TestAdminPrefixPathsSendBrowserToConsole(t *testing.T) {
 // 反过来钉住：接口路径**不能**因为带 text/html 就被重定向。
 // 浏览器直接打开 /_goproxy/routes 就是要看到 JSON。
 func TestAdminAPIsAreNotRedirectedForBrowserAccept(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	const token = "s3cret-admin-token"
+	env := newTestEnv(t, token, "")
 	const html = "text/html,application/xhtml+xml"
 
+	// 带上令牌：v0.6.0 起这些接口一律鉴权，不带就是 401，
+	// 那样就测不出「重定向」这件事了。
 	for _, p := range []string{"/_goproxy/routes", "/_goproxy/ports", "/_goproxy/stats", "/_goproxy/config", "/healthz", "/readyz", "/metrics"} {
-		rec := doAdmin(t, env, http.MethodGet, p, html, "", "")
+		rec := doAdmin(t, env, http.MethodGet, p, html, "", token)
 		if rec.Code == http.StatusFound && rec.Header().Get("Location") == uiPrefix {
 			t.Errorf("接口 %s 被重定向到控制台了，浏览器将拿不到数据", p)
 		}
@@ -259,31 +281,50 @@ func TestAdminAPIsAreNotRedirectedForBrowserAccept(t *testing.T) {
 
 // 拼错的接口地址必须响亮地 404。兜底的 "/" 曾经让所有未知路径回 200 + 清单，
 // 于是 `curl -f /_goproxy/statss` 看着像成功。
+//
+// v0.6.0 起这里有个必须注意的顺序：/healthz、/readyz、/metrics 以及
+// /_goproxy/ 开头的路径都会被 isAdminAPIPath 判为接口，统一交给带鉴权的
+// guarded mux。所以在「没配凭据」的环境里，它们先撞上 403，轮不到 404。
+// 这是有意的取舍：整个 /_goproxy/ 前缀都属于我们的命名空间，
+// 宁可对未认证的调用方统一回 403（不泄露「这个路径存不存在」），
+// 也不为了一个漂亮的状态码把「先鉴权」让位给「先路由」。
+// 但带齐凭据之后，拼错的路径必须老老实实 404 —— 下面两段分别钉住这两件事。
 func TestUnknownAdminPathIsNotFoundForNonHTML(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	const token = "s3cret-admin-token"
+	env := newTestEnv(t, token, "")
 
-	rec := doAdmin(t, env, http.MethodGet, "/_goproxy/statss", "*/*", "", "")
+	// 带凭据：拼错的路径必须 404。这一段才是这个用例原本要保障的事。
+	auth := []func(*http.Request){header("Authorization", "Bearer "+token)}
+	rec := doAdminOpt(t, env, http.MethodGet, "/_goproxy/statss", "*/*", "", "", auth...)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("写错的接口路径对 curl 应返回 404，实际 %d（%s）", rec.Code, rec.Body.String())
 	}
 
 	// 位置参数写法漏掉后半个括号 / 多带了斜杠也一样
-	rec = doAdmin(t, env, http.MethodGet, "/_goproxy/routes/", "*/*", "", "")
+	rec = doAdminOpt(t, env, http.MethodGet, "/_goproxy/routes/", "*/*", "", "", auth...)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("/_goproxy/routes/ 应返回 404（精确匹配）, 实际 %d", rec.Code)
 	}
 
 	// 但 /healthz 这类前缀相同的合法接口不能被误伤
-	rec = doAdmin(t, env, http.MethodGet, "/healthz", "*/*", "", "")
+	rec = doAdminOpt(t, env, http.MethodGet, "/healthz", "*/*", "", "", auth...)
 	if rec.Code != http.StatusOK {
 		t.Errorf("/healthz 应正常返回 200，实际 %d", rec.Code)
+	}
+
+	// 不带凭据：整个 /_goproxy/ 命名空间统一撞在鉴权上，而不是 404 ——
+	// 未认证时连「路径存不存在」都不该被区分出来。
+	// 这里配了凭据，所以是 401（该登录）；一个凭据都没配才是 403。
+	rec = doAdminOpt(t, env, http.MethodGet, "/_goproxy/statss", "*/*", "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("未认证时未知接口路径应返回 401，实际 %d", rec.Code)
 	}
 }
 
 // 保证 fs.FS 的路径清洗没被绕过：embed FS 本身拒绝含 .. 的路径，
 // 这里再确认一次请求不会穿透到别的目录。
 func TestUIPathTraversalIsContained(t *testing.T) {
-	env := newTestEnv(t, "", "")
+	env := newTestEnv(t, testToken, "")
 	for _, p := range []string{uiPrefix + "../../config.go", uiPrefix + "..%2f..%2fconfig.go"} {
 		rec := doAdmin(t, env, http.MethodGet, p, "", "", "")
 		if rec.Code == http.StatusOK && strings.Contains(rec.Body.String(), "package main") {

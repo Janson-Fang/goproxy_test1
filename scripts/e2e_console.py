@@ -37,6 +37,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = ".exe" if os.name == "nt" else ""
 ADMIN = "http://127.0.0.1:9080"
 
+# 认证用例专用的账号。密码写成常量是因为它只存在于这个临时配置里，
+# 进程退出即连同临时目录一起被清掉，不是真实凭据。
+E2E_ADMIN_USER = "e2e-admin"
+E2E_ADMIN_PASSWORD = "e2e-password-9f3a"
+
+# 自检实例的管理凭据。必须有值 —— v0.6.0 起回环不再免认证，
+# 所有管理接口都要凭据，包括 /healthz 和 /metrics。
+E2E_ADMIN_TOKEN = "e2e-s3cret-token"
+
 # 本机有 http_proxy 时会把 127.0.0.1 也截走（表现为 502），
 # 所以自检一律显式关掉代理。
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -54,12 +63,53 @@ def check(name, cond, detail=""):
         print("  [FAIL] %s  %s" % (name, detail))
 
 
+# 管理接口的认证头。在 main() 里根据临时配置填上。
+# 用一个模块级 dict 而不是给每个函数加参数：这个脚本里几十处调用都要带它，
+# 加参数会把每个调用点都改一遍，噪声远大于收益。
+AUTH_HEADERS = {}
+
+# 瞬时连接重置的重试次数。
+#
+# 实测（Windows / Winsock）偶发：客户端刚发完请求、服务端还在处理，
+# 连接就被本机协议栈重置，urllib 抛 ConnectionResetError。
+# 有意思的是**同一条请求单独重放一定成功**，服务端日志里连痕迹都没有 ——
+# 所以这是测试机上的时序/协议栈现象，不是被测代码的问题。
+#
+# 但它会以两种方式毁掉整轮自检：
+#   1. 未捕获异常直接崩掉脚本，**后面的用例一条都不跑**，
+#      表现成「改动把 e2e 弄挂了」，其实只是第 7 节某条 DELETE 撞上了；
+#   2. 把它当成失败断言，会让人去查一个不存在的服务端 bug。
+# 重试一次能把这两种噪声都消掉，同时**不掩盖真正的连接问题** ——
+# 连不通的话重试也会连不通，照样报错。
+_TRANSIENT = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+def _open_with_retry(op, req, timeout, attempts=2):
+    """执行一次 opener.open，遇到瞬时连接重置就重放。
+
+    只对连接层异常重试：HTTPError（4xx/5xx）是**有效响应**，必须原样返回，
+    重试它会把「过期 If-Match -> 409」这类断言变成不确定。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return op(req, timeout=timeout)
+        except _TRANSIENT as e:
+            last = e
+            if i + 1 < attempts:
+                print("     （连接被重置，重试一次：%s）" % e)
+                time.sleep(0.3)
+    raise last
+
+
 def get(path, accept=None, timeout=8):
     req = urllib.request.Request(ADMIN + path)
     if accept:
         req.add_header("Accept", accept)
+    for k, v in AUTH_HEADERS.items():
+        req.add_header(k, v)
     try:
-        with opener.open(req, timeout=timeout) as r:
+        with _open_with_retry(opener.open, req, timeout) as r:
             return r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read()
@@ -85,8 +135,10 @@ def get_noredirect(path, accept=None, timeout=8):
     req = urllib.request.Request(ADMIN + path)
     if accept:
         req.add_header("Accept", accept)
+    for k, v in AUTH_HEADERS.items():
+        req.add_header(k, v)
     try:
-        with no_redirect.open(req, timeout=timeout) as r:
+        with _open_with_retry(no_redirect.open, req, timeout) as r:
             return r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read()
@@ -104,10 +156,13 @@ def post(path, body, method="POST", headers=None):
     data = json.dumps(body).encode()
     req = urllib.request.Request(ADMIN + path, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    # 认证头先挂，再挂调用方给的 —— 让调用方能显式覆盖（比如测「不带凭据」）
+    for k, v in AUTH_HEADERS.items():
+        req.add_header(k, v)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with opener.open(req, timeout=8) as r:
+        with _open_with_retry(opener.open, req, 8) as r:
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
@@ -170,14 +225,16 @@ def build_binaries(outdir):
 def run_auth_section(tmp, bins):
     """认证与会话的端到端验证。
 
-    为什么要**另起一个实例**、而不是复用上面那个：
-    演示配置里没有 admin_token，而回环地址默认免认证 —— 两件事叠加，
-    上面那个实例根本走不到鉴权分支，拿它测认证等于什么都没测。
+    v0.6.0 起回环不再免认证，所以这里**不再需要**用内部标记头把请求降级成
+    「外部请求」—— 本机直连同样要走鉴权。标记头保留着是因为它仍有意义：
+    它验证「经代理转发进来的请求」也不会被额外优待。
 
-    这里单独起一个带 admin_token 的实例，并且**主动带上内部标记头**
-    （X-Goproxy-Internal-Via）把每个请求降级成「经代理转发进来的外部请求」，
-    这样才能真正走到 adminGuard 的鉴权逻辑。标记头本身不保密：
-    伪造它只会让判断更严格，对攻击者不利。
+    为什么仍然单独起一个实例：这个用例要自己控制凭据（知道密码明文才能验证
+    「密码错会怎样」），而演示配置里不该有明文密码。单独起一个能精确布置
+    各种凭据状态，也不受演示数据影响。
+
+    凭据形态：admin_users（用户名 + bcrypt 哈希，给人登录用）
+            + admin_token（Bearer，给脚本用）。两条都验。
     """
     import http.cookiejar
 
@@ -185,19 +242,27 @@ def run_auth_section(tmp, bins):
     port_biz = 9082
     auth_cfg_path = os.path.join(tmp, "auth-config.json")
 
-    with open(os.path.join(ROOT, "config.json"), encoding="utf-8") as f:
-        base = json.load(f)
+    # 用二进制自己算哈希，而不是在这里实现一遍 bcrypt ——
+    # 那样测的就不是「服务端能不能校验它自己生成的哈希」了。
+    pw_hash = subprocess.run(
+        [bins["goproxy-test"], "-hash-password", E2E_ADMIN_PASSWORD],
+        cwd=ROOT, capture_output=True, text=True,
+    ).stdout.strip()
+    if not pw_hash:
+        check("生成 bcrypt 哈希", False, "goproxy -hash-password 没输出")
+        return
 
     cfg = {
         "admin_addr": "127.0.0.1:%d" % port_admin,
-        "admin_token": "e2e-s3cret-token",
+        "admin_token": E2E_ADMIN_TOKEN,
+        "admin_users": [{"username": E2E_ADMIN_USER, "password_hash": pw_hash}],
         "access_log": False,
         "default_ports": [],
         "routes": [],
     }
     with open(auth_cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
-    del base, port_biz
+    del port_biz
 
     if port_in_use(port_admin):
         check("认证实例端口空闲", False, "%d 已被占用" % port_admin)
@@ -238,20 +303,25 @@ def run_auth_section(tmp, bins):
             except urllib.error.HTTPError as e:
                 return e.code, dict(e.headers), e.read()
 
-        # ---- 10.1 三种凭据路径 ----
-        st, h, b = req("/_goproxy/routes")
-        check("外部请求无凭据 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+        # ---- 10.0 回环不再免认证（v0.6.0 的行为变更）----
+        # 这里是本机 127.0.0.1 直连、不带任何凭据。旧版本会全部 200。
+        # 探针/指标也要凭据 —— 这条是刻意的：它们同样能泄露运行状态。
+        for path in ("/_goproxy/routes", "/_goproxy/stats", "/healthz", "/readyz", "/metrics"):
+            st, h, b = req(path)
+            check("回环无凭据 %s -> 401" % path, st == 401,
+                  "实际 %s :: %s" % (st, b[:150]))
 
+        # ---- 10.1 三种凭据路径 ----
         st, h, b = req("/_goproxy/routes", headers={"Authorization": "Bearer wrong"})
         check("错误 Bearer -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
 
         st, h, b = req(
             "/_goproxy/routes",
-            headers={"Authorization": "Bearer e2e-s3cret-token"},
+            headers={"Authorization": "Bearer " + E2E_ADMIN_TOKEN},
         )
         check("正确 Bearer -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
 
-        # ---- 10.2 登录换取会话 Cookie ----
+        # ---- 10.2 用户名 + 密码登录换取会话 Cookie ----
         # 用带 CookieJar 的 opener，模拟浏览器
         jar = http.cookiejar.CookieJar()
         browser = urllib.request.build_opener(
@@ -261,22 +331,43 @@ def run_auth_section(tmp, bins):
         st, h, b = req(
             "/_goproxy/login",
             method="POST",
-            body={"token": "wrong-token"},
+            body={"username": E2E_ADMIN_USER, "password": "wrong-password"},
             headers={"Origin": base_url},
             opener=browser,
         )
-        check("登录用错令牌 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+        check("密码错 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+
+        # 用户名不存在必须和密码错**完全一样** —— 否则可以拿来枚举账号
+        st2, h2, b2 = req(
+            "/_goproxy/login",
+            method="POST",
+            body={"username": "no-such-user", "password": "whatever"},
+            headers={"Origin": base_url},
+            opener=browser,
+        )
+        check("用户不存在 -> 401", st2 == 401, "实际 %s :: %s" % (st2, b2[:150]))
+        check("  用户不存在与密码错的响应无法区分",
+              st == st2 and b == b2,
+              "密码错 %s/%s vs 用户不存在 %s/%s" % (st, b[:80], st2, b2[:80]))
 
         st, h, b = req(
             "/_goproxy/login",
             method="POST",
-            body={"token": "e2e-s3cret-token"},
+            body={"username": E2E_ADMIN_USER, "password": E2E_ADMIN_PASSWORD},
             headers={"Origin": base_url},
             opener=browser,
         )
-        check("登录用对令牌 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
+        check("用户名+密码正确 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
         if st != 200:
             return
+
+        # 登录响应要报出是谁登录了 —— 控制台顶部靠它显示用户名
+        try:
+            lbody = json.loads(b)
+            check("  登录响应带 username", lbody.get("username") == E2E_ADMIN_USER, str(lbody))
+            check("  登录响应 via=session", lbody.get("via") == "session", str(lbody))
+        except Exception as e:
+            check("  登录响应可解析", False, str(e))
 
         sess_cookies = [c for c in jar if c.name == "goproxy_admin_session"]
         check("登录下发了会话 Cookie", len(sess_cookies) == 1, "实际 %d 个" % len(sess_cookies))
@@ -299,6 +390,22 @@ def run_auth_section(tmp, bins):
             info = json.loads(b)
             check("  via 报告为 session", info.get("via") == "session", str(info))
             check("  has_session 为真", info.get("has_session") is True, str(info))
+            check("  报告登录用户名", info.get("username") == E2E_ADMIN_USER, str(info))
+
+        # 未登录时 /session 必须给 401 + credentials_configured，
+        # 前端靠这两个信息决定「显示登录表单」还是「引导去配账号」
+        st, h, b = req("/_goproxy/session", opener=bare)
+        check("未登录 /session -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
+        if st == 401:
+            try:
+                ubody = json.loads(b)
+                check("  401 体里带 credentials_configured",
+                      ubody.get("credentials_configured") is True, str(ubody))
+                check("  401 的 message 不暴露「用户名是否存在」",
+                      "用户名" not in ubody.get("message", "") or "或密码" in ubody.get("message", ""),
+                      str(ubody.get("message")))
+            except Exception as e:
+                check("  401 体可解析", False, str(e))
 
         # ---- 10.4 CSRF：带会话的跨源写请求必须被拒 ----
         st, h, b = req(
@@ -323,14 +430,18 @@ def run_auth_section(tmp, bins):
         st, h, b = req(
             "/_goproxy/login",
             method="POST",
-            body={"token": "e2e-s3cret-token"},
+            body={"username": E2E_ADMIN_USER, "password": E2E_ADMIN_PASSWORD},
             headers={"Origin": "http://evil.example"},
             opener=bare,
         )
         check("跨源登录 -> 403", st == 403, "实际 %s :: %s" % (st, b[:150]))
 
         # 但不带 Origin 的脚本请求要能登录（fail-open 的那一半）
-        st, h, b = req("/_goproxy/login", method="POST", body={"token": "e2e-s3cret-token"})
+        st, h, b = req(
+            "/_goproxy/login",
+            method="POST",
+            body={"username": E2E_ADMIN_USER, "password": E2E_ADMIN_PASSWORD},
+        )
         check("无 Origin 的脚本登录 -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
 
         # ---- 10.5 登出后会话立即失效 ----
@@ -342,7 +453,7 @@ def run_auth_section(tmp, bins):
         check("登出后旧会话失效 -> 401", st == 401, "实际 %s :: %s" % (st, b[:150]))
 
         # ---- 10.6 安全响应头 ----
-        st, h, b = req("/_goproxy/routes", headers={"Authorization": "Bearer e2e-s3cret-token"})
+        st, h, b = req("/_goproxy/routes", headers={"Authorization": "Bearer " + E2E_ADMIN_TOKEN})
         low = {k.lower(): v for k, v in h.items()}
         check("带 X-Content-Type-Options: nosniff",
               low.get("x-content-type-options") == "nosniff", str(low.get("x-content-type-options")))
@@ -397,11 +508,21 @@ def main():
         shutil.copyfile(os.path.join(ROOT, "config.json"), cfg)
 
         # 管理地址以临时配置为准，别写死 9080。
-        global ADMIN
+        global ADMIN, AUTH_HEADERS
         cfg_data = json.load(open(cfg, encoding="utf-8"))
         admin_addr = cfg_data.get("admin_addr") or "127.0.0.1:9080"
         ADMIN = "http://" + admin_addr
         admin_port = int(admin_addr.rsplit(":", 1)[1])
+
+        # v0.6.0 起管理接口一律要凭据（回环也不例外），所以必须往这份临时配置里
+        # 塞一个 admin_token，否则后面的每个断言都会撞在 401 上。
+        #
+        # 为什么用 admin_token 而不是 admin_users：这些用例是「脚本访问」，
+        # 走 Bearer 最直接，不用维持一个 CookieJar。登录本身由第 10 节专门测。
+        cfg_data["admin_token"] = E2E_ADMIN_TOKEN
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump(cfg_data, f, ensure_ascii=False, indent=2)
+        AUTH_HEADERS = {"Authorization": "Bearer " + E2E_ADMIN_TOKEN}
 
         # 端口预检。这一步不能省：如果 9080 上已经跑着一个实例（本机开发时很常见），
         # 自检自己起的那份会因端口被占而退出，而 wait_port 却立刻成功，
@@ -581,6 +702,11 @@ def main():
         def listen():
             req = urllib.request.Request(ADMIN + "/_goproxy/events")
             req.add_header("Accept", "text/event-stream")
+            # v0.6.0 起 /events 也在 adminGuard 后面，必须带凭据。
+            # 漏了这句的症状很隐蔽：401 被下面的 except 吞掉，
+            # 表现为「hello 没收到、事件数 0」，看着像 SSE 本身坏了。
+            for k, v in AUTH_HEADERS.items():
+                req.add_header(k, v)
             try:
                 with opener.open(req, timeout=12) as r:
                     ev = ""
@@ -603,8 +729,11 @@ def main():
                             ev = v
                         elif k == "data":
                             data += v
-            except Exception:
-                pass
+            except urllib.error.HTTPError as e:
+                # 把状态码打出来，别静默吞掉 —— 否则鉴权失败会伪装成「SSE 没数据」
+                print("    （SSE 连接被拒：HTTP %d %s）" % (e.code, e.read()[:120]))
+            except Exception as e:
+                print("    （SSE 连接异常：%s）" % e)
 
         t = threading.Thread(target=listen, daemon=True)
         t.start()
@@ -696,6 +825,14 @@ def main():
         cfg = json.loads(b)
         check("不回传 admin_token 明文", "admin_token" not in cfg, str(list(cfg)))
         check("返回 admin_token_set 布尔位", "admin_token_set" in cfg)
+        # admin_users 只暴露用户名，密码哈希绝不出现 ——
+        # 这个接口能读到配置，把哈希顺带带出去等于一次认证读取就泄漏全部凭据
+        check("返回 admin_users 列表", isinstance(cfg.get("admin_users"), list), str(cfg.get("admin_users")))
+        for u in cfg.get("admin_users") or []:
+            check("  admin_users 里不含密码材料",
+                  "password" not in u and "password_hash" not in u, str(u))
+        check("返回 credentials_configured 布尔位",
+              isinstance(cfg.get("credentials_configured"), bool), str(cfg.get("credentials_configured")))
         check("管理地址正确", cfg["admin_addr"] == "127.0.0.1:9080", str(cfg["admin_addr"]))
 
         st, h, b = post("/_goproxy/config", {"admin_addr": "0.0.0.0:9080"}, method="PATCH")

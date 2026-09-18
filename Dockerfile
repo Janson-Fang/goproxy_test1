@@ -25,10 +25,16 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 goproxy
 COPY --from=builder /out/goproxy /usr/local/bin/goproxy
 
-# 配置目录必须归 goproxy 所有。管理接口改配置走的是原子写
+# 配置文件目录必须归 goproxy 所有。管理接口改配置走的是原子写
 # （写 config.json.tmp 再 rename 覆盖），容器又是以 uid 10001 跑的，
 # /etc/goproxy 保持 root:root 0755 的话，点「删除路由」会 permission denied。
 # 挂载了宿主机目录时以宿主目录的属主为准，compose 里有说明。
+#
+# 注意：这只是**给容器跑起来用**的示例配置，它的 admin_users 是空的，
+# 也就是说管理接口会拒绝一切请求（403 admin_credentials_not_set）。
+# 生产部署应该把配置挂进来（compose 里已经这么做了），并至少配一个
+# admin_users 账号或一个 admin_token。启动时若发现没有任何凭据，
+# 进程会在日志里明确警告 —— 见 main.go 的 warnIfNoAdminCredentials。
 COPY config.example.json /etc/goproxy/config.json
 RUN chown -R goproxy:goproxy /etc/goproxy
 

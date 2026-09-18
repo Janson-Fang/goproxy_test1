@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // defaultAdminAddr 是 admin_addr 留空时使用的默认值。
@@ -29,22 +32,27 @@ type Config struct {
 	// 显式写 off / none / disabled 则彻底关闭管理端口。
 	AdminAddr string `json:"admin_addr,omitempty"`
 
-	// AdminToken 管理接口的访问令牌。
-	// 从回环地址访问时不需要它；一旦管理端口监听了非回环地址，
-	// 没有它所有外部请求一律拒绝 —— 这是防止管理接口裸奔的唯一闸门。
-	AdminToken string `json:"admin_token,omitempty"`
+	// AdminUsers 是控制台的管理员账号列表。
+	//
+	// 每项含 username 与 bcrypt 的 password_hash（复用路由 Basic 认证那套字段，
+	// 代码也复用同一套校验）。控制台登录页收「用户名 + 密码」，
+	// 校验通过后换一个 HttpOnly 会话 Cookie，密码本身不进浏览器存储。
+	//
+	// 与 AdminToken 的关系（两者可同时存在，也可只用其一）：
+	//   - AdminUsers 给**浏览器**用：有用户名、可按人区分、能在控制台里看到是谁登的
+	//   - AdminToken 给**脚本/监控**用：Authorization: Bearer <token>，一个值搞定，
+	//     适合 curl、Prometheus、CI 这类不方便维护 Cookie 的调用方
+	// 两个都为空时管理接口完全打不开 —— 这是有意的：宁可打不开，
+	// 也不能出现「没配凭据却谁都能改路由」这种状态。
+	AdminUsers []AdminUser `json:"admin_users,omitempty"`
 
-	// AdminTrustLoopback 是否信任来自回环地址的请求（默认 true）。
+	// AdminToken 管理接口的访问令牌，用于 Authorization: Bearer。
 	//
-	// 用指针是为了区分「没写」（用默认值 true）和「显式写了 false」——
-	// 普通 bool 的零值就是 false，没法表达「没写」。
-	//
-	// 什么时候该关掉：管理端口前面还挂了别的本地反向代理（nginx、Caddy…）。
-	// 那种转发同样来自 127.0.0.1，且不会带本进程的代理标记头，
-	// 于是「回环 = 本机运维」这个前提不再成立。
-	// 本进程自己的代理转发**不需要**靠这个开关兜底：它会带标记头，
-	// 管理端一律按外部请求处理（见 internalViaHeader）。
-	AdminTrustLoopback *bool `json:"admin_trust_loopback,omitempty"`
+	// 历史说明：v0.5.0 及以前它还有第二个职责 —— 「回环地址免认证」是默认行为，
+	// 这个字段只在管理端口监听非回环地址时才被要求。v0.6.0 起**回环不再免认证**，
+	// 所有访问都必须带凭据（会话 Cookie 或 Bearer 令牌），这个字段退回它本来的定位：
+	// 给脚本用的便捷凭据。
+	AdminToken string `json:"admin_token,omitempty"`
 
 	AccessLog bool `json:"access_log"`
 	// TrustedProxies 里的项是 IP 或 CIDR。
@@ -219,10 +227,25 @@ func (c *Config) applyDefaults() {
 // adminEnabled 报告是否应该监听管理端口。
 func (c *Config) adminEnabled() bool { return !isOff(c.AdminAddr) }
 
-// adminTrustsLoopback 报告是否信任来自回环地址的管理请求。
-// 留空即信任（保持历史行为：本机 curl / 脚本免令牌）。
-func (c *Config) adminTrustsLoopback() bool {
-	return c.AdminTrustLoopback == nil || *c.AdminTrustLoopback
+// AdminUser 是控制台的一个管理员账号。
+//
+// 字段与路由 Basic 认证的 BasicAuthEntry 保持一致（username + bcrypt 的
+// password_hash）—— 这不是巧合，是有意复用：同一套概念在项目里只该有一种写法，
+// 否则用户得记住两套配置格式，代码里也会出现两份几乎相同的校验逻辑。
+type AdminUser struct {
+	Username     string `json:"username"`
+	Password     string `json:"password"`      // 明文，仅测试用，启动会打警告
+	PasswordHash string `json:"password_hash"` // bcrypt，推荐
+}
+
+// hasAdminCredentials 报告配置里是否至少存在一种可用的管理端凭据。
+//
+// 两者皆无时管理接口完全打不开。这是**故意**的：曾经的默认行为是
+// 「回环免认证」，于是没配凭据的机器从本机看是好的、从外面看是被拒的，
+// 同一个配置在不同来源下表现不一致，很难排查。现在没凭据就是彻底进不去，
+// 启动日志会明确告诉你该怎么配。
+func (c *Config) hasAdminCredentials() bool {
+	return len(c.AdminUsers) > 0 || strings.TrimSpace(c.AdminToken) != ""
 }
 
 // isOff 识别用于「显式关闭」的哨兵值。
@@ -249,6 +272,59 @@ func addrPort(addr string) int {
 	return n
 }
 
+// maxAdminUsers 是管理员账号数量上限。
+//
+// 管理端是单管理员场景的轻量实现，不存在角色/权限分级。
+// 设上限是为了挡住「配置写错导致数组无限增长」这类事故：
+// 每个账号都要在登录时做一次 bcrypt（几十到上百毫秒），
+// 账号太多会让登录耗时线性增长，反而变成放大攻击面。
+const maxAdminUsers = 32
+
+// validateAdminUsers 校验管理员账号列表。
+//
+// 这里的规则与 Basic 认证那套**故意保持一致**（非空、唯一、hash 合法），
+// 因为两者对 bcrypt 的要求完全相同。唯一的额外约束是数量上限 ——
+// 路由的 Basic 账号是每请求比对的，管理端账号会在登录时逐个参与校验，
+// 代价不一样，所以上限也不该照搬。
+func (c *Config) validateAdminUsers() error {
+	if len(c.AdminUsers) > maxAdminUsers {
+		return fmt.Errorf("admin_users 最多 %d 个账号，当前 %d 个", maxAdminUsers, len(c.AdminUsers))
+	}
+
+	seen := make(map[string]struct{}, len(c.AdminUsers))
+	for i, u := range c.AdminUsers {
+		name := strings.TrimSpace(u.Username)
+		if name == "" {
+			return fmt.Errorf("admin_users[%d]: username 不能为空", i)
+		}
+		// 用户名统一按原样存储与比对（不做大小写折叠）：
+		// 折叠会引入「Admin 和 admin 是同一个账号」这种需要额外解释的语义，
+		// 而这里并没有避免撞名的需求 —— 配置是管理员自己写的。
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("admin_users[%d]: username %q 重复", i, name)
+		}
+		seen[name] = struct{}{}
+
+		hash := u.PasswordHash
+		if hash == "" {
+			if u.Password == "" {
+				return fmt.Errorf("admin_users[%d] (%s): 既没有 password 也没有 password_hash", i, name)
+			}
+			continue // 明文密码会在构建认证器时转成 bcrypt
+		}
+		// 校验是不是合法 bcrypt。配错了却以为在生效是最坏的情况：
+		// 表面上「我明明设了密码」，实际没人能登录（或者更糟，谁都能登录）。
+		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("probe")); err != nil &&
+			!errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			return fmt.Errorf("admin_users[%d] (%s): password_hash 不是合法的 bcrypt: %w", i, name, err)
+		}
+	}
+
+	// 管理端开着却一个凭据都没有 —— 直接拒绝启动太苛刻（用户可能正要进去配），
+	// 但要明确告诉他：现在这个状态谁都进不去。启动流程会把这句话打出来。
+	return nil
+}
+
 func (c *Config) validate() error {
 	// trusted_proxies 每一项必须是 IP 或 CIDR。不在这里拦，
 	// 写接口就会先把坏配置落盘、再在 reload 阶段失败。
@@ -257,6 +333,10 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.validateTLS(); err != nil {
+		return err
+	}
+
+	if err := c.validateAdminUsers(); err != nil {
 		return err
 	}
 

@@ -39,21 +39,30 @@ func notFound(id string) *apiError {
 
 // ---------- 登录 / 登出 / 会话状态 ----------
 //
-// 这三个接口都挂在 adminMux 上，也就是**在 adminGuard 之内**。
-// 看起来有点绕（登录接口本身要鉴权？），但这是有意的：
+// 这三个接口的路径都**不在 adminGuard 之内**（见 main.go 的 isAuthPath）：
+// 登录接口的职责就是「在还没有凭据的时候拿到凭据」，放在闸门里等于把钥匙
+// 锁在屋里。放行不等于不设防 —— 各自带限流、恒定耗时、同源校验。
 //
-//   - POST /_goproxy/login 需要先通过 adminGuard，而 Guard 现在把
-//     「登录中」也当作放行条件之一（见 trySessionLogin）。这样登录请求
-//     本身也能拿到限流与 CSRF 保护，且不用在 Guard 外面开一个特例路径。
-//   - 回环免认证的本机用户也能直接创建会话，不用先去翻 config.json 抄令牌。
+// 历史上这三条曾注册在 adminMux 上（受 Guard 保护），导致未登录请求在 Guard 里
+// 就被 401 掉、永远走不到处理器。那个 bug 的症状是「所有登录测试一起变 401」，
+// 看着像认证逻辑写错，实际是路由挂错了层。
 
-// sessionLoginRequest 是登录请求体。字段名刻意不叫 token，避免被日志采集
-// 误当成通用凭据字段；但仍然必须保证它不会被回显。
+// sessionLoginRequest 是登录请求体。
+//
+// 支持两种形态，两种都合法：
+//
+//	{"username":"alice","password":"..."}  ← 控制台登录页用
+//	{"token":"<admin_token>"}              ← 脚本 / 不方便建账号的场景用
+//
+// 都不含回显字段：这两个值在任何情况下都不会出现在响应体或日志里
+// （日志故意只记 ip / ua / 是否配置了凭据，不记内容）。
 type sessionLoginRequest struct {
-	Token string `json:"token"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Token    string `json:"token"`
 }
 
-// handleLogin 用 admin_token 换取一个会话 Cookie。
+// handleLogin 用「用户名 + 密码」或「admin_token」换取一个会话 Cookie。
 //
 // 防爆破的三层：
 //   - 单个 IP 失败 5 次封 10 分钟
@@ -109,22 +118,62 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	a.mu.Lock()
 	token := a.adminToken
+	accounts := a.adminAccounts
 	a.mu.Unlock()
 
-	// 常量时间比对。注意这里对「令牌为空」和「令牌错误」走同一条路径 ——
-	// 区分开来等于告诉攻击者服务端到底有没有配置令牌。
-	ok := token != "" &&
-		subtle.ConstantTimeCompare([]byte(req.Token), []byte(token)) == 1
+	// 两条凭据路径。顺序无关紧要（两者互斥：用户名密码请求不带 token 字段），
+	// 但结果要能区分「哪种凭据都没配」—— 那不是登录失败，是没配置，
+	// 前端据此显示「去设置账号」而不是「密码错误」（否则用户会一直重试一个
+	// 根本没设过的密码）。
+	var (
+		username    string
+		fingerprint string
+		via         authVia
+	)
 
-	if !ok {
+	switch {
+	case req.Username != "" || req.Password != "":
+		// 用户名密码路径。verify 内部对「用户不存在」也跑一次假哈希比对，
+		// 避免用响应时间枚举用户名。
+		fp, err := accounts.verify(req.Username, req.Password)
+		if err == nil {
+			username, fingerprint, via = req.Username, fp, viaSession
+		}
+
+	case req.Token != "":
+		// 令牌路径。常量时间比对；「令牌没配」和「令牌错」走同一条失败路径 ——
+		// 区分开来等于告诉攻击者服务端到底有没有配置令牌。
+		if token != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(token)) == 1 {
+			fingerprint, via = tokenFingerprint(token), viaBearer
+		}
+	}
+
+	if via == "" {
+		// 凭据都没配置时不要记失败次数：那不是「有人在猜密码」，
+		// 而是「管理员还没配」。记进去会让真正的管理员被自己锁在门外。
+		if !a.hasAnyAdminCredentialLocked() {
+			slog.Warn("管理端登录被拒：配置里没有任何可用的管理凭据", "ip", ip)
+			sleepConstant(start)
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "admin_credentials_not_set",
+				"message": "服务端还没有配置任何管理凭据。请在 config.json 里设置 " +
+					"admin_users（用户名 + bcrypt 密码哈希，推荐）或 admin_token，" +
+					"保存后会自动热重载。",
+			})
+			return
+		}
+
 		a.sessions.recordLoginFailure(ip)
-		slog.Warn("管理端登录失败", "ip", ip, "ua", ua, "token_set", token != "")
+		slog.Warn("管理端登录失败", "ip", ip, "ua", ua,
+			"username_used", req.Username,
+			"token_used", req.Token != "",
+			"accounts_configured", accounts.count())
 		sleepConstant(start)
 		writeJSON(w, http.StatusUnauthorized, loginFailureBody())
 		return
 	}
 
-	handle, expires, err := a.sessions.create(token, ip, ua)
+	handle, expires, err := a.sessions.create(username, fingerprint, ip, ua)
 	if err != nil {
 		slog.Error("创建会话失败", "err", err)
 		sleepConstant(start)
@@ -137,11 +186,14 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	a.sessions.recordLoginSuccess(ip)
 	setSessionCookie(w, r, handle, expires)
-	slog.Info("管理端登录成功", "ip", ip, "active_sessions", a.sessions.count())
+	slog.Info("管理端登录成功", "ip", ip, "username", username, "via", string(via),
+		"active_sessions", a.sessions.count())
 
 	sleepConstant(start)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
+		"via":      string(via),
+		"username": username,
 		"expires":  expires.UTC().Format(time.RFC3339),
 		"secure":   requestIsTLS(r),
 		"idle_sec": int(sessionIdleTimeout.Seconds()),
@@ -160,29 +212,8 @@ func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	handle := sessionHandleFrom(r)
-
-	a.mu.Lock()
-	token := a.adminToken
-	a.mu.Unlock()
-
-	// 三种凭据来源，与 adminGuard 保持一致。这里只是「如实汇报」，不做放行决定。
-	hasSession := handle != "" && a.sessions.lookup(handle, token)
-	loopback := !viaOwnProxy(r) && a.trustsLoopback() && isLoopbackAddr(r.RemoteAddr)
-	_, hasBearer := bearerToken(r)
-	// Bearer 只有在令牌确实配置了、且请求确实带了 Authorization 头时才算数。
-	// 光有头不算：令牌没配时任何 Bearer 都是无效的。
-	hasBearerOK := hasBearer && token != ""
-
-	authenticated := hasSession || loopback || hasBearerOK
-	via := "none"
-	switch {
-	case hasSession:
-		via = "session"
-	case loopback:
-		via = "loopback"
-	case hasBearerOK:
-		via = "bearer"
-	}
+	user, via := a.identifyAdminRequest(r, handle)
+	authenticated := via != viaNone
 
 	switch r.Method {
 	case http.MethodGet:
@@ -193,17 +224,22 @@ func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
 		// 给 200 + authenticated:false 会让控制台一直转圈。
 		if !authenticated {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="goproxy admin"`)
-			writeJSON(w, http.StatusUnauthorized, map[string]string{
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"error":   "unauthorized",
 				"message": "尚未登录。",
+				// 一并告诉前端「服务端到底有没有配凭据」，让它能在登录页上
+				// 直接给出正确的下一步，而不是让人对着「用户名或密码错误」
+				// 反复试一个从来没设过的账号。
+				"credentials_configured": a.hasAnyAdminCredential(),
 			})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"authenticated": true,
-			"via":           via,
-			"has_session":   hasSession,
-			"token_set":     token != "",
+			"via":           string(via),
+			"username":      user,
+			"has_session":   via == viaSession,
+			"token_set":     a.adminTokenSet(),
 		})
 
 	case http.MethodDelete, http.MethodPost:
@@ -215,7 +251,7 @@ func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if hasSession {
+		if via == viaSession {
 			a.sessions.revoke(handle)
 		}
 		clearSessionCookie(w, r)
@@ -225,6 +261,62 @@ func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, DELETE, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// identifyAdminRequest 判断一个请求的凭据来源，返回 (用户名, 来源)。
+//
+// 这是唯一一处「怎么算通过鉴权」的判定逻辑，adminGuard 与 handleSession
+// 都调它 —— 两处各写一遍是这类代码最容易出的错：Guard 放行的路径
+// handleSession 认为没登录（或者反过来），症状是「能改路由但按钮显示未登录」。
+//
+// 不在这里做 CSRF 校验：写方法要不要同源检查取决于调用场景
+// （会话写请求 fail-closed、登录 fail-open），由各自的调用方决定。
+func (a *App) identifyAdminRequest(r *http.Request, handle string) (username string, via authVia) {
+	a.mu.Lock()
+	token := a.adminToken
+	accounts := a.adminAccounts
+	a.mu.Unlock()
+
+	// 会话优先：浏览器只会走这条，而且它带得出「是谁」。
+	if handle != "" {
+		ok, user := a.sessions.lookup(handle, func(sessionUser string) string {
+			if sessionUser == "" {
+				// 令牌登录建立的会话没有用户名，用令牌指纹续期
+				return tokenFingerprint(token)
+			}
+			return accounts.fingerprintFor(sessionUser)
+		})
+		if ok {
+			return user, viaSession
+		}
+	}
+
+	// Bearer 令牌：给 curl / 脚本 / Prometheus 用。
+	if got, ok := bearerToken(r); ok && token != "" &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+		return "", viaBearer
+	}
+
+	return "", viaNone
+}
+
+// hasAnyAdminCredential 报告当前配置里有没有可用的管理凭据。
+func (a *App) hasAnyAdminCredential() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hasAnyAdminCredentialLocked()
+}
+
+// hasAnyAdminCredentialLocked 同上，但要求调用方已持有 a.mu。
+func (a *App) hasAnyAdminCredentialLocked() bool {
+	return a.adminAccounts.count() > 0 || strings.TrimSpace(a.adminToken) != ""
+}
+
+// adminTokenSet 报告是否配置了 admin_token。只用于展示，不用于鉴权决定。
+func (a *App) adminTokenSet() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.TrimSpace(a.adminToken) != ""
 }
 
 // writeErr 把错误翻译成响应。
@@ -275,28 +367,18 @@ func newErrorID() string {
 // 因此这里额外要求「不带代理标记头」才认回环，见 internalViaHeader。
 func (a *App) adminGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		viaOwnProxy := viaOwnProxy(r)
+		handle := sessionHandleFrom(r)
+		username, via := a.identifyAdminRequest(r, handle)
 
-		if !viaOwnProxy && a.trustsLoopback() && isLoopbackAddr(r.RemoteAddr) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		a.mu.Lock()
-		token := a.adminToken
-		a.mu.Unlock()
-
-		// 路径 3：会话 Cookie。
-		//
-		// 放在 Bearer 之前是因为它对浏览器是唯一的路径（Cookie 自动携带），
-		// 而 Bearer 走的是显式请求头，两者不会互相干扰。
-		if handle := sessionHandleFrom(r); handle != "" && a.sessions.lookup(handle, token) {
+		switch via {
+		case viaSession:
 			// 会话/Cookie 会被浏览器自动携带，所以必须防 CSRF。
 			// 只对写方法强制：GET 修改不了任何东西，而 SSE 等长连接
 			// 不该因为缺 Origin 就被拒。
 			if isStateChanging(r.Method) && !requireSameOrigin(r) {
 				slog.Warn("拒绝来源不明的管理写请求（会话鉴权）",
 					"method", r.Method, "path", r.URL.Path,
+					"username", username,
 					"origin", r.Header.Get("Origin"),
 					"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"))
 				writeJSON(w, http.StatusForbidden, map[string]string{
@@ -307,31 +389,41 @@ func (a *App) adminGuard(next http.Handler) http.Handler {
 			}
 			next.ServeHTTP(w, r)
 			return
+
+		case viaBearer:
+			// Bearer 不随请求自动携带，本来就没有 CSRF 面，
+			// 所以这里**不做**同源校验 —— 给 curl 增加负担没有收益。
+			next.ServeHTTP(w, r)
+			return
 		}
 
-		if token == "" {
-			// 走到这里说明这个请求不享受回环免认证：要么来源不是回环，
-			// 要么是经本进程代理转发进来的（那属于外部访问）。
+		// 到这里说明既没有有效会话、也没有有效令牌。
+		//
+		// 曾经这里还有一条「回环地址免认证」的路径，v0.6.0 已移除：
+		// 它让同一个配置在本机访问和外部访问下表现完全不同，是用户报
+		// 「没见到登录界面」的直接原因。现在一律要凭据。
+		//
+		// 注意 viaOwnProxy / internalViaHeader 仍然必须保留 ——
+		// 它的作用已经不是「把回环请求降级」，而是保证经本进程代理转发进来的
+		// 请求一定带有这个标记。攻击者可以伪造它，但伪造的后果只是「把自己
+		// 变成一个普通的未认证请求」，对攻击者毫无好处，所以无需防伪。
+		if !a.hasAnyAdminCredential() {
 			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error": "admin_token_not_set",
-				"message": "该请求需要认证，但配置里没有 admin_token，已拒绝。" +
-					"请在 config.json 里设置 admin_token 后重载；" +
-					"若只想本机访问，可把 admin_addr 设为 127.0.0.1 并确认没有路由" +
-					"把 target 指向管理端口（经代理转发一律按外部请求处理）。",
+				"error": "admin_credentials_not_set",
+				"message": "该请求需要认证，但配置里既没有 admin_users 也没有 admin_token，已拒绝。" +
+					"请在 config.json 里配置后重载（admin_users 用 bcrypt 的 password_hash，推荐）。",
 			})
 			return
 		}
 
-		got, ok := bearerToken(r)
-		if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="goproxy admin"`)
-			writeJSON(w, http.StatusUnauthorized, map[string]string{
-				"error":   "unauthorized",
-				"message": "需要登录，或带 Authorization: Bearer <admin_token>",
-			})
-			return
-		}
-		next.ServeHTTP(w, r)
+		// 这条是给「用脚本/curl 的人」看的：他已经会读响应体，直接告诉他
+		// 两条路各怎么走。浏览器走的是 /_goproxy/session 的 401（文案不同），
+		// 因为前端要看的是状态码 + credentials_configured，不是这句话。
+		w.Header().Set("WWW-Authenticate", `Bearer realm="goproxy admin"`)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "unauthorized",
+			"message": "需要登录：浏览器打开 /_goproxy/ui/ 用用户名密码登录，脚本请带 Authorization: Bearer <admin_token>",
+		})
 	})
 }
 
@@ -348,21 +440,14 @@ func isStateChanging(method string) bool {
 //
 // 标记头由本进程在转发前往请求里注入（见 internalViaHeader），外部客户端
 // 理论上也能自己伪造这个头。但伪造的后果只是「把自己降级成需要认证」——
-// 相当于主动放弃回环免认证，对攻击者毫无好处，所以这里不需要额外防伪。
+// 相当于主动放弃任何可能的信任，对攻击者毫无好处，所以这里不需要额外防伪。
+//
+// v0.6.0 起回环不再免认证，这个函数也就不再用于「决定要不要放行」。
+// 保留它是因为 adminHandler 仍需要识别「经代理进来的请求」来做日志标注与
+// 避免把控制台重定向逻辑套到代理流量上；同样的判断在 probe 脚本里也仍是
+// 验证「路由指向管理端口能不能提权」的依据。
 func viaOwnProxy(r *http.Request) bool {
 	return r.Header.Get(internalViaHeader) != ""
-}
-
-// trustsLoopback 返回是否信任「来自回环地址」的请求。
-//
-// 默认信任（本机 curl / 脚本不必带令牌）。但一旦管理端口前面还有**别的**本地
-// 反向代理（nginx、Caddy 等），那些转发同样来自 127.0.0.1，且不会带本进程的
-// 标记头 —— 这时「回环」就同样不成立了，应当把 admin_trust_loopback 设为 false。
-func (a *App) trustsLoopback() bool {
-	a.mu.Lock()
-	v := a.adminTrustLoopback
-	a.mu.Unlock()
-	return v
 }
 
 // trustedNets 返回可信代理网段快照，登录限流用它解析真实 IP。
@@ -660,16 +745,27 @@ func (a *App) mutationResult(rev string, out *Config, id string) map[string]any 
 // ---------- 全局配置 ----------
 
 // configView 是 GET /_goproxy/config 的返回体。
-// 刻意不回传 admin_token 明文：界面从来不需要它，少一处泄露面。
+//
+// 刻意不回传 admin_token 明文、也不回传 admin_users 的 password_hash：
+// 界面只需要知道「配了几个账号、都叫什么」，永远不需要密码材料。
+// 少一处泄露面 —— 这个接口本身是能读到配置的，把凭据顺带带出去等于
+// 一次认证读取就泄漏全部凭据。
 type configView struct {
-	DefaultPorts       []int    `json:"default_ports"`
-	AdminAddr          string   `json:"admin_addr"`
-	AdminEnabled       bool     `json:"admin_enabled"`
-	AdminTokenSet      bool     `json:"admin_token_set"`
-	AdminTrustLoopback bool     `json:"admin_trust_loopback"`
-	AccessLog          bool     `json:"access_log"`
-	TrustedProxies     []string `json:"trusted_proxies"`
-	RouteCount         int      `json:"route_count"`
+	DefaultPorts   []int    `json:"default_ports"`
+	AdminAddr      string   `json:"admin_addr"`
+	AdminEnabled   bool     `json:"admin_enabled"`
+	AdminTokenSet  bool     `json:"admin_token_set"`
+	AccessLog      bool     `json:"access_log"`
+	TrustedProxies []string `json:"trusted_proxies"`
+	RouteCount     int      `json:"route_count"`
+
+	// AdminUsers 只给用户名，供界面展示「当前有哪些管理员」。
+	// 密码哈希绝不出现。
+	AdminUsers []string `json:"admin_users"`
+
+	// CredentialsConfigured 报告是否至少有一种可用凭据。
+	// 控制台据此在「什么都没配」时给出正确的引导，而不是让人猜。
+	CredentialsConfigured bool `json:"credentials_configured"`
 }
 
 func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -683,24 +779,28 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if !cfg.adminEnabled() {
 		addr = ""
 	}
+	names := make([]string, 0, len(cfg.AdminUsers))
+	for _, u := range cfg.AdminUsers {
+		names = append(names, u.Username)
+	}
 	writeJSON(w, http.StatusOK, configView{
-		DefaultPorts:       cfg.DefaultPorts,
-		AdminAddr:          addr,
-		AdminEnabled:       cfg.adminEnabled(),
-		AdminTokenSet:      cfg.AdminToken != "",
-		AdminTrustLoopback: cfg.adminTrustsLoopback(),
-		AccessLog:          cfg.AccessLog,
-		TrustedProxies:     cfg.TrustedProxies,
-		RouteCount:         len(cfg.Routes),
+		DefaultPorts:          cfg.DefaultPorts,
+		AdminAddr:             addr,
+		AdminEnabled:          cfg.adminEnabled(),
+		AdminTokenSet:         cfg.AdminToken != "",
+		AccessLog:             cfg.AccessLog,
+		TrustedProxies:        cfg.TrustedProxies,
+		RouteCount:            len(cfg.Routes),
+		AdminUsers:            names,
+		CredentialsConfigured: cfg.hasAdminCredentials(),
 	})
 }
 
 type configPatch struct {
-	DefaultPorts       *[]int    `json:"default_ports"`
-	AccessLog          *bool     `json:"access_log"`
-	TrustedProxies     *[]string `json:"trusted_proxies"`
-	AdminToken         *string   `json:"admin_token"`
-	AdminTrustLoopback *bool     `json:"admin_trust_loopback"`
+	DefaultPorts   *[]int    `json:"default_ports"`
+	AccessLog      *bool     `json:"access_log"`
+	TrustedProxies *[]string `json:"trusted_proxies"`
+	AdminToken     *string   `json:"admin_token"`
 }
 
 func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -746,9 +846,6 @@ func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.AdminToken != nil {
 			cfg.AdminToken = *p.AdminToken
-		}
-		if p.AdminTrustLoopback != nil {
-			cfg.AdminTrustLoopback = p.AdminTrustLoopback
 		}
 		return nil
 	})

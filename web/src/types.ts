@@ -199,14 +199,40 @@ export interface PortInfo {
  */
 export interface SessionInfo {
   authenticated: boolean
-  via: 'session' | 'loopback' | 'bearer' | 'none'
+  /**
+   * 这次请求是靠什么通过认证的。
+   *   session —— 浏览器登录后拿到的会话 Cookie（唯一「有身份」的那种）
+   *   bearer  —— 带 Authorization: Bearer <admin_token> 的脚本/探针
+   * 未认证时后端不回这个字段。
+   *
+   * v0.6.0 去掉了 'loopback'：回环不再免认证，本机访问同样要凭据。
+   */
+  via: 'session' | 'bearer' | ''
+  /** 仅当 via === 'session' 为 true。前端据此决定要不要渲染「登出」 */
   has_session: boolean
+  /** 登录账号名。via === 'session' 时后端一定给得出；bearer 时为空串 */
+  username: string
+  /** 配置里是否设了 admin_token（展示用，不参与鉴权决定） */
   token_set: boolean
+}
+
+/** /_goproxy/session 在 401 时的响应体。前端靠它区分「该登录」和「该去配账号」 */
+export interface SessionUnauthorized {
+  error: string
+  message: string
+  /**
+   * 服务端到底有没有配过凭据。
+   *
+   * false 时登录页必须直接说「去 config.json 配一个账号」，
+   * 而不是显示「用户名或密码错误」—— 后者会让人对着一个
+   * 从来没设过的账号反复试密码。
+   */
+  credentials_configured: boolean
 }
 
 // ---------- 全局配置 ----------
 
-/** admin_api.go 的 configView。刻意不含 admin_token 明文。 */
+/** admin_api.go 的 configView。刻意不含 admin_token 明文与任何密码哈希。 */
 export interface ConfigView {
   default_ports: number[]
   admin_addr: string
@@ -215,6 +241,10 @@ export interface ConfigView {
   access_log: boolean
   trusted_proxies: string[] | null
   route_count: number
+  /** 当前配置了哪些管理员账号。**只有用户名**，密码哈希永远不下发。 */
+  admin_users: string[]
+  /** 是否至少有一种可用凭据（admin_users 或 admin_token） */
+  credentials_configured: boolean
 }
 
 export interface ConfigPatch {

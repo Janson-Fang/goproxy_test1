@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type App struct {
@@ -34,13 +36,13 @@ type App struct {
 	lastMod   time.Time
 	lastSize  int64
 
-	// adminToken 管理接口令牌。只从回环访问时不需要，非回环必须带。
+	// adminToken 管理接口令牌，用于 Authorization: Bearer。
+	// v0.6.0 起回环不再免认证，所以它不再是「只有外部访问才需要」的东西。
 	adminToken string
 
-	// adminTrustLoopback 是否信任来自回环地址的请求。
-	// 默认 true（本机 curl / 脚本免令牌）；管理端口前面还挂了别的本地反代时
-	// 应设为 false —— 那些转发同样来自 127.0.0.1，却不是「本机运维」。
-	adminTrustLoopback bool
+	// adminAccounts 控制台的管理员账号（用户名 + bcrypt 哈希）。
+	// 与 adminToken 并存：前者给浏览器登录用，后者给脚本用。
+	adminAccounts *adminAccounts
 
 	// sessions 管理控制台的登录会话。内存存储：进程重启即全部失效，
 	// 对单机自托管是可接受的取舍（换来的是「不引入存储依赖」）。
@@ -70,16 +72,47 @@ func NewApp(cfgPath string) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 先放一个空账号表而不是留 nil：nil 会让「还没 reload」这个很短的时间窗里
+	// 出现 nil 解引用。空表在行为上等价于「没配账号」，语义上也更准确。
+	empty, err := newAdminAccounts(nil)
+	if err != nil {
+		return nil, err
+	}
 	return &App{
-		cfgPath:   cfgPath,
-		transport: newTransport(),
-		listeners: NewListenerManager(),
-		metrics:   NewMetrics(),
-		logs:      newLogBuffer(logRingSize),
-		sessions:  newSessionStore(),
-		lastMod:   st.ModTime(),
-		lastSize:  st.Size(),
+		cfgPath:       cfgPath,
+		transport:     newTransport(),
+		listeners:     NewListenerManager(),
+		metrics:       NewMetrics(),
+		logs:          newLogBuffer(logRingSize),
+		sessions:      newSessionStore(),
+		adminAccounts: empty,
+		lastMod:       st.ModTime(),
+		lastSize:      st.Size(),
 	}, nil
+}
+
+// warnIfNoAdminCredentials 在管理端口开着但没有任何凭据时给出明确指引。
+//
+// 这种状态下管理接口完全打不开，这是有意为之：宁可打不开，也不能出现
+// 「没配凭据却谁都能改路由」的情况。但「有意拒绝」和「配置漏了」在现象上
+// 是一样的，都会让人对着 401/403 反复试，所以启动时就把话说清楚，
+// 并给出可以直接照抄的命令。
+func (a *App) warnIfNoAdminCredentials() {
+	a.mu.Lock()
+	enabled := a.adminAddr != ""
+	hasCred := a.hasAnyAdminCredentialLocked()
+	a.mu.Unlock()
+
+	if !enabled || hasCred {
+		return
+	}
+	slog.Warn("管理端口已开启，但配置里没有任何管理凭据，所有管理接口都会拒绝访问",
+		"admin_addr", a.adminAddr,
+		"控制台", "/_goproxy/ui/")
+	slog.Warn("请二选一配置后保存，保存后会自动热重载：" +
+		"admin_users（用户名加 bcrypt 密码哈希，推荐给浏览器登录）" +
+		" 或 admin_token（一个令牌，推荐给脚本和 Prometheus）")
+	slog.Warn("生成 password_hash 的命令", "cmd", "goproxy -hash-password <你的密码>")
 }
 
 // warnIfConfigUnwritable 启动时探一下配置目录能不能写。
@@ -164,8 +197,16 @@ func (a *App) reload() error {
 	} else {
 		a.adminAddr = ""
 	}
+
+	// 管理员账号在重载时重建。这一步**同时**实现了「改密码 / 删账号 → 其会话
+	// 立刻失效」：会话每次请求都会拿当前账号表的指纹去比对，
+	// 账号表一变，旧会话的指纹就对不上了（见 identifyAdminRequest）。
+	accounts, err := newAdminAccounts(cfg.AdminUsers)
+	if err != nil {
+		return err
+	}
+	a.adminAccounts = accounts
 	a.adminToken = cfg.AdminToken
-	a.adminTrustLoopback = cfg.adminTrustsLoopback()
 	a.accessLog.Store(cfg.AccessLog)
 	a.table.Store(tbl)
 
@@ -554,8 +595,10 @@ func serveAdminIndex(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	io.WriteString(w, "goproxy admin\n"+
 		"  管理控制台（浏览器打开）  "+uiPrefix+"\n"+
+		"  登录用 config.json 里 admin_users 配置的用户名 / 密码\n"+
+		"  以下接口全部需要凭据（会话 Cookie 或 Bearer 令牌），本机访问也不例外：\n"+
 		"  /healthz  /readyz  /metrics\n"+
-		"  /_goproxy/login           POST 用 admin_token 换取会话 Cookie\n"+
+		"  /_goproxy/login           POST {username,password} 或 {token} 换取会话 Cookie\n"+
 		"  /_goproxy/session         GET 当前登录态  DELETE 登出\n"+
 		"  /_goproxy/routes          GET 列出路由  POST 新建\n"+
 		"  /_goproxy/routes/{id}     GET / PUT / PATCH(局部改) / DELETE\n"+
@@ -757,6 +800,9 @@ func (a *App) Run(ctx context.Context) error {
 	// 放在 reload 之后：配置文件本身读不到会先在这里上面就退出，
 	// 能走到这说明「读」没问题，接下来要确认「写」也没问题。
 	a.warnIfConfigUnwritable()
+	// 同理，「管理凭据没配」也要等 reload 之后才能判断（reload 才把
+	// 配置里的账号表建起来）。
+	a.warnIfNoAdminCredentials()
 
 	a.mu.Lock()
 	adminAddr := a.adminAddr
@@ -810,10 +856,25 @@ func main() {
 	logLevel := flag.String("log-level", "info", "日志级别: debug|info|warn|error")
 	textLog := flag.Bool("text-log", false, "输出人类可读日志（默认 JSON）")
 	showVer := flag.Bool("version", false, "打印版本信息并退出")
+	hashPw := flag.String("hash-password", "",
+		"把给定密码算成 bcrypt 哈希并退出（用于填进 config.json 的 admin_users[].password_hash）")
 	flag.Parse()
 
 	if *showVer {
 		fmt.Printf("goproxy %s (commit %s)\n", version, commit)
+		return
+	}
+
+	if *hashPw != "" {
+		h, err := bcrypt.GenerateFromPassword([]byte(*hashPw), bcrypt.DefaultCost)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "生成失败: %v\n", err)
+			os.Exit(1)
+		}
+		// 只往 stdout 打哈希本身，方便直接 $(...) 取用。
+		// 提示语走 stderr，免得被一起捕获进去。
+		fmt.Println(string(h))
+		fmt.Fprintln(os.Stderr, "把上面这行填进 config.json 的 admin_users[].password_hash")
 		return
 	}
 

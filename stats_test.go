@@ -48,11 +48,12 @@ func newStatsEnv(t *testing.T) (*testEnv, []int) {
 	cfg := fmt.Sprintf(`{
   "default_ports": [%d],
   "admin_addr": "127.0.0.1:%d",
+  "admin_token": %q,
   "access_log": true,
   "routes": [
     {"id":"seed","name":"种子路由","listen_port":%d,"path_prefix":"/","target":%q}
   ]
-}`, p[0], p[2], p[1], backend.URL)
+}`, p[0], p[2], testToken, p[1], backend.URL)
 
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
@@ -70,7 +71,9 @@ func newStatsEnv(t *testing.T) (*testEnv, []int) {
 		defer cancel()
 		a.listeners.ShutdownAll(ctx)
 	})
-	return &testEnv{app: a, path: path, p: p}, p
+	// token 必须带上：本文件里的用例都是「打到管理接口读指标」，
+	// 而 v0.6.0 起回环不再免认证，不带给就是 401。
+	return &testEnv{app: a, path: path, p: p, token: testToken}, p
 }
 
 // hit 向数据端口发一个真实请求。
@@ -448,7 +451,7 @@ func TestStatsEndpointReportsCircuitState(t *testing.T) {
 	// 这条路由配了熔断、指向一个没人监听的端口：先打几次把错误率顶上去
 	cbPort := nextPorts(1)[0]
 	bePort := nextPorts(1)[0]
-	e := newTestEnv(t, "", fmt.Sprintf(
+	e := newTestEnv(t, testToken, fmt.Sprintf(
 		`{"id":"cb","listen_port":%d,"path_prefix":"/","target":"http://127.0.0.1:%d",`+
 			`"circuit_breaker":{"min_calls":2,"error_rate":0.5,"window_secs":10,"open_secs":30}}`,
 		cbPort, bePort))
@@ -493,10 +496,13 @@ func TestEventsStreamsAccessLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// 这里手工构造请求（要走真实 HTTP，才能验 SSE 的流式响应头），
+	// 所以必须自己带上令牌：v0.6.0 起 /_goproxy/events 同样在 adminGuard 后面。
 	req, err := http.NewRequestWithContext(ctx, "GET", srv.URL+"/_goproxy/events", nil)
 	if err != nil {
 		t.Fatalf("构造请求失败: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	resp, err := noProxyClient().Do(req)
 	if err != nil {
 		t.Fatalf("连接 SSE 失败: %v", err)

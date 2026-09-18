@@ -14,6 +14,9 @@
 # 只装二进制、不装 systemd（容器里用这个）：
 #   curl -fsSL .../install.sh | sudo bash -s -- --no-service
 #
+# 无人值守安装（CI / 容器 / 批量部署）—— 跳过设置管理员账号的交互：
+#   curl -fsSL .../install.sh | sudo bash -s -- --no-admin-prompt
+#
 # 不想用 root（装到家目录）：
 #   curl -fsSL .../install.sh | BIN_DIR=$HOME/.local/bin CONFIG_DIR=$HOME/.goproxy bash -s -- --no-service
 #
@@ -21,6 +24,11 @@
 #   MIRROR=auto   默认值，先试直连，不通自动切加速镜像
 #   MIRROR=direct 强制直连，不走镜像
 #   MIRROR=https://ghfast.top/  指定自己的镜像前缀
+#
+# 首次安装会引导你设置一个管理账号（用户名 + 密码）。控制台需要登录才能用，
+# 从 v0.6.0 起连本机访问也不例外。密码不会明文落地，只保存 bcrypt 哈希。
+# 之后想改密码：goproxy -hash-password '新密码'，把输出填进 config.json
+# 的 admin_users[].password_hash，保存后会自动热重载。
 
 set -euo pipefail
 
@@ -41,18 +49,29 @@ MIRROR="${MIRROR:-auto}"
 MIRROR_LIST="${MIRROR_LIST:-https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/}"
 WITH_SERVICE=1
 RESTART=1
+# 设成 1 就完全跳过「引导设置管理员账号」那一步。
+# CI / 容器 / 无人值守安装必须开它 —— 否则脚本会挂在等待终端输入上。
+# 也可以用环境变量 NO_ADMIN_PROMPT=1 达到同样效果。
+NO_ADMIN_PROMPT="${NO_ADMIN_PROMPT:-0}"
 
 # 只取脚本头部的注释块当帮助信息。
-# 之前写的是 2,24p —— 会把 set / REPO= / VERSION= 这些内部语句一起打出来。
+#
+# 之前写的是 2,23p，两个毛病：一是会把 set / REPO= / VERSION= 这些内部语句
+# 一起打出来，二是范围写死 —— 往头部补几行说明，帮助里就会**少掉最后几行**
+# （v0.6.0 加「引导设置管理员账号」那段时就踩到了，静默截断，没有任何报错）。
+#
+# 现在改成「从第 2 行读到最后一个连续注释行为止」：范围跟着内容走，
+# 补注释不用再来改这个数字。
 usage() {
-    sed -n '2,23p' "${BASH_SOURCE[0]:-}" 2>/dev/null ||
-        echo "用法: install.sh [--no-service] [--no-restart] [--version vX.Y.Z]"
+    sed -n '2,/^[^#]/p' "${BASH_SOURCE[0]:-}" 2>/dev/null | sed '$d' ||
+        echo "用法: install.sh [--no-service] [--no-restart] [--version vX.Y.Z] [--no-admin-prompt]"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --no-service) WITH_SERVICE=0 ;;
-        --no-restart) RESTART=0 ;;
+        --no-service)      WITH_SERVICE=0 ;;
+        --no-restart)      RESTART=0 ;;
+        --no-admin-prompt) NO_ADMIN_PROMPT=1 ;;
         --version)    VERSION="${2:?--version 后面要跟版本号}"; shift ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "未知参数: $1（--help 看用法）" >&2; exit 1 ;;
@@ -280,12 +299,140 @@ NEW_VER=$(printf '%s\n' "$VER_OUT" | sed -n 's/^goproxy \([^ ]*\).*/\1/p' | head
 
 # ---------- 8. 配置文件 ----------
 $SUDO install -d "$CONFIG_DIR"
+
+# gen_admin_hash <密码> —— 调 goproxy 自己的 -hash-password 算 bcrypt。
+#
+# 为什么不在这里内联别的实现：密码哈希一旦算错（cost 不对、salt 生成有 bug、
+# 用了没法验的编码），症状是「登录永远失败」而且极难排查。
+# 让二进制自己算，服务端用什么校验、这里就生成什么，不可能不一致。
+gen_admin_hash() {
+    "$BIN_DIR/goproxy" -hash-password "$1" 2>/dev/null | head -n1
+}
+
+# 把 admin_users 注入 config.json。优先用 python3（几乎所有发行版都有），
+# 没有就退回 sed —— 示例配置里 admin_users 恰好是空数组 "admin_users": []，
+# 这个形态足够稳定，不会误伤别处。
+inject_admin_user() { # inject_admin_user <文件> <用户名> <哈希>
+    local f="$1" u="$2" h="$3"
+    if command -v python3 >/dev/null 2>&1; then
+        $SUDO python3 - "$f" "$u" "$h" <<'PYEOF'
+import json, sys
+path, user, phash = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as fh:
+    cfg = json.load(fh)
+cfg.setdefault("admin_users", [])
+cfg["admin_users"] = [u for u in cfg["admin_users"] if u.get("username") != user]
+cfg["admin_users"].append({"username": user, "password_hash": phash})
+with open(path, "w") as fh:
+    json.dump(cfg, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PYEOF
+    else
+        # 转义哈希与用户名里的 / & \ 以适配 sed 的替换语义
+        local eu eh
+        eu=$(printf '%s' "$u" | sed 's/[&/\\]/\\&/g')
+        eh=$(printf '%s' "$h" | sed 's/[&/\\]/\\&/g')
+        $SUDO sed -i \
+            "s|\"admin_users\"[[:space:]]*:[[:space:]]*\[\]|\"admin_users\": [{\"username\": \"$eu\", \"password_hash\": \"$eh\"}]|" \
+            "$f"
+    fi
+}
+
+# 交互式引导设置一个管理员账号。
+#
+# 从 /dev/tty 读而不是 stdin：这个脚本最常见的用法是
+#   curl ... | sudo bash
+# 那时 stdin 是**脚本自身的管道**，对它 read 会吃掉还没执行的脚本文本。
+# /dev/tty 指向真正的终端，不受管道影响。非交互环境（CI、容器）下
+# /dev/tty 打不开，所以必须处理好这个分支。
+prompt_admin_credentials() { # prompt_admin_credentials <文件>
+    local f="$1" user pw pw2 hash
+
+    if [ "${NO_ADMIN_PROMPT:-0}" = "1" ]; then
+        return 1
+    fi
+    # 有 /dev/tty 且可读才进入交互；否则交给调用方打非交互提示。
+    if [ ! -r /dev/tty ]; then
+        return 1
+    fi
+
+    printf '\n' > /dev/tty
+    printf '%s\n' "----------------------------------------" > /dev/tty
+    printf '%s\n' " 设置管理控制台的登录账号" > /dev/tty
+    printf '%s\n' "----------------------------------------" > /dev/tty
+    printf '%s\n' "控制台现在需要用户名 + 密码登录。请现在设置一个，" > /dev/tty
+    printf '%s\n' "否则从浏览器打开会看到「还没有配置管理员账号」。" > /dev/tty
+    printf '%s\n' "（以后也可以用: goproxy -hash-password '密码' 自己改）" > /dev/tty
+    printf '\n' > /dev/tty
+
+    printf '用户名 [admin]: ' > /dev/tty
+    read -r user < /dev/tty || return 1
+    [ -n "$user" ] || user="admin"
+
+    # read -s：不回显密码。两次输入以防打错 —— 密码是要进 bcrypt 的，
+    # 打错了自己看不出来，只能靠登录失败才发现。
+    while :; do
+        printf '密码: ' > /dev/tty
+        read -rs pw < /dev/tty || return 1
+        printf '\n' > /dev/tty
+        if [ -z "$pw" ]; then
+            printf '密码不能为空，请重新输入。\n' > /dev/tty
+            continue
+        fi
+        printf '再输一次: ' > /dev/tty
+        read -rs pw2 < /dev/tty || return 1
+        printf '\n' > /dev/tty
+        if [ "$pw" = "$pw2" ]; then
+            break
+        fi
+        printf '两次输入不一致，请重新输入。\n' > /dev/tty
+    done
+
+    hash=$(gen_admin_hash "$pw")
+    unset pw pw2
+    if [ -z "$hash" ]; then
+        warn "生成密码哈希失败，请稍后手动执行: goproxy -hash-password '密码'"
+        return 1
+    fi
+    if ! inject_admin_user "$f" "$user" "$hash"; then
+        warn "写入 admin_users 失败，请手动编辑 $f"
+        return 1
+    fi
+    ok "已设置管理账号「$user」（密码只以 bcrypt 哈希形式保存，脚本不留副本）"
+    return 0
+}
+
 if [ -f "$CONFIG_DIR/config.json" ]; then
     warn "$CONFIG_DIR/config.json 已存在，保持不动（新版本示例放在 config.json.example）"
     $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_DIR/config.json.example"
+
+    # 老配置升级上来的情况：以前 admin_token 是唯一凭据，现在用户也可能
+    # 想改用账号登录。这里只在**确实一个凭据都没有**时才提示 ——
+    # 已经有 admin_token 的环境照样能用（Bearer 仍然有效），不该被打扰。
+    if ! grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CONFIG_DIR/config.json" 2>/dev/null &&
+       ! grep -q '"admin_token"[[:space:]]*:[[:space:]]*"[^"]' "$CONFIG_DIR/config.json" 2>/dev/null; then
+        warn "检测到这份配置里没有任何管理员凭据 —— 管理接口会拒绝所有请求。"
+        if ! prompt_admin_credentials "$CONFIG_DIR/config.json"; then
+            warn "没有设置账号。请手动在 $CONFIG_DIR/config.json 里加 admin_users，例如："
+            warn "  \"admin_users\": [{\"username\": \"admin\", \"password_hash\": \"\$(goproxy -hash-password '你的密码')\"}]"
+        fi
+    fi
 else
     $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_DIR/config.json"
     ok "已生成配置 $CONFIG_DIR/config.json"
+
+    # 这是「默认安装」路径 —— 也是最容易出问题的一条。
+    # 示例配置里没有 admin_token，历史版本因此让人从浏览器打开时
+    # 只看到一张「已拒绝所有外部请求」的说明页（用户反馈过「没见到登录界面」）。
+    # 现在一律要登录，所以这一步要么在这里问出账号，要么明确告诉人怎么补。
+    if ! prompt_admin_credentials "$CONFIG_DIR/config.json"; then
+        warn "尚未设置管理账号 —— 控制台现在需要用户名 + 密码才能登录。"
+        warn "两种补法（任选其一，改完会自动热重载，不用重启）："
+        warn "  1. 重新运行本脚本，在交互提示里设置；"
+        warn "  2. 手动编辑 $CONFIG_DIR/config.json，加上管理员账号："
+        warn "       goproxy -hash-password '你的密码'"
+        warn "     把输出填进 admin_users[].password_hash，字段格式见 config.json.example。"
+    fi
     warn "这是示例配置，后端指向 127.0.0.1:9001 等本机端口，先改成你自己的后端"
 fi
 
@@ -448,6 +595,34 @@ echo "  二进制    $BIN_DIR/goproxy"
 echo "  配置文件  $CONFIG_DIR/config.json"
 if [ -n "$OLD_VER" ]; then
     echo "  旧二进制  $BIN_DIR/goproxy.old（回滚用）"
+fi
+
+# 明确告诉人「控制台地址是什么、以及有没有账号能进去」。
+#
+# 这段是有意加的：以前装完只说了配置文件和二进制路径，用户从浏览器打开
+# 管理端口时看到的是「已拒绝所有外部请求」，完全不知道下一步该干什么，
+# 反馈过「没见到登录界面」。把这两条直接写出来能省掉一整轮排查。
+ADMIN_ADDR=$(sed -n 's/.*"admin_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_DIR/config.json" 2>/dev/null | head -n1)
+if grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CONFIG_DIR/config.json" 2>/dev/null; then
+    HAS_CRED="yes"
+else
+    HAS_CRED="no"
+fi
+
+if [ -n "$ADMIN_ADDR" ]; then
+    echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/"
+fi
+echo
+if [ "$HAS_CRED" = "yes" ]; then
+    echo "控制台登录：用刚才设置的用户名 + 密码。"
+elif [ "$NO_ADMIN_PROMPT" = "1" ]; then
+    echo "注意：没有设置管理员账号，控制台暂时登录不进去。补一个："
+    echo "  $BIN_DIR/goproxy -hash-password '你的密码'"
+    echo "  把输出填进 $CONFIG_DIR/config.json 的 admin_users[].password_hash"
+    echo "  保存后自动热重载，不用重启。"
+else
+    echo "注意：没有设置管理员账号，控制台暂时登录不进去。"
+    echo "  重新运行本安装脚本即可在交互提示里设置，或按上面的命令手动补。"
 fi
 echo
 if [ "$SVC_RESTARTED" = "1" ]; then

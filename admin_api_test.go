@@ -21,6 +21,18 @@ import (
 // 刚关闭的监听端口会短暂无法重绑。单调递增最省心。
 var portSeq int32 = 18000
 
+// testToken 是绝大多数用例里配的 admin_token。
+//
+// 为什么要有这么一个共享常量：v0.6.0 起回环不再免认证，凡是「要调管理接口
+// 才能测的东西」都必须先过鉴权。绝大多数用例真正想验的是路由/配置/指标，
+// 认证只是它们路上的一道必经关卡 —— 与其在几十个 newTestEnv 里各写一遍
+// 字面量（改起来容易漏），不如统一从这个常量取。
+//
+// 真正在测认证本身的用例（TestAdminAuth、TestLoopbackNoLongerBypassesAuth、
+// TestNoCredentialsConfiguredRejectsEverything 等）继续用各自的字面量或
+// 空字符串，不受这里影响。
+const testToken = "s3cret-admin-token"
+
 func nextPorts(n int) []int {
 	start := atomic.AddInt32(&portSeq, int32(n)) - int32(n) + 1
 	out := make([]int, n)
@@ -34,6 +46,12 @@ type testEnv struct {
 	app  *App
 	path string
 	p    []int
+
+	// token 是这份测试配置里的 admin_token。do() 默认带上它 ——
+	// v0.6.0 起回环不再免认证，如果还依赖「来自 127.0.0.1 就放行」，
+	// 那么每个既有用例都会变成 401，而这些用例真正要测的并不是认证。
+	// 需要测「未认证会怎样」的用例自己用 noAuth() 去掉这个头。
+	token string
 }
 
 // newTestEnv 起一个真的在监听端口的管理端环境。
@@ -76,11 +94,15 @@ func newTestEnv(t *testing.T, adminToken string, extraRoute string) *testEnv {
 		defer cancel()
 		a.listeners.ShutdownAll(ctx)
 	})
-	return &testEnv{app: a, path: path, p: p}
+	return &testEnv{app: a, path: path, p: p, token: adminToken}
 }
 
 // do 把请求喂给管理端 mux。走 mux 而不是直接调 handler，
 // 是因为 {id} 这类路径参数要靠 ServeMux 填进 PathValue。
+//
+// 默认带上 Bearer 令牌（回环不再免认证，不带就是 401）。
+// RemoteAddr 仍然设成回环：这既是「真实本机调用」的模拟，
+// 也顺带保证「回环不再自动放行」这件事被每个用例持续验证着。
 func (e *testEnv) do(t *testing.T, method, path, body string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
 	t.Helper()
 	var r io.Reader
@@ -88,13 +110,21 @@ func (e *testEnv) do(t *testing.T, method, path, body string, opts ...func(*http
 		r = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, r)
-	req.RemoteAddr = "127.0.0.1:34567" // 默认按回环处理，认证自动放行
+	req.RemoteAddr = "127.0.0.1:34567"
+	if e.token != "" {
+		req.Header.Set("Authorization", "Bearer "+e.token)
+	}
 	for _, o := range opts {
 		o(req)
 	}
 	rr := httptest.NewRecorder()
 	e.app.adminHandler().ServeHTTP(rr, req)
 	return rr
+}
+
+// noAuth 清掉默认带上的 Bearer 令牌，用来测「未认证」的分支。
+func noAuth() func(*http.Request) {
+	return func(r *http.Request) { r.Header.Del("Authorization") }
 }
 
 func remote(addr string) func(*http.Request) {
@@ -153,7 +183,7 @@ func readConfigFromDisk(t *testing.T, path string) ([]byte, Config) {
 }
 
 func TestAdminRouteCRUD(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 	np := nextPorts(2)
 
 	// --- 列表 ---
@@ -262,7 +292,7 @@ func TestAdminRouteCRUD(t *testing.T) {
 }
 
 func TestRouteCreateDuplicateID(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 	body := fmt.Sprintf(`{"id":"seed","listen_port":%d,"target":"http://127.0.0.1:9000"}`, e.p[3])
 	rr := e.do(t, "POST", "/_goproxy/routes", body)
 	if rr.Code != http.StatusConflict {
@@ -274,7 +304,7 @@ func TestRouteCreateDuplicateID(t *testing.T) {
 }
 
 func TestRouteAutoIDAndDefaults(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 	body := fmt.Sprintf(`{"listen_port":%d,"target":"http://127.0.0.1:9000"}`, e.p[3])
 	rr := e.do(t, "POST", "/_goproxy/routes", body)
 	if rr.Code != http.StatusCreated {
@@ -297,7 +327,7 @@ func TestRouteAutoIDAndDefaults(t *testing.T) {
 
 // 两个页签同时编辑时，后提交的那个必须被挡下，否则前一个人的修改会被静默吞掉。
 func TestIfMatchPreventsLostUpdate(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 
 	rr := e.do(t, "GET", "/_goproxy/routes", "")
 	revA := strings.Trim(rr.Header().Get("ETag"), `"`)
@@ -323,7 +353,7 @@ func TestIfMatchPreventsLostUpdate(t *testing.T) {
 }
 
 func TestInvalidRouteRejectedWithoutTouchingFile(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 	before, err := os.ReadFile(e.path)
 	if err != nil {
 		t.Fatal(err)
@@ -360,7 +390,7 @@ func TestInvalidRouteRejectedWithoutTouchingFile(t *testing.T) {
 // 局部更新必须只覆盖报文里出现过的字段。这条要是错了，
 // 界面上改个名字就会把限流、熔断、认证全清掉，而且很难发现。
 func TestPatchMergesAndNullClears(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 	np := nextPorts(1)
 
 	body := fmt.Sprintf(
@@ -401,24 +431,27 @@ func TestPatchMergesAndNullClears(t *testing.T) {
 func TestAdminAuth(t *testing.T) {
 	const external = "203.0.113.9:5555"
 
-	t.Run("非回环且未配 token 时一律拒绝", func(t *testing.T) {
+	t.Run("一个凭据都没配时一律 403", func(t *testing.T) {
 		e := newTestEnv(t, "", "")
 		rr := e.do(t, "GET", "/_goproxy/routes", "", remote(external))
 		if rr.Code != http.StatusForbidden {
 			t.Fatalf("应 403，实际 %d: %s", rr.Code, rr.Body)
 		}
-		if !strings.Contains(rr.Body.String(), "admin_token_not_set") {
+		if !strings.Contains(rr.Body.String(), "admin_credentials_not_set") {
 			t.Fatalf("错误码不对: %s", rr.Body)
 		}
-		if rr := e.do(t, "GET", "/_goproxy/routes", ""); rr.Code != http.StatusOK {
-			t.Fatalf("回环地址应放行，实际 %d", rr.Code)
+		// v0.6.0 起回环不再免认证：本机访问同样 403。
+		// 旧版本这里断言的是 200（「回环地址应放行」），那正是
+		// 「同一个配置在本机和别处表现不同」的根源，已经删掉了。
+		if rr := e.do(t, "GET", "/_goproxy/routes", "", noAuth()); rr.Code != http.StatusForbidden {
+			t.Fatalf("未配凭据时回环也应 403，实际 %d", rr.Code)
 		}
 	})
 
 	t.Run("配了 token 后校验 Bearer", func(t *testing.T) {
 		e := newTestEnv(t, "s3cret-token", "")
 
-		if rr := e.do(t, "GET", "/_goproxy/routes", "", remote(external)); rr.Code != http.StatusUnauthorized {
+		if rr := e.do(t, "GET", "/_goproxy/routes", "", remote(external), noAuth()); rr.Code != http.StatusUnauthorized {
 			t.Fatalf("不带 token 应 401，实际 %d", rr.Code)
 		}
 		if rr := e.do(t, "GET", "/_goproxy/routes", "", remote(external),
@@ -431,7 +464,10 @@ func TestAdminAuth(t *testing.T) {
 		}
 		// 这是最关键的一条：X-Forwarded-For 是客户端随手可写的，
 		// 伪造它说「我是本机」绝不能被当成回环访问放行。
+		// v0.6.0 起回环本身就不放行了，但这条断言仍然有价值：
+		// 它保证没有人偷偷把「看 XFF 判断来源」这种写法加回来。
 		if rr := e.do(t, "GET", "/_goproxy/routes", "", remote(external),
+			noAuth(),
 			header("X-Forwarded-For", "127.0.0.1"),
 			header("X-Real-IP", "127.0.0.1")); rr.Code != http.StatusUnauthorized {
 			t.Fatalf("伪造 XFF 不该绕过认证，实际 %d", rr.Code)
@@ -439,81 +475,126 @@ func TestAdminAuth(t *testing.T) {
 	})
 }
 
-// TestAdminGuardRejectsProxiedLoopbackRequest 是本文件里最要紧的一条回归测试。
+// TestAdminGuardRejectsProxiedLoopbackRequest 守住「经代理转发不能白拿权限」。
 //
-// 背景：管理端对来自回环的请求免认证，而代理转发正是从 127.0.0.1 发出的。
-// 于是「把一条路由的 target 指向管理端口」就能让外部客户端白拿免认证的管理权限。
-// 实测确认过：这样读 /_goproxy/config、写 POST /_goproxy/reload 全部 200。
+// 历史背景（v0.5.0）：管理端当时对来自回环的请求免认证，而代理转发正是从
+// 127.0.0.1 发出的。于是「把一条路由的 target 指向管理端口」就能让外部客户端
+// 白拿免认证的管理权限。实测确认过：这样读 /_goproxy/config、
+// 写 POST /_goproxy/reload 全部 200。
 //
-// 修法是让代理转发时打上标记头，管理端见到标记头就按「外部请求」处理。
-// 这条测试如果失败，说明那个越权洞又回来了。
+// v0.6.0 起回环不再免认证，这个洞从根上没了 —— 但本测试**保留**，
+// 因为它现在守的是另一件同样重要的事：标记头不能反过来成为放行理由。
+// 只要有人日后写出「见到标记头就跳过认证」这种反向逻辑，这里立刻红。
 func TestAdminGuardRejectsProxiedLoopbackRequest(t *testing.T) {
 	t.Run("带代理标记的回环请求必须认证", func(t *testing.T) {
-		e := newTestEnv(t, "s3cret-token", "")
+		e := newTestEnv(t, testToken, "")
 
-		// 不带令牌 → 必须被拒。未修时这里是 200，也就是越权成立。
-		rr := e.do(t, "GET", "/_goproxy/config", "", header(internalViaHeader, "1"))
+		// 不带凭据 → 必须被拒。未修时这里是 200，也就是越权成立。
+		rr := e.do(t, "GET", "/_goproxy/config", "", noAuth(), header(internalViaHeader, "1"))
 		if rr.Code != http.StatusUnauthorized {
-			t.Fatalf("经代理转发且无令牌应 401，实际 %d: %s", rr.Code, rr.Body)
+			t.Fatalf("经代理转发且无凭据应 401，实际 %d: %s", rr.Code, rr.Body)
 		}
 
 		// 带正确令牌 → 正常放行：加了标记不能把合法访问也一起挡死，
 		// 否则「用 TLS 路由把管理面板发布出去」这种正当用法就没法用了。
 		if rr := e.do(t, "GET", "/_goproxy/config", "",
-			header(internalViaHeader, "1"),
-			header("Authorization", "Bearer s3cret-token")); rr.Code != http.StatusOK {
+			header(internalViaHeader, "1")); rr.Code != http.StatusOK {
 			t.Fatalf("带正确令牌应 200，实际 %d: %s", rr.Code, rr.Body)
 		}
 	})
 
-	t.Run("不带标记的回环请求仍然免认证", func(t *testing.T) {
-		e := newTestEnv(t, "s3cret-token", "")
-		if rr := e.do(t, "GET", "/_goproxy/config", ""); rr.Code != http.StatusOK {
-			t.Fatalf("本机直连应免认证放行，实际 %d: %s", rr.Code, rr.Body)
+	t.Run("不带标记的回环请求同样要认证", func(t *testing.T) {
+		e := newTestEnv(t, testToken, "")
+		// v0.5.0 这里断言的是 200（「本机直连免认证」）。
+		// 那条豁免正是「控制台在别的机器上打开却没有登录入口」的根因，已删除。
+		if rr := e.do(t, "GET", "/_goproxy/config", "", noAuth()); rr.Code != http.StatusUnauthorized {
+			t.Fatalf("本机直连不带凭据也应 401，实际 %d: %s", rr.Code, rr.Body)
 		}
 	})
 
 	t.Run("伪造任意标记值同样要认证", func(t *testing.T) {
-		e := newTestEnv(t, "s3cret-token", "")
+		e := newTestEnv(t, testToken, "")
 		// 判断只认「有没有」这个头，不认值 —— 这样就不存在「猜中密钥就绕过」的说法。
 		if rr := e.do(t, "GET", "/_goproxy/config", "",
+			noAuth(),
 			header(internalViaHeader, "随便编一个")); rr.Code != http.StatusUnauthorized {
 			t.Fatalf("带标记头一律要认证，应 401，实际 %d", rr.Code)
 		}
 	})
 }
 
-// TestAdminTrustLoopbackCanBeDisabled 覆盖「管理端口前面还挂着别的本地反代」的场景：
-// 那种转发同样来自 127.0.0.1，却不会带本进程的标记头，只能靠开关关掉回环信任。
-func TestAdminTrustLoopbackCanBeDisabled(t *testing.T) {
+// TestLoopbackNoLongerBypassesAuth 是 v0.6.0 的行为变更守卫。
+//
+// v0.5.0 及以前：来自 127.0.0.1 的请求免认证。这条规则让同一个配置在
+// 「本机打开控制台」和「从别的机器打开控制台」下表现完全不同 ——
+// 前者直接进、后者可能看到登录页也可能看到被拒页，用户反馈过
+// 「没见到登录界面」，根因就在这里。
+//
+// 现在一律要凭据。这个用例把「回环也不行」钉死：万一以后有人觉得
+// 「本机调用加个豁免比较方便」又把它加回来，这里会立刻红。
+func TestLoopbackNoLongerBypassesAuth(t *testing.T) {
 	e := newTestEnv(t, "s3cret-token", "")
 
-	// 默认信任回环
+	// 来自回环、不带任何凭据 —— 必须 401，而不是 200
+	for _, path := range []string{
+		"/_goproxy/config", "/_goproxy/routes", "/_goproxy/stats",
+		"/metrics", "/healthz", "/readyz",
+	} {
+		rr := e.do(t, "GET", path, "", noAuth())
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("%s：回环地址不带凭据应 401，实际 %d", path, rr.Code)
+		}
+	}
+
+	// 写操作同样拦住，不能靠回环直连改配置
+	if rr := e.do(t, "POST", "/_goproxy/reload", "", noAuth()); rr.Code != http.StatusUnauthorized {
+		t.Errorf("回环地址不带凭据写操作应 401，实际 %d", rr.Code)
+	}
+
+	// 带上令牌就正常（证明上面拦的是「缺凭据」，不是把接口整个弄坏了）
 	if rr := e.do(t, "GET", "/_goproxy/config", ""); rr.Code != http.StatusOK {
-		t.Fatalf("默认应信任回环，实际 %d", rr.Code)
+		t.Errorf("带令牌应 200，实际 %d: %s", rr.Code, rr.Body)
+	}
+}
+
+// TestNoCredentialsConfiguredRejectsEverything 覆盖「一个凭据都没配」的状态。
+//
+// 这种状态下管理端必须彻底关门，并且回一个**能被前端识别的**错误码
+// （admin_credentials_not_set），而不是笼统的 401 ——
+// 否则用户会以为是自己密码打错了，对着一个从没设过的密码反复试。
+func TestNoCredentialsConfiguredRejectsEverything(t *testing.T) {
+	e := newTestEnv(t, "", "") // 既没有 admin_token，也没有 admin_users
+
+	rr := e.do(t, "GET", "/_goproxy/config", "", noAuth())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("无任何凭据时应 403，实际 %d", rr.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是 JSON: %v", err)
+	}
+	if body["error"] != "admin_credentials_not_set" {
+		t.Fatalf("错误码应是 admin_credentials_not_set，实际 %q", body["error"])
 	}
 
-	// 关掉（这次修改本身就靠回环免认证才做得了）
-	if rr := e.do(t, "PATCH", "/_goproxy/config",
-		`{"admin_trust_loopback":false}`); rr.Code != http.StatusOK {
-		t.Fatalf("关闭回环信任应 200，实际 %d: %s", rr.Code, rr.Body)
+	// 即便带了（根本不存在的）令牌也要拒绝
+	if rr := e.do(t, "GET", "/_goproxy/config", "",
+		header("Authorization", "Bearer whatever")); rr.Code != http.StatusForbidden {
+		t.Fatalf("凭据未配置时带任何令牌都应 403，实际 %d", rr.Code)
 	}
 
-	// 关掉之后，本机不带令牌也必须认证
-	if rr := e.do(t, "GET", "/_goproxy/config", ""); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("关闭后本机无令牌应 401，实际 %d: %s", rr.Code, rr.Body)
+	// 会话状态接口要如实告诉前端「服务端没配凭据」，
+	// 前端的登录页据此给出正确引导而不是「密码错误」
+	sess := e.do(t, "GET", "/_goproxy/session", "", noAuth())
+	if sess.Code != http.StatusUnauthorized {
+		t.Fatalf("/session 未登录应 401，实际 %d", sess.Code)
 	}
-
-	// 带令牌照常可用
-	authed := e.do(t, "GET", "/_goproxy/config", "",
-		header("Authorization", "Bearer s3cret-token"))
-	if authed.Code != http.StatusOK {
-		t.Fatalf("带令牌应 200，实际 %d", authed.Code)
+	var sv map[string]any
+	if err := json.Unmarshal(sess.Body.Bytes(), &sv); err != nil {
+		t.Fatalf("/session 响应不是 JSON: %v", err)
 	}
-
-	// 视图里要能读到这个开关的当前值
-	if v := decode[configView](t, authed); v.AdminTrustLoopback {
-		t.Fatal("configView 应反映 admin_trust_loopback=false")
+	if cfg, ok := sv["credentials_configured"].(bool); !ok || cfg {
+		t.Fatalf("/session 应报告 credentials_configured=false，实际 %v", sv["credentials_configured"])
 	}
 }
 
@@ -547,7 +628,7 @@ func TestReverseProxyMarksInternalVia(t *testing.T) {
 }
 
 func TestAdminConfigEndpoint(t *testing.T) {
-	e := newTestEnv(t, "", "")
+	e := newTestEnv(t, testToken, "")
 
 	rr := e.do(t, "GET", "/_goproxy/config", "")
 	if rr.Code != http.StatusOK {

@@ -1,11 +1,17 @@
 {
   "_说明": "生产配置示例。与 config.json 的区别：这里用 80 端口 + 域名分流，业务端口单独列出。",
+  "_管理端凭据说明": "管理控制台从 v0.6.0 起一律需要登录，本机访问也不例外（探针 /healthz、/readyz、/metrics 同样要认证）。两种凭据：(1) admin_users —— 给人用的「用户名 + 密码」，密码用 bcrypt 哈希存放，推荐；(2) admin_token —— 给脚本 / 监控探针用的 Bearer 令牌。两者可以同时配。一个都不配的话，所有管理接口都返回 403 admin_credentials_not_set，控制台会显示配置指引页。",
 
   "default_ports": [80, 443],
   "admin_addr": "127.0.0.1:9080",
   "_admin_addr_说明": "留空=用默认值 127.0.0.1:8080；写 off/none/disabled 可彻底关闭管理端口。改它属于启动期配置，改完要重启。",
-  "_admin_token_说明": "管理接口令牌。只在管理端口监听非回环地址时才需要；那时不配它，所有外部请求一律 403。回环地址访问不需要。",
-  "_admin_trust_loopback_说明": "默认 true = 本机访问免令牌。只有当你把管理端口前面又挂了别的本地反向代理（nginx/Caddy）时才需要设为 false —— 那种转发同样来自 127.0.0.1 却带不了本进程的标记头。注意：本进程自己的代理转发不需要靠它兜底，代理会写标记头，管理端一律按外部请求处理。",
+
+  "_admin_users_说明": "给人登录控制台用的账号列表。password_hash 用 `goproxy -hash-password '你的密码'` 生成（哈希必须和二进制同源，别用 htpasswd 之类自己算）。下面留空表示「还没配」，安装脚本会引导你填。改完保存即热重载，不用重启；改密码或删账号会让该账号的已有会话立刻失效。",
+  "admin_users": [],
+
+  "_admin_token_说明": "给脚本 / 监控探针用的 Bearer 令牌，不是给人登录用的。用 `curl -H 'Authorization: Bearer <token>'` 访问管理接口。留空 = 不启用这条凭据路径。",
+  "admin_token": "",
+
   "access_log": true,
 
   "trusted_proxies": ["10.0.0.0/8"],
