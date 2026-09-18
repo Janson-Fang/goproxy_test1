@@ -6,17 +6,13 @@ import type {
   JWTConfig,
   RateLimitScope,
   Route,
-  RouteACLConfig,
   RouteAuthConfig,
   TLSMode,
 } from '../types'
-import { Badge, Checkbox, Field, Modal, Note, Switch, toast } from '../ui'
+import { Checkbox, Field, Modal, Note, Switch, toast } from '../ui'
 import {
-  ipRulesToText,
-  looksLikeCIDR,
   normalizeIPRules,
   pairList,
-  parseIPRules,
   parsePairs,
   parsePorts,
   splitList,
@@ -70,9 +66,6 @@ interface FormState {
   jwtAudience: string
   jwtLeeway: string
   jwtForward: string
-
-  aclAllow: string
-  aclDeny: string
 }
 
 function emptyForm(): FormState {
@@ -111,8 +104,6 @@ function emptyForm(): FormState {
     jwtAudience: '',
     jwtLeeway: '',
     jwtForward: '',
-    aclAllow: '',
-    aclDeny: '',
   }
 }
 
@@ -173,11 +164,8 @@ function fromRoute(r: Route): FormState {
     }
   }
 
-  // 两份名单并存（v0.7.0）。空文本 = 这份名单没配，和「配了但是空的」是两件事，
-  // 后者会让白名单拒绝所有请求，所以在界面上根本无法表达 —— 只有配置文件能写出来，
-  // 后端在校验阶段会拦下它。
-  f.aclAllow = ipRulesToText(normalizeIPRules(r.acl?.allow))
-  f.aclDeny = ipRulesToText(normalizeIPRules(r.acl?.deny))
+  // 名单（acl.allow / acl.deny）不在这张表单里编辑 —— 它们统一在「IP 名单」页签维护。
+  // 表单只是原样把 r.acl 带过去，见下面 toRoute 的说明。
 
   return f
 }
@@ -206,7 +194,6 @@ function toRoute(f: FormState): Route {
     rate_limit: null,
     circuit_breaker: null,
     auth: null,
-    acl: null,
   }
 
   if (f.rlEnabled) {
@@ -256,17 +243,10 @@ function toRoute(f: FormState): Route {
     route.auth = auth
   }
 
-  // 名单只在真的配了内容时才写进 route —— 两边都是空 = 这条路由不做 IP 限制。
-  // 留空（而不是写成 allow: []）是必须的：显式空数组在白名单那一侧意味着
-  // 「谁都进不来」，后端会当成配置错误直接拒绝。
-  const aclAllow = parseIPRules(f.aclAllow)
-  const aclDeny = parseIPRules(f.aclDeny)
-  if (aclAllow.length > 0 || aclDeny.length > 0) {
-    const acl: RouteACLConfig = {}
-    if (aclAllow.length > 0) acl.allow = aclAllow
-    if (aclDeny.length > 0) acl.deny = aclDeny
-    route.acl = acl
-  }
+  // 这里**故意不碰 route.acl**：名单已搬到「IP 名单」页签，表单读不到也写不了它。
+  // 而本表单保存走的是 PUT（整条替换，后端 handleReplaceRoute 直接
+  // `cfg.Routes[idx] = rc`），所以"不写"等于"清空"——调用方必须把原有的 acl
+  // 原样带回去，见 submit 里那句 route.acl = initial.acl。
 
   return route
 }
@@ -368,16 +348,7 @@ function validate(f: FormState, isCreate: boolean, adminPort: number): Record<st
     if (algs.length === 0 && f.jwtPublicKey.trim() === '' && !f.jwtSecret) e.jwtSecret = '缺少验签凭据'
   }
 
-  // 名单条目的形状检查。刻意只做「像不像 IP/CIDR」，真正的解析交给后端 ——
-  // 前端不该有一套自己的 CIDR 语法，那种重复最终一定会和后端跑偏。
-  const badAllow = parseIPRules(f.aclAllow).filter((r) => !looksLikeCIDR(r.cidr))
-  if (badAllow.length > 0) {
-    e.aclAllow = `这些看起来不是 IP 或 CIDR：${badAllow.map((r) => r.cidr).join('、')}`
-  }
-  const badDeny = parseIPRules(f.aclDeny).filter((r) => !looksLikeCIDR(r.cidr))
-  if (badDeny.length > 0) {
-    e.aclDeny = `这些看起来不是 IP 或 CIDR：${badDeny.map((r) => r.cidr).join('、')}`
-  }
+  // 名单条目的形状检查已随名单一起搬到「IP 名单」页签的 IPListPage 里。
 
   return e
 }
@@ -424,7 +395,7 @@ export function RouteForm({
         tls: ['tlsMode', 'certFile', 'keyFile'],
         limit: ['rlRps', 'rlBurst'],
         breaker: ['cbErrorRate', 'cbMinCalls', 'cbOpenSecs', 'cbHalfOpenCalls', 'cbWindowSecs'],
-        guard: ['accounts', 'jwtSecret', 'jwtPublicKey', 'jwtAlgs', 'aclAllow', 'aclDeny'],
+        guard: ['accounts', 'jwtSecret', 'jwtPublicKey', 'jwtAlgs'],
       }
       for (const t of order) {
         const keys = where[t]
@@ -436,10 +407,20 @@ export function RouteForm({
       toast('err', '还有必填项没填对，已跳到对应分组')
       return
     }
-    onSubmit(toRoute(form))
+    const route = toRoute(form)
+    // 关键的一行。名单不在这张表单里改，但保存走 PUT（整条替换），
+    // 不带过去就等于把人家在「IP 名单」页签配好的规则一起抹掉 ——
+    // 用户只是改了个超时时间，回来发现黑名单没了。
+    // 新建时 initial 为 null，保持 undefined 即可（新路由本来就没有名单）。
+    if (!isCreate && initial) route.acl = initial.acl ?? null
+    onSubmit(route)
   }
 
   const err = (k: string) => (touched ? errors[k] : undefined)
+
+  // 只用于「认证与 ACL」页签里那段只读回显：名单本身在「IP 名单」页签改。
+  const aclAllowN = normalizeIPRules(initial?.acl?.allow).length
+  const aclDenyN = normalizeIPRules(initial?.acl?.deny).length
 
   return (
     <Modal
@@ -484,9 +465,32 @@ export function RouteForm({
           aria-selected={tab === 'guard'}
           onClick={() => setTab('guard')}
         >
-          认证与 ACL{flag(form.authMode !== 'none' || form.aclAllow.trim() !== '' || form.aclDeny.trim() !== '')}
+          {/* 这一页签以前叫「认证与 ACL」。名单搬走之后叫 ACL 会把人引到
+              一个改不了名单的地方，所以改回「认证」，名单的去处在下面那段 Note 里。 */}
+          认证{flag(form.authMode !== 'none')}
         </button>
       </div>
+
+      {/*
+        名单的编辑入口整体搬到了「IP 名单」页签，这里只留一句指路。
+        放在子页签**外面** —— 每一屏都能看到。放在某个子页签里等于没有：
+        有人打开这张表单本来就是来找名单的，他不会想到要去「认证」里翻。
+      */}
+      <Note kind="info">
+        <b>IP 名单不在这张表单里。</b>
+        {isCreate ? (
+          <>这条路由会按「不做 IP 限制」创建，之后到「IP 名单」页签按路由加白名单 / 黑名单。</>
+        ) : (
+          <>
+            请到「IP 名单」页签维护。这条路由当前：
+            {aclAllowN > 0 ? ` 白名单 ${aclAllowN} 条` : ' 不限来源'}
+            {aclDenyN > 0 ? `，黑名单 ${aclDenyN} 条` : ''}。
+            在<b>这里</b>保存不会改动名单（表单会把原值原样带回去）。
+          </>
+        )}
+        <br />
+        判定顺序固定为：全局黑名单 → 白名单 → 黑名单 → 放行；那一页带<b>命中测试</b>，可以拿个地址先试一次。
+      </Note>
 
       {tab === 'basic' && (
         <div className="grid2">
@@ -964,72 +968,12 @@ export function RouteForm({
             </fieldset>
           )}
 
-          <Field
-            label={
-              <>
-                白名单 acl.allow{' '}
-                {parseIPRules(form.aclAllow).length > 0 ? (
-                  <Badge kind="info">{parseIPRules(form.aclAllow).length} 条</Badge>
-                ) : (
-                  <Badge kind="muted">不限制</Badge>
-                )}
-              </>
-            }
-            error={err('aclAllow')}
-            hint="一行一条：CIDR [备注]。单个 IP 会自动按 /32 处理，# 开头是注释。留空 = 不限制来源。"
-            span
-          >
-            <textarea
-              className={`textarea mono${err('aclAllow') ? ' invalid' : ''}`}
-              value={form.aclAllow}
-              placeholder={'10.0.0.0/8 办公网\n203.0.113.66'}
-              onChange={(e) => set('aclAllow', e.target.value)}
-            />
-          </Field>
-
-          <Field
-            label={
-              <>
-                黑名单 acl.deny{' '}
-                {parseIPRules(form.aclDeny).length > 0 ? (
-                  <Badge kind="warn">{parseIPRules(form.aclDeny).length} 条</Badge>
-                ) : (
-                  <Badge kind="muted">未启用</Badge>
-                )}
-              </>
-            }
-            error={err('aclDeny')}
-            hint="在白名单划定的范围内再剔掉若干地址。没配白名单时，就是从全部来源里剔掉它们。"
-            span
-          >
-            <textarea
-              className={`textarea mono${err('aclDeny') ? ' invalid' : ''}`}
-              value={form.aclDeny}
-              placeholder={'10.0.0.66 老是有异常流量'}
-              onChange={(e) => set('aclDeny', e.target.value)}
-            />
-          </Field>
-
-          <Note kind="info" span>
-            <b>两份名单可以并存，判定顺序是固定的：</b>
-            <br />
-            ① 全局黑名单命中 → 拒绝（在「配置」页维护，对<b>所有</b>入口生效，这里的白名单救不回来）
-            <br />
-            ② 白名单已填但没命中 → 拒绝（<b>填了白名单就等于「只允许名单内」</b>，不是额外放行）
-            <br />
-            ③ 本路由黑名单命中 → 拒绝（所以白名单里的地址也能被黑名单单独剔掉）
-            <br />
-            ④ 都通过 → 放行
-            <br />
-            想确认某个地址会被哪一层拦下，用「配置」页的<b>命中测试</b>先试一遍。
-          </Note>
-
-          <Note kind="warn" span>
-            IP 名单是按<b>客户端 IP</b>判断的，而这个取值受 <code>trusted_proxies</code> 影响 ——
-            如果前面还有一层反代（或 CDN）没被加进可信代理，名单看到的会是<b>上一跳的地址</b>：
-            按它封禁会误伤整条链路，按它做白名单则会连自己都进不来。
-            {form.listen_port.trim() === '' && ' 这条路由挂在所有端口上，尤其要注意这一点。'}
-          </Note>
+          {/*
+            名单的编辑入口整体搬到了「IP 名单」页签，指路的那段 Note 在子页签外面
+            （每屏都看得到）。这里不再重复一遍 —— 同一句话写两处，改的时候必然漏一处。
+            原来在这里的 trusted_proxies 提醒也跟着名单一起搬过去了：它讲的是
+            「名单看到的到底是哪个地址」，属于名单那一页的事。
+          */}
         </div>
       )}
     </Modal>

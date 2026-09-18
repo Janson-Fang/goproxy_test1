@@ -7,7 +7,14 @@ import { usePolling } from '../hooks'
 import { ms, num } from '../format'
 import { RouteForm, summarize } from './RouteForm'
 
-export function RoutesPage({ onChanged }: { onChanged: () => void }) {
+export function RoutesPage({
+  active = true,
+  onChanged,
+}: {
+  /** 当前是不是正显示这一页。切回来时会立刻重读一次配置。 */
+  active?: boolean
+  onChanged: () => void
+}) {
   const [routes, setRoutes] = useState<Route[]>([])
   const [rev, setRev] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -50,7 +57,12 @@ export function RoutesPage({ onChanged }: { onChanged: () => void }) {
 
   // 实时观测值由服务端每 5 秒同步一次，跟着它的节奏刷就够了。
   // 弹窗打开或正在提交时停掉：避免把用户正在编辑的那条路由的旧数据糊到界面上。
-  usePolling(load, 5000, !editing && !busy && !pendingDelete)
+  //
+  // active && 那一段是为了「切回本页时立刻重读」：usePolling 在启用时会马上跑一次。
+  // 这很关键 —— revision 是给 If-Match 用的，而「IP 名单」页改的是**同一个**配置文件，
+  // 拿着过期 revision 去保存会先撞一次 409（用户会看到「请再操作一次」）。
+  // 顺带的好处：停在别的页签上时不再有后台请求。
+  usePolling(load, 5000, active && !editing && !busy && !pendingDelete)
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()

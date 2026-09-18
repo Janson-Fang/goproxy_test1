@@ -78,8 +78,18 @@ export type RawIPRule = string | { cidr?: string; note?: string }
  * 后端实现见 acl.go 的 decideIP，前端只是照抄这个顺序做提示。
  */
 export interface RouteACLConfig {
-  allow?: IPRule[]
-  deny?: IPRule[]
+  /**
+   * 类型是 RawIPRule 而不是 IPRule：写出去的条目要走字符串简写，
+   * 后端 IPRule.UnmarshalJSON 两种形态都收（同 ConfigPatch.global_ip_deny）。
+   *
+   * 显式的 null 表示「把这一侧清掉」。
+   *
+   * 这不是可有可无的讲究：PATCH 路由是「反序列化到现有路由上」的合并语义，
+   * 字段不出现就保持原值。控制台清空一份名单时必须显式写 null ——
+   * 否则界面上看着删干净了，磁盘上那份名单还在拦人。
+   */
+  allow?: RawIPRule[] | null
+  deny?: RawIPRule[] | null
 }
 
 /** 命中测试里单层的判定结果。 */

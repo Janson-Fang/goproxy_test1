@@ -7,6 +7,7 @@ import { useHashTab, usePolling, useTheme } from './hooks'
 import { duration, num } from './format'
 import { Dashboard } from './pages/Dashboard'
 import { RoutesPage } from './pages/RoutesPage'
+import { IPListPage } from './pages/IPListPage'
 import { CertsPage } from './pages/CertsPage'
 import { LogsPage } from './pages/LogsPage'
 import { SettingsPage } from './pages/SettingsPage'
@@ -182,6 +183,11 @@ export default function App() {
           路由
           {stats && <span className="count">{stats.routes_configured}</span>}
         </button>
+        {/* 紧挨「路由」：名单决定的是「谁能进来」，和路由是同一条链路上的事。
+            以前它跟端口、令牌一起挤在「配置」里，改个名单得先想清楚它在哪一页。 */}
+        <button className="tab" aria-selected={tab === 'acl'} onClick={() => navigate('acl')}>
+          IP 名单
+        </button>
         <button className="tab" aria-selected={tab === 'certs'} onClick={() => navigate('certs')}>
           证书
         </button>
@@ -203,12 +209,15 @@ export default function App() {
           </div>
         )}
 
-        {/* 四个页面保持挂载：切页签不丢状态，日志流也不会断（断一次就会漏掉那段时间的记录） */}
+        {/* 页面保持挂载：切页签不丢状态，日志流也不会断（断一次就会漏掉那段时间的记录） */}
         <div style={{ display: tab === 'dashboard' ? 'block' : 'none' }}>
           <Dashboard stats={stats} error={statsErr} loading={false} />
         </div>
         <div style={{ display: tab === 'routes' ? 'block' : 'none' }}>
-          <RoutesPage onChanged={() => void refresh()} />
+          <RoutesPage active={tab === 'routes'} onChanged={() => void refresh()} />
+        </div>
+        <div style={{ display: tab === 'acl' ? 'block' : 'none' }}>
+          <IPListPage active={tab === 'acl'} onChanged={() => void refresh()} />
         </div>
         <div style={{ display: tab === 'certs' ? 'block' : 'none' }}>
           <CertsPage />
