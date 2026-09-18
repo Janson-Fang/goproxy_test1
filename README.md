@@ -1242,6 +1242,40 @@ curl -s http://127.0.0.1:9080/_goproxy/certs | jq .
 git tag v0.3.0 && git push origin v0.3.0
 ```
 
+### 发布说明写在 tag 里
+
+**只手写一遍，写在 annotated tag 的 message 里** —— 不写在提交信息里，也不指望 auto changelog：
+
+```bash
+# 第一行是标题（Release 名本来就是 tag），正文从第二行起
+cat > notes.md <<'EOF'
+v0.8.0：一句话说清这版干了什么
+
+正文……可以带表格、代码块、反引号。
+EOF
+
+git tag -a v0.8.0 -F notes.md
+git push origin v0.8.0
+```
+
+CI 取 message 的第二行起当正文，auto changelog（一行 `Full Changelog` 链接）只作附录落在末尾。
+这样发布说明跟着 tag 走 —— 有版本控制、可 diff、不依赖谁去网页上点编辑。
+
+> ⚠ **CI 里不能用本地 git 读 tag 说明。** `actions/checkout` 在 tag 触发的 run 里会执行
+> `git fetch --no-tags ... origin +<commit-sha>:refs/tags/<tag>`，把本地 `refs/tags/<tag>`
+> **重写成指向 commit 的轻量标签**；而 `git for-each-ref ... %(contents:body)` 对轻量标签
+> 返回的是**提交信息**。脚本不报错，只是安静地把 commit message 当发布说明发出去 ——
+> v0.6.1 和 v0.7.0 都这么发错过一版。现在改走 GitHub API 读 tag 对象（服务端权威，
+> 不受本地 ref 改写影响），并在日志里打印取到的首行，让「取错来源」至少可见。
+
+发布之后可以核对一遍：每个 Release 的正文到底来自 tag 说明还是提交信息。
+
+```bash
+# 需要 git credential 里有 github.com 的凭据（脚本自己取，不用手填 token）
+python scripts/check_release_notes.py
+# 输出逐版本对比 release / tag正文 / commit 三个长度，并以退出码表示是否全对
+```
+
 镜像：
 
 ```bash
@@ -1622,6 +1656,7 @@ docker build -t goproxy:demo . && docker run --network host \
 | `deploy_test.go` | 部署守卫：单元 `ReadWritePaths` 含配置目录、`install.sh` 改属主、Dockerfile `chown`、compose 挂目录而非单文件 |
 | `session_test.go` | 会话与登录单测：存储哈希、过期、限流、Cookie 属性、CSRF、端点可达性、恒定耗时、账号指纹失效 |
 | `scripts/e2e_console.py` | 端到端自检：真实后端 + 真实反代，**180 余项断言**（含认证、账号登录、三层 IP 名单、负向验证） |
+| `scripts/check_release_notes.py` | 发布后核对：每个 Release 的正文是否来自 annotated tag 说明（而不是提交信息） |
 
 ```bash
 go test ./...   # 跑测试
