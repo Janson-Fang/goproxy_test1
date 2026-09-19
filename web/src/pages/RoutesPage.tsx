@@ -10,10 +10,13 @@ import { RouteForm, summarize } from './RouteForm'
 export function RoutesPage({
   active = true,
   onChanged,
+  onViewLogs,
 }: {
   /** 当前是不是正显示这一页。切回来时会立刻重读一次配置。 */
   active?: boolean
   onChanged: () => void
+  /** 点某条路由的「日志」入口时回调，参数是路由 id，由上层负责切到日志页并预筛。 */
+  onViewLogs: (routeId: string) => void
 }) {
   const [routes, setRoutes] = useState<Route[]>([])
   const [rev, setRev] = useState<string | null>(null)
@@ -242,6 +245,7 @@ export function RoutesPage({
                     onToggle={(v) => void toggle(r, v)}
                     onEdit={() => setEditing({ route: r, isCreate: false })}
                     onDelete={() => setPendingDelete(r)}
+                    onViewLogs={() => onViewLogs(r.id)}
                   />
                 ))}
               </tbody>
@@ -477,6 +481,7 @@ function RouteRow({
   onToggle,
   onEdit,
   onDelete,
+  onViewLogs,
 }: {
   route: Route
   /** 地址列表库，用来把引用翻译成「白名单 / 黑名单」。 */
@@ -489,6 +494,7 @@ function RouteRow({
   onToggle: (v: boolean) => void
   onEdit: () => void
   onDelete: () => void
+  onViewLogs: () => void
 }) {
   const live = r.live
   const tags = summarize(r)
@@ -599,6 +605,9 @@ function RouteRow({
 
       <td className="right nowrap">
         <EntryLink target={entry} />
+        <button className="btn ghost sm" onClick={onViewLogs} disabled={busy} title="只看这条路由的访问日志">
+          日志
+        </button>
         <button className="btn ghost sm" onClick={onEdit} disabled={busy}>
           编辑
         </button>

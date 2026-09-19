@@ -10,7 +10,18 @@ const MAX_ENTRIES = 2000
 
 type StatusFilter = 'all' | '2xx' | '3xx' | '4xx' | '5xx' | 'blocked'
 
-export function LogsPage({ active = true }: { active?: boolean }) {
+export function LogsPage({
+  active = true,
+  focusRoute = '',
+  focusSeq = 0,
+}: {
+  active?: boolean
+  /** 从「路由」页点「日志」跳进来时，要预选的路由 id。非空时把筛选器锁定到这一条。 */
+  focusRoute?: string
+  /** 每次从路由页触发「看日志」都会 +1。没有它，连着两次点同一条路由的
+   * 「日志」（中间手动改过筛选）会因 prop 没变而漏掉第二次预筛。 */
+  focusSeq?: number
+}) {
   const [entries, setEntries] = useState<LogEntry[]>([])
   const [meta, setMeta] = useState<LogsResponse | null>(null)
   const [state, setState] = useState<StreamState>('connecting')
@@ -20,6 +31,13 @@ export function LogsPage({ active = true }: { active?: boolean }) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [routeFilter, setRouteFilter] = useState('')
   const [methodFilter, setMethodFilter] = useState('')
+
+  // 从「路由」页点「日志」跳进来时，把筛选器锁定到那条路由。
+  // 以 focusSeq（触发次数）为依赖：同一条路由点两次，id 不变但 seq 变，预筛仍要重放。
+  // 直接打开日志页（seq=0）时不碰筛选器 —— 用户自己选的不该被清掉。
+  useEffect(() => {
+    if (focusSeq > 0) setRouteFilter(focusRoute)
+  }, [focusSeq, focusRoute])
   const [keyword, setKeyword] = useState('')
   const [historyLimit, setHistoryLimit] = useState(200)
 
@@ -90,12 +108,18 @@ export function LogsPage({ active = true }: { active?: boolean }) {
 
   const routeOptions = useMemo(() => {
     const set = new Map<string, string>()
+    // 筛选器锁定的路由还没有任何记录时，把它补进选项里：
+    // 不补的话受控 value 在 DOM 里无处落，下拉框会显示「全部路由」，
+    // 看起来像没过滤，实际却在过滤 —— 显示和状态不一致比没有这个选项更糟。
+    if (routeFilter && routeFilter !== '__none__' && !set.has(routeFilter)) {
+      set.set(routeFilter, routeFilter)
+    }
     for (const e of entries) {
       if (!e.route) continue
       set.set(e.route, e.route_name || e.route)
     }
     return [...set.entries()].sort((a, b) => a[0].localeCompare(b[0]))
-  }, [entries])
+  }, [entries, routeFilter])
 
   const methodOptions = useMemo(() => {
     const s = new Set<string>()
@@ -231,7 +255,9 @@ export function LogsPage({ active = true }: { active?: boolean }) {
             icon="▤"
             text={
               entries.length === 0
-                ? '还没有访问记录。往任意监听端口发一个请求就能看到。'
+                ? routeFilter && routeFilter !== '__none__'
+                  ? `路由 ${routeFilter} 还没有访问记录。往它的监听端口发一个请求就能看到。`
+                  : '还没有访问记录。往任意监听端口发一个请求就能看到。'
                 : '当前筛选条件下没有记录'
             }
           />

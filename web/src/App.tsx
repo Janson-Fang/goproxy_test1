@@ -46,6 +46,13 @@ export default function App() {
   // 和「刚打开页面、还没拿到答案」——前者要引导去改配置，后者该显示登录表单。
   const [credsConfigured, setCredsConfigured] = useState<boolean | null>(null)
 
+  // 「路由」页点某条路由的「日志」入口时，把要预筛的路由 id 记在这里，
+  // 切到日志页后交给 LogsPage 锁定筛选器。空串 = 不预筛。
+  // seq 每次触发都 +1：连着两次点同一条路由（中间手动改过筛选）时，
+  // id 没变但预筛必须重放，LogsPage 靠它区分「真触发了」和「只是重渲染」。
+  const [logsFocus, setLogsFocus] = useState('')
+  const [logsFocusSeq, setLogsFocusSeq] = useState(0)
+
   const refresh = useCallback(async () => {
     try {
       const s = await api.getStats()
@@ -220,7 +227,15 @@ export default function App() {
           <Dashboard stats={stats} error={statsErr} loading={false} />
         </div>
         <div style={{ display: tab === 'routes' ? 'block' : 'none' }}>
-          <RoutesPage active={tab === 'routes'} onChanged={() => void refresh()} />
+          <RoutesPage
+            active={tab === 'routes'}
+            onChanged={() => void refresh()}
+            onViewLogs={(routeId) => {
+              setLogsFocus(routeId)
+              setLogsFocusSeq((n) => n + 1)
+              navigate('logs')
+            }}
+          />
         </div>
         <div style={{ display: tab === 'acl' ? 'block' : 'none' }}>
           <IPListPage active={tab === 'acl'} onChanged={() => void refresh()} />
@@ -229,7 +244,7 @@ export default function App() {
           <CertsPage />
         </div>
         <div style={{ display: tab === 'logs' ? 'block' : 'none' }}>
-          <LogsPage active={tab === 'logs'} />
+          <LogsPage active={tab === 'logs'} focusRoute={logsFocus} focusSeq={logsFocusSeq} />
         </div>
         <div style={{ display: tab === 'settings' ? 'block' : 'none' }}>
           <SettingsPage onChanged={() => void refresh()} />
