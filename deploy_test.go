@@ -247,6 +247,10 @@ func renderUnit(t *testing.T) string {
 		{"$BIN_DIR", "/usr/local/bin"},
 		{"$CONFIG_DIR", "/etc/goproxy"},
 		{"$CONFIG_DB", "/etc/goproxy/goproxy.db"},
+		// $SERVICE_CONFIG 是 install.sh 按「装出来的二进制支不支持 SQLite
+		// 配置源」算出来的：支持就是库文件，不支持（v0.8.x 及更早）就是
+		// config.json。这里按新版渲染，也就是库文件的路径。
+		{"$SERVICE_CONFIG", "/etc/goproxy/goproxy.db"},
 		{"$STATE_DIR", "/var/lib/goproxy"},
 	} {
 		s = strings.ReplaceAll(s, kv[0], kv[1])
@@ -306,6 +310,75 @@ func TestInstallRendersWellFormedUnit(t *testing.T) {
 	}
 	if !strings.Contains(unit, "User=goproxy") {
 		t.Error("单元里没有 User=goproxy —— 服务会以 root 跑，降权就白做了")
+	}
+}
+
+// 装「旧版二进制」这条路必须留着，而且不能只靠注释标榜。
+//
+// 脚本是给最新版写的，但 VERSION= 允许装任意历史版本（README 也把固定版本列为
+// 推荐做法，因为 latest 解析依赖网络），而且 Release 刚发出来之前 latest 还停在
+// 上一个 tag 上。v0.8.x 及更早的二进制没有 -config-import，`-c` 指的也是 JSON
+// 文件 —— 硬按库流程走，对它们调 -config-import 会直接报
+// 「flag provided but not defined」：现象是「装不上」，原因却是版本不匹配。
+//
+// 所以脚本要按**装出来的那个二进制的能力**分流。这条测试在 install-smoke 之前
+// 先兜一道：那边要靠真 Linux 才能跑到，本地跑不了；而这里的三个不变量坏掉的话，
+// 那边一定失败，且报错很难指向真正的原因。
+func TestInstallFallsBackForLegacyBinaries(t *testing.T) {
+	raw, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatalf("读不到 install.sh: %v", err)
+	}
+	text := string(raw)
+	lines := effectiveLines(t, "install.sh")
+
+	// 1. 靠 -h 的自述探测，而不是在脚本里自己比版本号 ——
+	//    比版本号要在 shell 里重新实现一遍「v0.9.0 > v0.8.0」的语义比较，
+	//    而 flags 是二进制自己说的，永远是对的。
+	if !strings.Contains(text, `"$BIN_DIR/goproxy" -h`) {
+		t.Error("install.sh 没有用 -h 探测二进制支持哪些开关")
+	}
+	var onUsageProbe bool
+	for _, line := range lines {
+		if strings.HasPrefix(line, "case ") && strings.Contains(line, "USAGE_PROBE") {
+			onUsageProbe = true
+		}
+	}
+	if !onUsageProbe {
+		t.Error("探测结果没有落到生效分支上（没找到对 USAGE_PROBE 的 case）—— 只探测不判断等于没探测")
+	}
+	if !strings.Contains(text, "*-config-import*") {
+		t.Error("没有按 -config-import 判断支持与否：这是 SQLite 配置源的唯一开关，用它当判据最直接")
+	}
+
+	// 2. 单元文件必须经 $SERVICE_CONFIG 间接取配置路径。
+	//    写死 $CONFIG_DB 的话，装旧版时 ExecStart 会指向一个永远不存在的库 → 服务起不来。
+	unit := extractHeredoc(t, "install.sh", "EOF")
+	if !strings.Contains(unit, "-c $SERVICE_CONFIG") {
+		t.Errorf("单元文件的 ExecStart 没走 $SERVICE_CONFIG：\n%s\n"+
+			"  写死 $CONFIG_DB 的话，装 v0.8.x 及更早的二进制时服务会起不来", unit)
+	}
+
+	// 3. 两条路各有自己的收尾提示，不能互相冒充：
+	//    装旧版说「配置库」等于告诉人去看一个不存在的文件。
+	var mentionDB, mentionFile, legacyKeep bool
+	for _, line := range lines {
+		if strings.Contains(line, `"  配置库    $CONFIG_DB"`) {
+			mentionDB = true
+		}
+		if strings.Contains(line, `"  配置文件  $CONFIG_FILE"`) {
+			mentionFile = true
+		}
+		if strings.Contains(line, `$CONFIG_FILE 已存在，保持不动`) {
+			legacyKeep = true
+		}
+	}
+	if !mentionDB || !mentionFile {
+		t.Errorf("收尾提示没有按配置源分流（提到配置库=%v，提到配置文件=%v）", mentionDB, mentionFile)
+	}
+	if !legacyKeep {
+		t.Error("旧版分支没有「$CONFIG_FILE 已存在就保持不动」——" +
+			"少了它，一次重跑安装就会把用户的配置文件按示例覆盖掉")
 	}
 }
 

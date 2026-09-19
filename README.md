@@ -925,6 +925,11 @@ sudo systemctl enable --now goproxy && sudo journalctl -u goproxy -f
 > 导入交给 `goproxy -config-import` 走完整校验 —— 失败就中止，**库不会被改坏**。
 > 导入完成后那份 `config.json` 只是种子，**以后不再被读取**，可以留作备份或自行删掉。
 > 全新安装另外会放一份 `config.json.example` 方便对照新增字段。
+>
+> **`VERSION=v0.8.0` 这类历史版本照旧能用**：脚本会先探一下装出来的二进制支不支持 SQLite
+> 配置源（看它有没有 `-config-import`），不支持就走原来的 JSON 文件流程 ——
+> 那时配置就是 `config.json`，没有库可导。不这么分流的话，对着旧二进制调 `-config-import`
+> 会报 `flag provided but not defined`，现象是「装不上」，原因却是版本不匹配。
 
 起来之后浏览器打开 **`http://<服务器IP>:9080/`** 就是控制台（要先登录）。默认 `admin_addr` 是 `127.0.0.1:9080`
 只有本机能连；要开放到局域网 / 公网就改它，并**建议同时配一个 `admin_token`** 给探针用 —— 探针不方便走账号登录。

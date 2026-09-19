@@ -44,6 +44,17 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/goproxy}"
 # 导入之后它就不再被读取了 —— 所以升级时绝对不能用它去覆盖库里那份
 # 已经被控制台改过的配置，这一步下面有判断。
 CONFIG_DB="${CONFIG_DB:-$CONFIG_DIR/goproxy.db}"
+# 旧版二进制的配置文件路径（见下面 CONFIG_BACKEND 的说明）。
+CONFIG_FILE="$CONFIG_DIR/config.json"
+# 配置源由**装出来的那个二进制**决定，不是由脚本决定，所以下面探测一次再分流：
+#   sqlite —— v0.9.0 起，`-c` 指向库文件，有 -config-import / -config-export
+#   json   —— v0.8.x 及更早，`-c` 指向 JSON 文件，没有那两个开关
+#
+# 为什么必须有这条分支：脚本给「最新版」写，但 VERSION= 允许装任意历史版本，
+# 而且 Release 刚发出来之前 latest 还停在上一个 tag。硬按库流程走的话，
+# 对旧二进制调 -config-import 会直接报「flag provided but not defined」，
+# 现象是「装不上」，真正的原因却是版本不匹配 —— 极难查，所以这里主动分辨。
+CONFIG_BACKEND="sqlite"
 # 单元文件目录做成可覆盖的：一来某些发行版不放在这里，
 # 二来 CI 里要能指到临时目录去验证「先备份再重写」这条路径。
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
@@ -305,6 +316,29 @@ fi
 printf '%s\n' "$VER_OUT"
 NEW_VER=$(printf '%s\n' "$VER_OUT" | sed -n 's/^goproxy \([^ ]*\).*/\1/p' | head -1)
 
+# 探测这个二进制支不支持 SQLite 配置源（即有没有 -config-import / -config-export）。
+#
+# 用 -h 的输出而不是比版本号：比版本号要在这里重新实现一遍「v0.9.0 > v0.8.0」的
+# 语义比较，而 flags 是二进制的自述，永远是对的。
+#
+# 两个细节：
+#   · 先把输出收进变量再匹配，不走管道 —— 脚本开了 pipefail，而 -h 的退出码是 2，
+#     走管道会让整条管道判成失败，结果永远是 json 分支（看起来「探测没生效」）。
+#   · `|| true` 是为了不让 set -e 在 -h 的非 0 退出码上把脚本打死。
+USAGE_PROBE=$("$BIN_DIR/goproxy" -h 2>&1 || true)
+case "$USAGE_PROBE" in
+    *-config-import*) CONFIG_BACKEND="sqlite" ;;
+    *)                CONFIG_BACKEND="json" ;;
+esac
+unset USAGE_PROBE
+
+# 单元文件 / 收尾提示里的 -c 指哪个文件，由上面探测出的配置源决定。
+if [ "$CONFIG_BACKEND" = "sqlite" ]; then
+    SERVICE_CONFIG="$CONFIG_DB"
+else
+    SERVICE_CONFIG="$CONFIG_FILE"
+fi
+
 # ---------- 8. 配置数据库 ----------
 $SUDO install -d "$CONFIG_DIR"
 
@@ -410,6 +444,31 @@ prompt_admin_credentials() { # prompt_admin_credentials <文件>
     return 0
 }
 
+if [ "$CONFIG_BACKEND" = "json" ]; then
+    # ---- 旧版二进制（v0.8.x 及更早）：配置就是 config.json 本身 ----
+    #
+    # 保留原行为：文件在就不动它，不在就铺一份示例并引导设账号。
+    # 这条分支存在的意义是让 `VERSION=v0.3.0` 这类固定版本安装照旧可用 ——
+    # 用脚本的新旧去决定装法，而不是用装出来的那个二进制的能力，是不对的。
+    info "$NEW_VER 用的是 JSON 配置文件（该版本还不支持 SQLite 配置源）"
+    if [ -f "$CONFIG_FILE" ]; then
+        ok "$CONFIG_FILE 已存在，保持不动"
+    else
+        $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_FILE"
+        ok "已生成配置 $CONFIG_FILE"
+
+        # 示例配置里没有 admin_token，历史版本因此让人从浏览器打开时只看到
+        # 一张「已拒绝所有外部请求」的说明页（用户反馈过「没见到登录界面」）。
+        if ! prompt_admin_credentials "$CONFIG_FILE"; then
+            warn "尚未设置管理账号 —— 控制台现在需要用户名 + 密码才能登录。"
+            warn "补法：重新运行本脚本，在交互提示里设置；或手动编辑 $CONFIG_FILE。"
+        fi
+        warn "这是示例配置，后端指向 127.0.0.1:9001 等本机端口，先改成你自己的后端"
+    fi
+    $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_DIR/config.json.example"
+fi
+
+if [ "$CONFIG_BACKEND" = "sqlite" ]; then
 # 数据库已经在 → 升级场景，一律不碰。
 #
 # 判据从「config.json 存不存在」换成了「数据库存不存在」，这一点很关键：
@@ -470,6 +529,7 @@ else
     ok "已导入到 $CONFIG_DB"
     info "config.json 只是种子，以后不再被读取 —— 改配置请用控制台，"
     info "  或 $BIN_DIR/goproxy -c $CONFIG_DB -config-export / -config-import"
+fi
 fi
 
 # ---------- 9. systemd 服务 ----------
@@ -534,6 +594,8 @@ if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
     # 目录里的文件也要过一遍属主。数据库那几个尤其重要：-wal / -shm 是 SQLite
     # 在写入过程中现建的，如果库文件是 root:root 0644，服务连 -wal 都建不出来，
     # 报的还是一句看不出跟权限有关的错。
+    #
+    # 旧版二进制没有库文件，那份列表里的项自然都不存在，多列几项没有副作用。
     for f in goproxy.db goproxy.db-wal goproxy.db-shm config.json; do
         if [ -e "$CONFIG_DIR/$f" ]; then
             $SUDO chown goproxy:goproxy "$CONFIG_DIR/$f" 2>/dev/null || true
@@ -561,7 +623,7 @@ After=network.target
 [Service]
 Type=simple
 User=goproxy
-ExecStart=$BIN_DIR/goproxy -c $CONFIG_DB
+ExecStart=$BIN_DIR/goproxy -c $SERVICE_CONFIG
 WorkingDirectory=$STATE_DIR
 Restart=always
 RestartSec=3
@@ -575,8 +637,8 @@ ProtectHome=true
 # ProtectSystem=strict 会把整个文件系统挂成只读（/etc 也在内），
 # 所以凡是运行期要写的地方都必须显式放行：
 #   $STATE_DIR  —— 证书、ACME 缓存、运行态文件（$CONFIG_DIR/data 软链到这里）
-#   $CONFIG_DIR —— 管理接口要写配置数据库。SQLite 还要在库文件旁边建
-#                  -wal / -shm，所以放行的是整个目录而不是那一个文件。
+#   $CONFIG_DIR —— 管理接口要写配置。SQLite 还要在库文件旁边建 -wal / -shm，
+#                  所以放行的是整个目录而不是那一个文件。
 #                  漏掉它，「删除路由」会报 attempt to write a readonly database。
 ReadWritePaths=$STATE_DIR $CONFIG_DIR
 
@@ -632,7 +694,11 @@ else
     echo "安装完成。"
 fi
 echo "  二进制    $BIN_DIR/goproxy"
-echo "  配置库    $CONFIG_DB"
+if [ "$CONFIG_BACKEND" = "sqlite" ]; then
+    echo "  配置库    $CONFIG_DB"
+else
+    echo "  配置文件  $CONFIG_FILE"
+fi
 if [ -n "$OLD_VER" ]; then
     echo "  旧二进制  $BIN_DIR/goproxy.old（回滚用）"
 fi
@@ -646,16 +712,30 @@ fi
 # 配置的真源是数据库，所以这里用 -config-export 导出一份临时 JSON 再读 ——
 # 导出的就是那套规范化 JSON，字段名和以前完全一样。导出文件里带着
 # admin_token 与密码哈希（所以 goproxy 自己按 0600 写），读完立刻删掉。
+#
+# 旧版二进制没有这个开关，那时配置文件本身就是真源，直接读文件即可。
 ADMIN_ADDR=""
 HAS_CRED="no"
-CRED_TMP="$(mktemp)"
-if $SUDO "$BIN_DIR/goproxy" -c "$CONFIG_DB" -config-export "$CRED_TMP" >/dev/null 2>&1; then
-    ADMIN_ADDR=$(sed -n 's/.*"admin_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CRED_TMP" | head -n1)
-    if grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CRED_TMP" 2>/dev/null; then
-        HAS_CRED="yes"
+if [ "$CONFIG_BACKEND" = "sqlite" ]; then
+    CRED_TMP="$(mktemp)"
+    if $SUDO "$BIN_DIR/goproxy" -c "$CONFIG_DB" -config-export "$CRED_TMP" >/dev/null 2>&1; then
+        ADMIN_ADDR=$(sed -n 's/.*"admin_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CRED_TMP" | head -n1)
+        if grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CRED_TMP" 2>/dev/null; then
+            HAS_CRED="yes"
+        fi
+    fi
+    rm -f "$CRED_TMP"
+else
+    # 这里刻意和 v0.8.0 的判据保持一致（只看 admin_users）：这条分支是兼容旧版本
+    # 用的，连提示语都该和那时候一模一样 —— 否则「升级脚本让老部署的话术变了」
+    # 本身就是一次没必要的意外。
+    if [ -f "$CONFIG_FILE" ]; then
+        ADMIN_ADDR=$(sed -n 's/.*"admin_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_FILE" | head -n1)
+        if grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CONFIG_FILE" 2>/dev/null; then
+            HAS_CRED="yes"
+        fi
     fi
 fi
-rm -f "$CRED_TMP"
 
 # admin_addr 留空的意思是「用默认值」（127.0.0.1:8080），那种情况下导出的 JSON
 # 里根本没有这个键。以前直接 grep config.json，留空就什么都不打印 ——
@@ -665,6 +745,12 @@ echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/"
 echo
 if [ "$HAS_CRED" = "yes" ]; then
     echo "控制台登录：用刚才设置的用户名 + 密码。"
+elif [ "$CONFIG_BACKEND" = "json" ]; then
+    # 与 v0.8.0 的提示语逐字一致 —— 这条分支服务的就是那些版本。
+    echo "注意：没有设置管理员账号，控制台暂时登录不进去。补一个："
+    echo "  $BIN_DIR/goproxy -hash-password '你的密码'"
+    echo "  把输出填进 $CONFIG_FILE 的 admin_users[].password_hash"
+    echo "  保存后自动热重载，不用重启。"
 elif [ "$NO_ADMIN_PROMPT" = "1" ]; then
     echo "注意：没有设置管理员账号，控制台暂时登录不进去。补一个："
     echo "  $BIN_DIR/goproxy -hash-password '你的密码'"
@@ -681,22 +767,28 @@ if [ "$SVC_RESTARTED" = "1" ]; then
 elif [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
     echo "下一步："
     echo "  1. 改配置：打开控制台，把每条路由的 target 指向你自己的后端"
-    echo "  2. 前台试跑：$BIN_DIR/goproxy -c $CONFIG_DB（看有没有报错）"
+    echo "  2. 前台试跑：$BIN_DIR/goproxy -c $SERVICE_CONFIG（看有没有报错）"
     echo "  3. 正式启动：sudo systemctl enable --now goproxy"
     echo "     看日志：sudo journalctl -u goproxy -f"
 else
     echo "下一步："
     echo "  1. 改配置：打开控制台，把每条路由的 target 指向你自己的后端"
-    echo "  2. 后台运行：nohup $BIN_DIR/goproxy -c $CONFIG_DB &"
+    echo "  2. 后台运行：nohup $BIN_DIR/goproxy -c $SERVICE_CONFIG &"
 fi
 echo
-echo "改配置的两条路（config.json 已经不再被读取了）："
-echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/  —— 保存即生效"
-echo "  命令行    导出、改完再导回（适合批量改或界面进不去时救急）："
-echo "              $BIN_DIR/goproxy -c $CONFIG_DB -config-export cfg.json"
-echo "              ……改 cfg.json……"
-echo "              $BIN_DIR/goproxy -c $CONFIG_DB -config-import cfg.json   # 需重启或调 reload 生效"
-echo "  改错了    每次写入前会自动留一版历史（最近 20 版），就在 $CONFIG_DB 里"
+if [ "$CONFIG_BACKEND" = "sqlite" ]; then
+    echo "改配置的两条路（config.json 已经不再被读取了）："
+    echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/  —— 保存即生效"
+    echo "  命令行    导出、改完再导回（适合批量改或界面进不去时救急）："
+    echo "              $BIN_DIR/goproxy -c $CONFIG_DB -config-export cfg.json"
+    echo "              ……改 cfg.json……"
+    echo "              $BIN_DIR/goproxy -c $CONFIG_DB -config-import cfg.json   # 需重启或调 reload 生效"
+    echo "  改错了    每次写入前会自动留一版历史（最近 20 版），就在 $CONFIG_DB 里"
+else
+    echo "改配置的两条路（$NEW_VER 还是 JSON 配置文件）："
+    echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/  —— 保存即生效"
+    echo "  直接编辑  $CONFIG_FILE —— 这个版本每秒轮询 mtime，保存后自动热重载"
+fi
 echo
 echo "卸载："
 echo "  sudo systemctl disable --now goproxy 2>/dev/null"

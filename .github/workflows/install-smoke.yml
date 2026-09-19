@@ -65,11 +65,28 @@ jobs:
           echo "--- 版本输出 ---"
           "$BIN_DIR/goproxy" -version
           "$BIN_DIR/goproxy" -version | grep -qv 'dev' || { echo "版本号没注入"; exit 1; }
-          test -f "$CONFIG_DIR/config.json" || { echo "配置文件没生成"; exit 1; }
 
           echo "--- 二进制确实是 Linux ELF ---"
           file "$BIN_DIR/goproxy"
           file "$BIN_DIR/goproxy" | grep -q ELF || { echo "不是 ELF"; exit 1; }
+
+          # 配置源由**装出来的那个二进制**决定，不是由脚本决定：
+          #   v0.9.0 起是 SQLite 库（goproxy.db），更早的版本是 JSON 文件。
+          # 矩阵里既有固定版本（v0.3.0）又有 latest，所以两种落点都得认 ——
+          # 但必须认对一个，两个都没有说明脚本哪条路都没走通。
+          #
+          # 判据用 -h 的自述而不是比版本号：把「v0.9.0 > v0.3.0」的语义比较
+          # 搬进 CI 的 shell 里，等于又维护一份会过期的规则。
+          if "$BIN_DIR/goproxy" -h 2>&1 | grep -q -- '-config-import'; then
+            echo "--- 配置源：SQLite 配置库 ---"
+            test -f "$CONFIG_DIR/goproxy.db" || { echo "配置库没生成"; exit 1; }
+            "$BIN_DIR/goproxy" -c "$CONFIG_DIR/goproxy.db" -config-export "$RUNNER_TEMP/exported.json"
+            grep -q '"routes"' "$RUNNER_TEMP/exported.json" || { echo "库里的配置导不出来"; exit 1; }
+            echo "导出成功：$(wc -c < "$RUNNER_TEMP/exported.json") 字节"
+          else
+            echo "--- 配置源：JSON 文件（该版本还不支持 SQLite）---"
+            test -f "$CONFIG_DIR/config.json" || { echo "配置文件没生成"; exit 1; }
+          fi
 
       - name: 幂等性：重跑不能覆盖已有配置
         env:
@@ -81,8 +98,19 @@ jobs:
           set -e
           printf '{"routes":[{"id":"keep-me"}]}' > "$CONFIG_DIR/config.json"
           bash install.sh --no-service
-          grep -q 'keep-me' "$CONFIG_DIR/config.json" || { echo "已有配置被覆盖了"; exit 1; }
+          grep -q 'keep-me' "$CONFIG_DIR/config.json" || { echo "已有配置文件被覆盖了"; exit 1; }
           test -f "$CONFIG_DIR/config.json.example" || { echo "新示例没另存"; exit 1; }
+
+          # 新版还有一层更重要的幂等性：**不能拿这份过时的 config.json 去覆盖库**。
+          # 库才是配置的真源，控制台里改过的路由只落在库里 —— 重跑一次安装就把
+          # 它们回退成安装时那份文件，是最难发现的一类事故（导入还会报成功）。
+          if [ -f "$CONFIG_DIR/goproxy.db" ]; then
+            "$BIN_DIR/goproxy" -c "$CONFIG_DIR/goproxy.db" -config-export "$RUNNER_TEMP/idem.json"
+            if grep -q 'keep-me' "$RUNNER_TEMP/idem.json"; then
+              echo "配置库被那份过时的 config.json 顶掉了"; exit 1
+            fi
+            echo "配置库没被 config.json 顶掉 OK"
+          fi
           echo "幂等性 OK"
 
       - name: 冒烟：二进制能起来并加载配置
@@ -91,26 +119,41 @@ jobs:
           CONFIG_DIR: ${{ runner.temp }}/conf
         run: |
           set -e
-          # 用示例配置起服务，确认能正常监听管理端口
+          # 用一份最小配置起服务，确认能正常监听管理端口。
+          #
+          # 配置源不同，起法也不同：v0.9.0 起 `-c` 指向库，得先把这份 JSON
+          # 导进去；更早的版本直接 `-c` 指这个文件。写死一种就会在另一半矩阵上
+          # 失败 —— 而失败信息看起来像「二进制起不来」，跟真正的原因差很远。
           cat > "$CONFIG_DIR/smoke.json" <<'CFG'
           {
             "admin_addr": "127.0.0.1:19080",
+            "admin_token": "smoke-token",
             "routes": [
               { "id": "smoke", "listen_port": 18080, "path_prefix": "/",
                 "target": "http://127.0.0.1:19001" }
             ]
           }
           CFG
-          "$BIN_DIR/goproxy" -c "$CONFIG_DIR/smoke.json" -text-log > "$RUNNER_TEMP/gp.log" 2>&1 &
+
+          if "$BIN_DIR/goproxy" -h 2>&1 | grep -q -- '-config-import'; then
+            echo "--- 经 -config-import 装进配置库 ---"
+            "$BIN_DIR/goproxy" -c "$CONFIG_DIR/smoke.db" -config-import "$CONFIG_DIR/smoke.json"
+            SMOKE_CFG="$CONFIG_DIR/smoke.db"
+          else
+            SMOKE_CFG="$CONFIG_DIR/smoke.json"
+          fi
+
+          "$BIN_DIR/goproxy" -c "$SMOKE_CFG" -text-log > "$RUNNER_TEMP/gp.log" 2>&1 &
           GP=$!
           for i in $(seq 1 20); do
-            if curl -fsS --max-time 2 http://127.0.0.1:19080/_goproxy/ports >/dev/null 2>&1; then break; fi
+            if curl -fsS --max-time 2 -H 'Authorization: Bearer smoke-token' \
+                 http://127.0.0.1:19080/_goproxy/ports >/dev/null 2>&1; then break; fi
             sleep 0.5
           done
           echo "--- 管理端点 ---"
-          curl -fsS --max-time 3 http://127.0.0.1:19080/_goproxy/ports
+          curl -fsS --max-time 3 -H 'Authorization: Bearer smoke-token' http://127.0.0.1:19080/_goproxy/ports
           echo
-          curl -fsS --max-time 3 http://127.0.0.1:19080/_goproxy/routes | head -c 300
+          curl -fsS --max-time 3 -H 'Authorization: Bearer smoke-token' http://127.0.0.1:19080/_goproxy/routes | head -c 300
           echo
           kill $GP 2>/dev/null || true
           echo "--- 启动日志 ---"
@@ -262,3 +305,110 @@ jobs:
 
           echo "--- 新单元内容 ---"
           cat "$SYSTEMD_DIR/goproxy.service"
+
+  # v0.8.x → v0.9.x 这条升级路是本次发版的关键路径：老版本配置在 config.json 里，
+  # 新版本把真源换成了 SQLite 库，中间靠「库为空时导入同目录 config.json 一次」接上。
+  #
+  # 配置层的那一步有单测（configstore_test.go 的首次导入），但**装出来之后**
+  # 「脚本 + 服务 + 库」串起来能不能用，只有真 Linux 上跑得出来。少了这个 job，
+  # 「升级完路由全丢」要等用户装上去才会发现。
+  upgrade-sqlite:
+    name: 升级自检（v0.8.x 的 config.json → 最新版 SQLite 库）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装一份旧版（v0.8.0）并用 config.json 跑起来
+        env:
+          MIRROR: direct
+          VERSION: v0.8.0
+          BIN_DIR: ${{ runner.temp }}/qbin
+          CONFIG_DIR: ${{ runner.temp }}/qconf
+        run: |
+          set -e
+          mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+          bash install.sh --no-service
+
+          # 先确认装出来的确实是「JSON 文件」那一版 —— 否则后面的断言会变成
+          # 「拿新版验新版」，看起来全过，实际没覆盖到升级路径。
+          "$BIN_DIR/goproxy" -version
+          if "$BIN_DIR/goproxy" -h 2>&1 | grep -q -- '-config-import'; then
+            echo "v0.8.0 竟然支持 -config-import，这个 job 的前提不成立了"; exit 1
+          fi
+
+          # 一份「用户自己改过」的配置：只留一条有辨识度的路由。
+          # 升级之后它必须原封不动地出现在库里。
+          cat > "$CONFIG_DIR/config.json" <<'CFG'
+          {"admin_addr":"127.0.0.1:19080","admin_token":"upgrade-token","routes":[{"id":"survives-upgrade","name":"升级前就有的路由","listen_port":18080,"path_prefix":"/","target":"http://127.0.0.1:19001"}]}
+          CFG
+          sha256sum "$CONFIG_DIR/config.json" > "$RUNNER_TEMP/qcfg.sha"
+
+          nohup "$BIN_DIR/goproxy" -c "$CONFIG_DIR/config.json" -text-log \
+                > "$RUNNER_TEMP/qup.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/qup.pid"
+          for _ in $(seq 1 20); do
+            curl -fsS --max-time 2 -H 'Authorization: Bearer upgrade-token' \
+              http://127.0.0.1:19080/_goproxy/ports >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -fsS --max-time 3 -H 'Authorization: Bearer upgrade-token' \
+            http://127.0.0.1:19080/_goproxy/routes | grep -q 'survives-upgrade'
+          ps -p "$(cat "$RUNNER_TEMP/qup.pid")" -o pid,cmd
+          echo "旧版（v0.8.0）已经用 config.json 跑起来了"
+
+      - name: 重跑安装脚本完成升级（装最新版）
+        env:
+          MIRROR: direct
+          BIN_DIR: ${{ runner.temp }}/qbin
+          CONFIG_DIR: ${{ runner.temp }}/qconf
+        run: |
+          set -e
+          bash install.sh --no-service
+          "$BIN_DIR/goproxy" -version
+
+      - name: 断言配置真的迁进库了，而且原文件没被动
+        env:
+          BIN_DIR: ${{ runner.temp }}/qbin
+          CONFIG_DIR: ${{ runner.temp }}/qconf
+        run: |
+          set -e
+          test -x "$BIN_DIR/goproxy.old" || { echo "升级前没有备份旧二进制"; exit 1; }
+          test -f "$CONFIG_DIR/goproxy.db" || { echo "升级后没有配置库"; exit 1; }
+
+          echo "--- 用户那条路由进了库 ---"
+          "$BIN_DIR/goproxy" -c "$CONFIG_DIR/goproxy.db" -config-export "$RUNNER_TEMP/q.json"
+          grep -q 'survives-upgrade' "$RUNNER_TEMP/q.json" \
+            || { echo "升级把用户的路由弄丢了："; cat "$RUNNER_TEMP/q.json"; exit 1; }
+
+          echo "--- 凭据也跟过去了 ---"
+          grep -q 'upgrade-token' "$RUNNER_TEMP/q.json" || { echo "admin_token 没迁进库"; exit 1; }
+
+          echo "--- 原 config.json 字节级未变（它只剩备份用途）---"
+          sha256sum -c "$RUNNER_TEMP/qcfg.sha"
+
+          echo "--- 升级前的进程仍然活着（rename 不影响运行中的旧 inode）---"
+          ps -p "$(cat "$RUNNER_TEMP/qup.pid")" >/dev/null \
+            || { echo "升级过程把运行中的旧进程弄死了"; exit 1; }
+          kill "$(cat "$RUNNER_TEMP/qup.pid")" 2>/dev/null || true
+          sleep 1
+
+      - name: 新版用配置库起来，路由照常服务
+        env:
+          BIN_DIR: ${{ runner.temp }}/qbin
+          CONFIG_DIR: ${{ runner.temp }}/qconf
+        run: |
+          set -e
+          nohup "$BIN_DIR/goproxy" -c "$CONFIG_DIR/goproxy.db" -text-log \
+                > "$RUNNER_TEMP/qnew.log" 2>&1 &
+          QP=$!
+          for _ in $(seq 1 20); do
+            curl -fsS --max-time 2 -H 'Authorization: Bearer upgrade-token' \
+              http://127.0.0.1:19080/_goproxy/ports >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          echo "--- 库里加载出来的路由 ---"
+          curl -fsS --max-time 3 -H 'Authorization: Bearer upgrade-token' \
+            http://127.0.0.1:19080/_goproxy/routes | grep -q 'survives-upgrade' \
+            || { echo "新版起不来，或路由没从库里加载出来："; cat "$RUNNER_TEMP/qnew.log"; kill $QP 2>/dev/null || true; exit 1; }
+          kill $QP 2>/dev/null || true
+          echo "升级路径自检 OK"
