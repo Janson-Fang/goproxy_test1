@@ -86,6 +86,42 @@ func TestConfigExampleUsesRelativeCertPaths(t *testing.T) {
 	}
 }
 
+// config.example.json 必须能走**真实的导入路径**进配置库。
+//
+// TestConfigExampleLoads 里「把 manual 证书引用清空再校验」那几行是在给示例开小灶：
+// 它证明的是「示例结构合法」，不是「示例能被装进去」。而 v0.9.0 起 install.sh 与
+// Docker 的首次安装都会把这份示例**原样导入**配置库，导入跑的是完整校验（fail-closed）
+// —— 证书文件不存在（仓库里当然不该有私钥）就拒绝整份配置。结果是一键安装与
+// 容器首启双双失败，而且只有 install-smoke 里 latest 那一格能暴露它：
+// 其余矩阵项都固定在 v0.3.0，走的是不需要导入的旧分支。
+//
+// 所以这里按示例**实际被使用的方式**来测它。修这类问题的正确位置是示例自己
+// （manual 演示路由保持 enabled=false），而不是放宽导入校验 —— 那道校验挡的是
+// 真实的配置事故，松了它，用户的证书路径写错就要等到第一个请求才炸。
+func TestConfigExampleImportsIntoDB(t *testing.T) {
+	raw, _ := loadExampleConfig(t)
+	db := tempConfigDB(t)
+	seedRawConfig(t, db, raw) // 走 importJSON：默认值补齐 + 旧写法拦截 + 完整校验
+
+	// 导入成功后读回来，确认示例的关键内容没有被导入过程丢掉
+	_, cfg, err := parseConfigFile(db)
+	if err != nil {
+		t.Fatalf("从配置库读回失败: %v", err)
+	}
+	if len(cfg.Routes) == 0 {
+		t.Fatal("示例导入后一条路由都没有")
+	}
+	if !cfg.TLS.Enabled {
+		t.Error("导入后 tls.enabled 变成了 false —— 示例对 TLS 的示范被丢了")
+	}
+	for _, r := range cfg.Routes {
+		if r.routeTLSMode() == TLSModeManual && r.enabled() {
+			t.Errorf("路由 %s 是 manual 且 enabled：仓库里没有它引用的证书文件，"+
+				"这样的示例会让一键安装/容器首启直接失败（应当先置 enabled=false）", r.ID)
+		}
+	}
+}
+
 // Dockerfile / docker-compose 必须真的暴露 HTTPS 端口。
 //
 // 这两个文件分处不同位置，改了一处忘了另一处是很典型的失误，

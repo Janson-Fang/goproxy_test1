@@ -72,6 +72,8 @@
     {
       "id": "admin-internal",
       "name": "后台（自签/内部 CA 证书，保留明文访问）",
+      "_enabled_说明": "刻意为 false：cert_file/key_file 指向的证书文件这个仓库里并不存在，开着它，导入/启动时的证书校验（fail-closed）会直接拒绝整份配置。照着填好自己的证书路径再改回 true。",
+      "enabled": false,
       "listen_port": 0,
       "host": "admin.example.com",
       "path_prefix": "/",
@@ -86,6 +88,8 @@
     {
       "id": "legacy-plain",
       "name": "老设备专用（挂通配手动证书）",
+      "_enabled_说明": "刻意为 false：同 admin-internal，证书文件不存在，开着会被导入/启动校验拦下。",
+      "enabled": false,
       "listen_port": 0,
       "host": "*.legacy.example.com",
       "path_prefix": "/",
