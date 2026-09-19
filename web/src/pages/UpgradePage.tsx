@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import type { UpgradeCheck, UpgradeState } from '../types'
-import { Badge, Card, ConfirmDialog, Empty, Note, Spinner, toast } from '../ui'
+import { Badge, Card, ConfirmDialog, CopyBtn, Empty, Note, Spinner, toast } from '../ui'
 import { bytes, datetime } from '../format'
 import { usePolling } from '../hooks'
 
@@ -30,6 +30,8 @@ export function UpgradePage({ active }: { active: boolean }) {
   const [confirm, setConfirm] = useState<null | { kind: 'install' | 'rollback'; title: string; message: ReactNode }>(null)
   /** 安装完成之后等进程回来：记录从哪一版升到哪一版、等到什么时候为止 */
   const [pending, setPending] = useState<null | { from: string; to: string; until: number }>(null)
+  /** 托管升级：安装 / 回退只是把新版本暂存好了，这里存下要交给 root 的那条命令 */
+  const [rootCmd, setRootCmd] = useState<null | { cmd: string; what: string }>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
@@ -97,6 +99,17 @@ export function UpgradePage({ active }: { active: boolean }) {
     setBusy('install')
     try {
       const res = await api.installUpgrade(req)
+      if (res.needs_root) {
+        // 托管：下载、校验、-version 验证都在服务端做完了，但进程写不进二进制目录，
+        // 最后一步要 root 在服务器上执行。所以不走「等服务重启」那套轮询。
+        setRootCmd({ cmd: res.apply_command ?? '', what: `把 ${res.to} 装上去` })
+        toast('info', `已下载并校验完毕（${res.to}），等 root 应用`)
+        setFile(null)
+        setProgress(null)
+        if (fileRef.current) fileRef.current.value = ''
+        await load()
+        return
+      }
       toast('info', `已写入 ${res.to}，正在重启服务`)
       setPending({ from: res.from, to: res.to, until: Date.now() + 60_000 })
       setFile(null)
@@ -132,6 +145,12 @@ export function UpgradePage({ active }: { active: boolean }) {
     setBusy('rollback')
     try {
       const res = await api.rollbackUpgrade()
+      if (res.needs_root) {
+        setRootCmd({ cmd: res.apply_command ?? '', what: `回退到 ${res.to || '上一版'}` })
+        toast('info', '回退已准备就绪，等 root 应用')
+        await load()
+        return
+      }
       toast('info', `正在切回 ${res.to}`)
       setPending({ from: res.from, to: res.to, until: Date.now() + 60_000 })
     } catch (e) {
@@ -154,6 +173,44 @@ export function UpgradePage({ active }: { active: boolean }) {
         <Note kind="info">
           正在替换进程：{pending.from} 切换为 {pending.to}。这几秒里管理接口会短暂连不上，
           页面正在自动重试，恢复后会自动报出新版本。
+        </Note>
+      )}
+
+      {rootCmd && rootCmd.cmd && (
+        <Note kind="ok">
+          {rootCmd.what}：下载、校验和 <span className="mono">-version</span> 验证都已经在服务端做完了，
+          最后一步要在这台机器上以 root 执行：
+          <pre className="code" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+            {rootCmd.cmd}
+          </pre>
+          <div className="row">
+            <CopyBtn text={rootCmd.cmd} label="复制命令" />
+            <button className="btn ghost sm" onClick={() => void load()}>
+              刷新状态
+            </button>
+          </div>
+        </Note>
+      )}
+
+      {state?.needs_root && (
+        <Note kind="warn">
+          这个实例的最后一步不能由服务自己做：服务账号写不进{' '}
+          <span className="mono">{state.runtime.exe_dir}</span>
+          （install.sh 装出来的实例都是这样：服务以 goproxy 跑、二进制目录归 root）。
+          所以控制台只负责下载、校验、验证并暂存，收尾要在服务器上以 root 执行：
+          {state.apply_command && (
+            <pre className="code" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+              {state.apply_command}
+            </pre>
+          )}
+          <div className="row" style={{ flexWrap: 'wrap' }}>
+            {state.apply_command && <CopyBtn text={state.apply_command} label="复制升级命令" />}
+            {state.rollback_command && <CopyBtn text={state.rollback_command} label="复制回退命令" />}
+          </div>
+          <div className="small faint">
+            暂存目录：<span className="mono">{state.stage_dir}</span>。
+            执行完刷新本页就能看到新版本；回退走同一条路（把 -upgrade-apply 换成 -upgrade-rollback）。
+          </div>
         </Note>
       )}
 

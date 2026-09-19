@@ -1039,12 +1039,44 @@ POST /_goproxy/upgrade/rollback  回退到 <exe>.old
 重启方式按平台自动选：Linux/macOS 用 `syscall.Exec` 原地替换（PID 不变，不依赖服务管理器）；
 Windows 起一个新进程再退出旧进程（这条路是**尽力而为**：新进程要等旧进程释放端口，万一没起来就手动重启一次（二进制已经换好了，界面上还有「回退上一版」）。
 
-> **能不能自升级由运行环境决定，界面上会直接说明原因。** 用 `go run` 起的实例、
-> 或二进制所在目录不可写（systemd 里最常见的是 `ReadWritePaths` 没带这个目录），
-> 升级页会显示为不可用并给出原因，而不是让人点一个注定失败的按钮。
+> **能不能升级由运行环境决定，界面上会直接说明原因。** 用 `go run` 起的实例（可执行文件
+> 落在 go-build 临时目录里）、或连暂存目录都写不进去时会显示为不可用并给出原因，
+> 而不是让人点一个注定失败的按钮。
 >
 > **容器里不建议开自升级**：容器内的文件系统是临时的，换掉容器里的二进制会被下次拉起镜像冲掉，
 > 正确做法是换镜像 tag。Docker 场景请继续用「上传文件」那条路临时救急，或直接改部署描述。
+
+#### 需要 root 收尾的实例（`install.sh` 装出来的都是这样）
+
+`install.sh` 写出来的 systemd 单元里服务以 `goproxy` 身份跑，`ReadWritePaths` 只放行了
+`$STATE_DIR` 与 `$CONFIG_DIR`，而 `/usr/local/bin` 归 root，也就是说**服务账号故意没有
+替换自己二进制的权限**（这是对的：拿到控制台不等于拿到 root）。这种情况下升级页不会变成
+不可用，而是走「托管」：
+
+1. 控制台照旧完成下载、`SHA256SUMS` 校验，以及对暂存文件跑一次 `-version` 验证；
+2. 文件落在配置库旁边的 `upgrade/` 目录（`ReadWritePaths` 已经放行了那里，不需要额外授权）；
+3. 页面给出一条命令，在服务器上以 root 执行它完成替换与重启：
+
+```bash
+sudo /usr/local/bin/goproxy -c /etc/goproxy/goproxy.db -upgrade-apply      # 应用新版本
+sudo /usr/local/bin/goproxy -c /etc/goproxy/goproxy.db -upgrade-rollback   # 回退到 <exe>.old
+```
+
+这两条命令和界面内部走的是同一套替换逻辑（先备份 `<exe>.old`、再把旧文件改名挪开、
+再把新文件放到位），所以「界面点的」和「命令行做的」结果一致，来回切也可以。
+把真正的落地动作留在服务器上由有权限的人触发，意味着「控制台被拿到」不会自动升级成
+「任意二进制落地」。
+
+想让它一键完成（不再需要 root 收尾），干净的做法是给二进制一个**自己独占的目录**、
+把那个目录交给服务账号，而不是放宽 `/usr/local/bin`：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh \
+  | sudo BIN_DIR=/opt/goproxy bash     # install.sh 会把单元里的 ExecStart 一起改过去
+```
+
+代价要明白：**从此这个服务能改写自己的二进制**，控制台一旦被攻破就等于持久化。
+项目默认不这么做，`install.sh` 也不会替你改。
 
 可覆盖的环境变量（都只在服务端读）：
 
@@ -1055,6 +1087,7 @@ Windows 起一个新进程再退出旧进程（这条路是**尽力而为**：�
 | `GOPROXY_UPGRADE_MIRRORS` | `https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/` | `auto` 模式下按顺序尝试的镜像 |
 | `GOPROXY_UPGRADE_GITHUB` | `https://github.com` | GitHub 基址（自建 / 企业版） |
 | `GOPROXY_UPGRADE_API` | `https://api.github.com` | 只用来兜底解析版本和取发布说明 |
+
 ### 版本号从哪来
 
 版本号不在源码里写死，编译时由 git 推导（`Makefile` 与 CI 用同一套规则）：正好打在 tag 上是 `v0.4.0`；
@@ -1071,7 +1104,7 @@ tag 之后又有提交是 `v0.4.0-9-gef38364`（距该 tag 9 个提交）；有�
 
 ```bash
 goproxy [-c 配置库] [-log-level 级别] [-text-log] [-version] [-hash-password 密码]
-        [-config-import JSON] [-config-export JSON]
+        [-config-import JSON] [-config-export JSON] [-upgrade-apply] [-upgrade-rollback]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -1083,6 +1116,8 @@ goproxy [-c 配置库] [-log-level 级别] [-text-log] [-version] [-hash-passwor
 | `-hash-password <密码>` | — | 把密码算成 bcrypt 哈希后退出，用于填进 `admin_users[].password_hash` |
 | `-config-import <JSON>` | — | 把一份 JSON 配置导入数据库后退出（走完整校验，失败不动原库） |
 | `-config-export <JSON>` | — | 把数据库里的配置导出成 JSON 后退出（人可读，适合 diff / 备份） |
+| `-upgrade-apply` | `-` | 以 **root** 应用控制台「升级」页暂存好的新版本（服务账号写不进二进制目录时用它） |
+| `-upgrade-rollback` | `-` | 以 **root** 回退到 `<exe>.old`（上一次升级前的版本，同样要权限） |
 
 > 后两个子命令**都需要同时给 `-c`**，例如 `goproxy -c goproxy.db -config-export config.json`。
 > 它们的作用和用法见[配置存在哪儿](#配置存在哪儿sqlitev090-起)。

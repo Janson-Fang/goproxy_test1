@@ -560,6 +560,19 @@ export interface UpgradeState {
   supported: boolean
   reason?: string
   writable: boolean
+  /**
+   * 最后一步（写二进制 + 重启服务）必须由 root 做。
+   *
+   * install.sh 装出来的实例就是这种：服务以 goproxy 跑、ReadWritePaths 只放行了
+   * 状态目录与配置目录，而 /usr/local/bin 归 root。这时控制台仍然能下载、校验、
+   * 验证并把结果暂存下来，只是要有人在服务器上跑一条 sudo 命令收尾。
+   */
+  needs_root: boolean
+  /** 暂存目录（needs_root 时是配置库旁边的 upgrade/） */
+  stage_dir?: string
+  /** 给人复制的 root 命令 */
+  apply_command?: string
+  rollback_command?: string
   source: UpgradeSource
   staged: UpgradeStaged
   backup: UpgradeBackup
@@ -582,4 +595,9 @@ export interface UpgradeInstallResult {
   verified: boolean
   channel?: string
   sums_verified: boolean
+  /** true 表示这次只是「下载 + 校验 + 暂存」，还没换上去，要 root 执行 apply_command */
+  needs_root: boolean
+  apply_command?: string
+  staged_path?: string
+  staged_sha256?: string
 }

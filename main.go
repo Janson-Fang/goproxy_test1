@@ -95,7 +95,7 @@ func NewApp(configDB string) (*App, error) {
 		logs:          newLogBuffer(logRingSize),
 		sessions:      newSessionStore(),
 		adminAccounts: empty,
-		upgrade:       newUpgradeManager(),
+		upgrade:       newUpgradeManager(executablePath(), configDB),
 	}, nil
 }
 
@@ -1025,6 +1025,10 @@ func main() {
 		"把一份 JSON 配置导入数据库后退出，例如 -c goproxy.db -config-import config.json")
 	exportCfg := flag.String("config-export", "",
 		"把数据库里的配置导出成 JSON 后退出，例如 -c goproxy.db -config-export config.json")
+	applyUpgrade := flag.Bool("upgrade-apply", false,
+		"以 root 应用控制台「升级」页暂存好的新版本（服务账号写不进二进制目录时用它）")
+	rollbackUpgrade := flag.Bool("upgrade-rollback", false,
+		"以 root 回退到 <exe>.old（升级模块留下的上一版）")
 	flag.Parse()
 
 	if *showVer {
@@ -1077,6 +1081,22 @@ func main() {
 		return
 	}
 
+	// 托管升级的第二半：以 root 应用 / 回退。
+	//
+	// install.sh 装出来的实例里服务以 goproxy 跑、/usr/local/bin 属 root，进程自己
+	// 写不进去，于是控制台只负责下载、校验、验证并暂存，最后这一步交给 root 执行：
+	//
+	// goproxy -c <库> -upgrade-apply      应用暂存的新版本
+	// goproxy -c <库> -upgrade-rollback   回退到 <exe>.old
+	//
+	// 必须在 NewApp 之前处理：它只需要 -c 来推导暂存目录，不该顺手把配置库建出来。
+	if *applyUpgrade || *rollbackUpgrade {
+		if err := runUpgradeApply(*configDB, *rollbackUpgrade); err != nil {
+			slog.Error("应用升级失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	app, err := NewApp(*configDB)
 	if err != nil {
 		slog.Error("初始化失败", "err", err)

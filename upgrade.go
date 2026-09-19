@@ -160,26 +160,43 @@ type upgradeEnv struct {
 	Exe      string
 	Dir      string
 	Strategy restartStrategy
-	// Service 只是展示用（systemd | none）：两种策略都不依赖它，
+	// Service 只是展示用（systemd | none）：重启方式不由它决定，
 	// 但「这个实例是谁在管」会影响用户对「升级后会不会掉线」的判断。
-	Service  string
+	Service string
+	// Writable 表示进程能写二进制所在目录，也就是能自己把文件换掉。
 	Writable bool
-	// Reason 非空表示不能自升级，内容是给人看的原因。
+	// StageDir 是「现在就能写」的暂存目录。Writable=false 时它落在状态目录里，
+	// 由 root 用 -upgrade-apply 应用（托管升级）。空表示连暂存都做不到。
+	StageDir string
+	// Delegated 表示这次升级得由 root 代劳：控制台照旧负责下载、校验、
+	// 跑一次 -version 验证，但最后那步「写 /usr/local/bin + 重启服务」需要权限。
+	Delegated bool
+	// Reason 非空表示整条升级路径都不通，内容是给人看的原因。
 	Reason string
 }
 
-// supported 表示这台机器上能不能自升级。
+// supported 表示这台机器上能不能升级（含需要 root 代劳的托管方式）。
 func (e upgradeEnv) supported() bool { return e.Reason == "" && e.Strategy != strategyUnsupported }
 
-// detectUpgradeEnv 探测当前进程的可升级性。
+// canSwap 表示进程能自己把二进制换到位。false 而 supported() 为 true 时走托管。
+func (e upgradeEnv) canSwap() bool { return e.supported() && e.Writable }
+
+// detectUpgradeEnv 探测升级能力。
 //
-// 这里刻意不只看 GOOS：真正会让人白忙一场的是「可执行文件躺在临时目录里」
-// （go run / go build 到 %TEMP%），那种情况下替换文件对下次启动毫无影响。
-func detectUpgradeEnv(exe string) upgradeEnv {
+// 两种情况必须分开看，因为处置办法完全不同：
+//
+//   - 进程能写二进制所在目录：自己原地替换，一步到位（Writable）。
+//   - 写不进去：install.sh 装出来的实例就是这一种（单元里 User=goproxy，
+//     ReadWritePaths 只放行了 $STATE_DIR 与 $CONFIG_DIR，而 /usr/local/bin
+//     是 root 的）。这时仍然可以下载、校验、验证，把结果暂存到配置库旁边的
+//     upgrade/ 目录，再由 root 用 `goproxy -upgrade-apply` 应用（Delegated）。
+//
+// 只有「两边都写不进去」「go run 起的实例」「不支持的平台」才判为不支持。
+func detectUpgradeEnv(exe, configDB string) upgradeEnv {
 	env := upgradeEnv{Exe: exe, Service: detectServiceManager()}
 	if exe == "" {
 		env.Strategy = strategyUnsupported
-		env.Reason = "拿不到当前进程的可执行文件路径（os.Executable 失败），无法自升级。"
+		env.Reason = "拿不到当前进程的可执行文件路径（os.Executable 失败），无法升级。"
 		return env
 	}
 	env.Dir = filepath.Dir(exe)
@@ -210,15 +227,58 @@ func detectUpgradeEnv(exe string) upgradeEnv {
 		}
 		return env
 	}
-	env.Writable = dirWritable(env.Dir)
-	if !env.Writable {
-		env.Reason = fmt.Sprintf("进程对 %s 没有写权限，替换二进制需要该目录可写"+
-			"（systemd 下最常见的成因是单元里的 ReadWritePaths 没带上这个目录）。", env.Dir)
+
+	if upgradeDirWritable(env.Dir) {
+		env.Writable = true
+		env.StageDir = env.Dir
+		return env
 	}
+
+	// 二进制目录写不进去：看能不能把新版本暂存到状态目录，交给 root 应用。
+	fallback := delegatedStageDir(configDB)
+	if fallback == "" {
+		env.Strategy = strategyUnsupported
+		env.Reason = fmt.Sprintf("进程对 %s 没有写权限，也没有可用的状态目录来暂存新版本。", env.Dir)
+		return env
+	}
+	if err := os.MkdirAll(fallback, 0o700); err != nil {
+		env.Strategy = strategyUnsupported
+		env.Reason = fmt.Sprintf("进程对 %s 没有写权限，也建不出暂存目录 %s：%v", env.Dir, fallback, err)
+		return env
+	}
+	if !upgradeDirWritable(fallback) {
+		env.Strategy = strategyUnsupported
+		env.Reason = fmt.Sprintf("进程对 %s 与暂存目录 %s 都没有写权限，无法升级。", env.Dir, fallback)
+		return env
+	}
+	env.Delegated = true
+	env.StageDir = fallback
 	return env
 }
 
-// inTempDir 判断目录是否落在系统临时目录里（go run 的典型症状）。
+// delegatedStageDir 返回托管升级的暂存目录：配置库旁边的 upgrade/ 子目录。
+//
+// 不写死在 /var/lib，而是跟着 -c 走：install.sh 的单元里 ReadWritePaths 放行了
+// $STATE_DIR 与 $CONFIG_DIR，而配置库所在目录必然可写（管理接口要写库，SQLite
+// 还要在库旁边建 -wal / -shm），所以这个位置不需要任何额外授权。
+func delegatedStageDir(configDB string) string {
+	dir := strings.TrimSpace(configDB)
+	if dir == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(abs), "upgrade")
+}
+
+// upgradeDirWritable 是 dirWritable 的间接层，给单测留一个注入点。
+//
+// 需要它是因为「二进制目录写不进去」这条分支在 Windows 上造不出来
+// （目录的只读属性和 Unix 权限位不是一回事），而它恰好是最该覆盖的一条路。
+var upgradeDirWritable = dirWritable
+
 // inBuildTempDir 判断目录是不是「构建工具随手放的临时目录」。
 //
 // 只认两种：go run / go test 的 go-build* 目录，以及系统临时目录本身。
@@ -399,6 +459,7 @@ func cleanupUpgradeLeftovers(exe string) {
 		return
 	}
 	removeUpgradeFile(exe + ".staged")
+	removeUpgradeFile(exe + ".rollback-staged")
 	// 「挪开的旧映像」用的是带时间戳的名字（见 parkedPath）：Windows 上正在
 	// 运行的那个映像删不掉，只能留在原地等下次启动清理，所以这里按前缀扫一遍，
 	// 而不是只删一个固定的名字。
@@ -458,8 +519,11 @@ type stagedBinary struct {
 }
 
 type upgradeManager struct {
-	exe    string
-	source *releaseSource
+	exe string
+	// configDB 是配置库路径：托管升级用它定位暂存目录（配置库旁边的 upgrade/），
+	// root 用 -upgrade-apply 应用时也会算出同一个位置。
+	configDB string
+	source   *releaseSource
 
 	// verify / restart / restartDelay 是留给单测的注入点。
 	// 这三件事在测试进程里必须有替身：verify 会真的去执行「被验证的文件」，
@@ -480,23 +544,70 @@ type upgradeManager struct {
 	busy atomic.Bool
 }
 
-func newUpgradeManager() *upgradeManager { return newUpgradeManagerFor(executablePath()) }
+// newUpgradeManager 给守护进程用：构造 + 清理上次升级留下的中间文件。
+func newUpgradeManager(exe, configDB string) *upgradeManager {
+	um := newUpgradeManagerFor(exe, configDB)
+	cleanupUpgradeLeftovers(exe)
+	return um
+}
 
-func newUpgradeManagerFor(exe string) *upgradeManager {
-	um := &upgradeManager{
+// newUpgradeManagerFor 只构造，不做任何清理。
+//
+// 分开的理由是 -upgrade-apply 那条路（root 应用暂存文件）不能清 .staged：
+// 那正是它要装的东西。只有守护进程需要「启动即清理」。
+func newUpgradeManagerFor(exe, configDB string) *upgradeManager {
+	return &upgradeManager{
 		exe:          exe,
+		configDB:     configDB,
 		source:       newReleaseSource(),
 		verify:       verifyBinary,
 		restart:      restartProcess,
 		restartDelay: upgradeRestartDelay,
 	}
-	cleanupUpgradeLeftovers(exe)
-	return um
 }
 
-func (um *upgradeManager) env() upgradeEnv { return detectUpgradeEnv(um.exe) }
+func (um *upgradeManager) env() upgradeEnv { return detectUpgradeEnv(um.exe, um.configDB) }
 
-func (um *upgradeManager) stagePath() string  { return um.exe + ".staged" }
+// stagePath 返回这次升级的暂存路径，空串表示当前连暂存都做不到。
+//
+// 命名统一是 <StageDir>/<二进制文件名>.staged：二进制目录可写时 StageDir 就是
+// 它自己，于是这个路径正好等于 <exe>.staged，rename 仍落在同一个文件系统内
+// （原子替换的前提）；写不进去时 StageDir 是配置库旁边的 upgrade/，
+// 交给 root 用 -upgrade-apply 应用。
+func (um *upgradeManager) stagePath() string {
+	env := um.env()
+	if env.StageDir == "" {
+		return ""
+	}
+	return filepath.Join(env.StageDir, filepath.Base(um.exe)+".staged")
+}
+
+// stagedCandidates 列出所有可能放着暂存文件的位置，按优先级排列。
+//
+// 必须扫两个而不是算一个：托管升级把文件放在状态目录里，而 root 用
+// -upgrade-apply 应用时算出来的 Writable 是 true（root 哪儿都能写），
+// 只按「当前可写位置」去找就会扑空。
+func (um *upgradeManager) stagedCandidates() []string {
+	primary := um.exe + ".staged"
+	out := []string{primary}
+	if d := delegatedStageDir(um.configDB); d != "" {
+		alt := filepath.Join(d, filepath.Base(um.exe)+".staged")
+		if alt != primary {
+			out = append(out, alt)
+		}
+	}
+	return out
+}
+
+// findStaged 返回实际存在的暂存文件路径，没有就返回空串。
+func (um *upgradeManager) findStaged() string {
+	for _, p := range um.stagedCandidates() {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
 func (um *upgradeManager) backupPath() string { return um.exe + ".old" }
 
 func (um *upgradeManager) begin() bool  { return um.busy.CompareAndSwap(false, true) }
@@ -546,12 +657,17 @@ func (um *upgradeManager) stagedView() upgradeStagedView {
 	// 进程里没有记录（多半是刚重启过）但磁盘上还留着一份：只报存在性和大小。
 	// sha256 / 自述版本不必为了显示再算一遍，真装的时候一定会重新验证，
 	// 到时候才算才有意义。
-	if fi, err := os.Stat(um.stagePath()); err == nil && !fi.IsDir() {
-		return upgradeStagedView{
-			Present: true,
-			Path:    um.stagePath(),
-			Size:    fi.Size(),
-			MTime:   formatLogTime(fi.ModTime()),
+	// 进程里没有记录（多半是刚重启过）但磁盘上还留着一份：只报存在性和大小。
+	// sha256 / 自述版本不必为了显示再算一遍，真装的时候一定会重新验证，
+	// 到时候才算才有意义。
+	if path := um.findStaged(); path != "" {
+		if fi, err := os.Stat(path); err == nil {
+			return upgradeStagedView{
+				Present: true,
+				Path:    path,
+				Size:    fi.Size(),
+				MTime:   formatLogTime(fi.ModTime()),
+			}
 		}
 	}
 	return upgradeStagedView{}
@@ -595,8 +711,11 @@ func (um *upgradeManager) parkedPath() string {
 
 // install 把暂存的二进制换到位。只负责「已经验证过的东西」的替换动作。
 func (um *upgradeManager) install(env upgradeEnv, st *stagedBinary) error {
-	if !env.supported() {
-		return upgradeConflict("upgrade_unsupported", env.Reason)
+	// 只有「能自己写二进制目录」时才走到这里。托管升级（Delegated）由
+	// handleUpgradeInstall / handleUpgradeRollback 在调用前分流，不会进来。
+	if !env.canSwap() {
+		return upgradeConflict("upgrade_needs_root",
+			"当前进程不能直接替换二进制（"+filepath.Dir(env.Exe)+" 不可写），需要 root 应用。")
 	}
 	if st == nil || st.Path == "" {
 		return upgradeConflict("upgrade_nothing_staged", "没有待安装的二进制：先上传一个，或先检查更新。")
@@ -619,12 +738,12 @@ func (um *upgradeManager) install(env upgradeEnv, st *stagedBinary) error {
 // 上传时验证一次（能立刻告诉用户文件不对），安装前再验证一次（防的是
 // 「上传之后、安装之前」这段窗口里文件被换掉）。验证本身很便宜。
 func (um *upgradeManager) stageFromDisk(expectedSHA string) (*stagedBinary, error) {
-	path := um.stagePath()
+	path := um.findStaged()
+	if path == "" {
+		return nil, upgradeConflict("upgrade_nothing_staged", "服务端没有待安装的文件：请先在控制台上传一个二进制，或先检查更新。")
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, upgradeConflict("upgrade_nothing_staged", "服务端没有待安装的文件：请先在控制台上传一个二进制。")
-		}
 		return nil, err
 	}
 	if fi.IsDir() {
@@ -671,6 +790,10 @@ func (um *upgradeManager) stageFromGitHub(ctx context.Context, want string, forc
 	}
 
 	dest := um.stagePath()
+	if dest == "" {
+		return nil, nil, upgradeConflict("upgrade_unsupported",
+			"没有可写的暂存位置（二进制目录与状态目录都写不进去），无法升级。")
+	}
 	res, err := um.source.fetchRelease(ctx, info, dest, upgradeMaxStagedBytes)
 	if err != nil {
 		_ = os.Remove(dest)
@@ -796,6 +919,13 @@ type upgradeStateResponse struct {
 	Backup    upgradeBackupView   `json:"backup"`
 	Busy      bool                `json:"busy"`
 	LastCheck *upgradeCheckResult `json:"last_check,omitempty"`
+	// NeedsRoot 表示升级 / 回退的最后一步必须由 root 做：进程能下载、能校验、
+	// 能跑 -version 验证，但写不进二进制目录（install.sh 装出来的实例就是这种）。
+	// 这时 StageDir 是暂存位置，ApplyCommand / RollbackCommand 是给人复制的命令。
+	NeedsRoot       bool   `json:"needs_root"`
+	StageDir        string `json:"stage_dir,omitempty"`
+	ApplyCommand    string `json:"apply_command,omitempty"`
+	RollbackCommand string `json:"rollback_command,omitempty"`
 }
 
 // upgradeInstallResult 是安装 / 回退成功后回给控制台的东西。
@@ -816,6 +946,13 @@ type upgradeInstallResult struct {
 	// ArchiveSHA256 是发布包（tar.gz）的 sha256，也就是校验和文件里那一个。
 	// 它和 SHA256 不是一回事：SHA256 是最终装上去那个二进制的哈希。
 	ArchiveSHA256 string `json:"archive_sha256,omitempty"`
+	// NeedsRoot 为 true 时这次「安装」只是把新版本暂存好了，还没换上去：
+	// ApplyCommand 是下一步要在服务器上执行的 root 命令，StagedPath / StagedSHA256
+	// 是那份待应用文件的落点与哈希，方便人工核对。
+	NeedsRoot    bool   `json:"needs_root"`
+	ApplyCommand string `json:"apply_command,omitempty"`
+	StagedPath   string `json:"staged_path,omitempty"`
+	StagedSHA256 string `json:"staged_sha256,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +1036,13 @@ func (a *App) handleUpgradeState(w http.ResponseWriter, r *http.Request) {
 		Busy:      um.isBusy(),
 		LastCheck: um.lastCheck(),
 	}
+	if env.Delegated {
+		// 能下载、能校验、能验证，但写不进二进制目录：把「以 root 应用」的命令给出来。
+		resp.NeedsRoot = true
+		resp.StageDir = env.StageDir
+		resp.ApplyCommand = um.applyCommand(false)
+		resp.RollbackCommand = um.applyCommand(true)
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -979,9 +1123,13 @@ func (a *App) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 落点和可执行文件同目录：最后那一步 rename 必须落在同一个文件系统上，
-	// 跨文件系统的 rename 会退化成「复制 + 删除」，中间就有窗口了。
+	// 落点由 stagePath 决定：二进制目录可写时就在它旁边（最后那一步 rename 才能
+	// 落在同一个文件系统内）；写不进去时退到状态目录，由 root 用 -upgrade-apply 应用。
 	stagePath := um.stagePath()
+	if stagePath == "" {
+		writeErr(w, upgradeConflict("upgrade_unsupported", "没有可写的暂存位置，无法接收上传。"))
+		return
+	}
 	f, err := os.OpenFile(stagePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		writeErr(w, err)
@@ -1091,13 +1239,33 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 托管：下载、校验、-version 验证都已经做完了，但进程写不进去二进制目录，
+	// 最后那一步（写文件 + 重启服务）得由 root 来。这不是失败，所以回 200，
+	// 把该执行的命令一并给出去；界面据此显示「等待 root 应用」。
+	if !env.canSwap() {
+		slog.Info("升级：已暂存，等待 root 应用", "actor", actor, "source", req.Source,
+			"from", from, "to", st.Version, "staged", st.Path, "sha256", st.SHA256)
+		out := upgradeInstallResult{
+			OK: true, From: from, To: st.Version, SHA256: st.SHA256,
+			Backup: filepath.Base(um.backupPath()), Restart: string(env.Strategy),
+			Service: env.Service, Source: st.Source, Verified: true,
+			Channel: st.Channel, SumsVerified: st.SumsVerified, ArchiveSHA256: st.ArchiveSHA,
+			NeedsRoot: true, ApplyCommand: um.applyCommand(false),
+			StagedPath: st.Path, StagedSHA256: st.SHA256,
+		}
+		if res != nil {
+			out.Channel = res.Channel
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
 	slog.Info("升级：开始安装", "actor", actor, "source", req.Source,
 		"from", from, "to", st.Version, "sha256", st.SHA256, "sums_verified", st.SumsVerified)
 	if err := um.install(env, st); err != nil {
 		writeErr(w, err)
 		return
 	}
-
 	out := upgradeInstallResult{
 		OK: true, From: from, To: st.Version, SHA256: st.SHA256,
 		Backup: filepath.Base(um.backupPath()), Restart: string(env.Strategy),
@@ -1132,6 +1300,19 @@ func (a *App) handleUpgradeRollback(w http.ResponseWriter, r *http.Request) {
 	if _, err := os.Stat(backupPath); err != nil {
 		writeErr(w, upgradeConflict("upgrade_no_backup",
 			"没有可回退的备份（"+filepath.Base(backupPath)+" 不存在）：只有在本机做过一次升级之后才会有备份。"))
+		return
+	}
+
+	// 托管：进程写不进去二进制目录，回退同样得由 root 应用。这里只把命令给出，
+	// 因为回退走的是和升级完全相同的替换路径（同一份 <exe>.old）。
+	if !env.canSwap() {
+		slog.Info("升级：回退需要 root 应用", "actor", actor, "from", version)
+		writeJSON(w, http.StatusOK, upgradeInstallResult{
+			OK: true, From: version, To: um.backupView().Version,
+			Backup: filepath.Base(backupPath), Restart: string(env.Strategy),
+			Service: env.Service, Source: "rollback", Verified: true,
+			NeedsRoot: true, ApplyCommand: um.applyCommand(true),
+		})
 		return
 	}
 
@@ -1209,4 +1390,130 @@ func isGzipFile(path string) bool {
 		return false
 	}
 	return magic[0] == 0x1f && magic[1] == 0x8b
+}
+
+// ---------------------------------------------------------------------------
+// 以 root 应用（托管升级的后半段）
+//
+// install.sh 装出来的实例里，服务以 goproxy 身份跑、/usr/local/bin 归 root，
+// 所以进程自己能做的只有「下载 + 校验 + 验证 + 暂存」。最后那一步写文件、
+// 重启服务需要权限，由这两条命令完成：
+//
+//goproxy -c <库> -upgrade-apply      应用暂存的新版本
+//goproxy -c <库> -upgrade-rollback   回退到 <exe>.old
+//
+// 两条都复用升级模块自己的替换逻辑（同样的「先备份、再改名挪开、再放上去」、
+// 同一份 <exe>.old），所以「界面点的」和「命令行做的」结果一致。
+// ---------------------------------------------------------------------------
+
+func runUpgradeApply(configDB string, rollback bool) error {
+	exe := executablePath()
+	if exe == "" {
+		return errors.New("拿不到当前可执行文件路径，无法应用")
+	}
+	// 用 newUpgradeManagerFor：它不清 .staged，而 .staged 正是这次要装的东西。
+	um := newUpgradeManagerFor(exe, configDB)
+
+	src := um.findStaged()
+	what := "暂存的新版本"
+	if rollback {
+		// 先把备份复制成一份「回退专用」的暂存文件，不能直接拿 <exe>.old 当源（见
+		// prepareRollbackSource 的注释：直接当源会被 swapBinary 的第一步覆盖掉）。
+		var err error
+		src, err = prepareRollbackSource(exe, um.backupPath())
+		if err != nil {
+			return err
+		}
+		what = "备份的上一版"
+	}
+	if src == "" {
+		return fmt.Errorf("没有可应用的%s：暂存文件不存在（先到控制台的「升级」页下载或上传）", what)
+	}
+	if fi, err := os.Stat(src); err != nil || fi.IsDir() {
+		return fmt.Errorf("读%s失败：%v", what, err)
+	}
+	if !dirWritable(filepath.Dir(exe)) {
+		return fmt.Errorf("没有写 %s 的权限，这条命令要用 root 跑（sudo）", filepath.Dir(exe))
+	}
+
+	// 换掉线上二进制之前再验证一次：校验和只证明字节没坏，跑得起来才算数。
+	// 这一步和 install.sh 第 7 节是同一个道理。
+	sha, err := hashFile(src)
+	if err != nil {
+		return err
+	}
+	bv, commit, err := verifyBinary(src)
+	if err != nil {
+		return fmt.Errorf("待应用的%s通不过验证，已放弃：%w", what, err)
+	}
+	if err := swapBinary(exe, src, um.backupPath(), um.parkedPath()); err != nil {
+		if rollback {
+			_ = os.Remove(src)
+		}
+		return err
+	}
+	slog.Info("升级：已应用", "what", what, "exe", exe, "version", bv.Raw, "commit", commit,
+		"sha256", sha, "backup", um.backupPath())
+	return restartServiceAfterApply()
+}
+
+// restartServiceAfterApply 让服务加载新版本。
+//
+// 只认 systemd（install.sh 的部署形态）：不是 systemd 环境时不做任何猜测，
+// 把「请手动重启」留给操作者  二进制已经换好了，重启是唯一的下一步。
+// prepareRollbackSource 把 <exe>.old 复制成一份「回退专用」的暂存文件并返回它的路径。
+//
+// 必须复制，不能直接拿备份当源：swapBinary 的第一步是「把当前二进制备份到
+// backupPath」，源如果就是 backupPath，那一步会先把源覆盖成当前这一版，
+// 于是最后装上去的还是原来那一版  现象是「回退成功了但版本没变」
+// （真实端到端跑出来的坑，界面那条路早就是这么绕的）。
+//
+// 复制出来的那份会在 swap 时被 rename 走，正常路径不需要清理；失败时由调用方删。
+func prepareRollbackSource(exe, backup string) (string, error) {
+	if fi, err := os.Stat(backup); err != nil || fi.IsDir() {
+		return "", fmt.Errorf("没有可回退的备份：%s 不存在（只有在本机做过一次升级之后才会有）", backup)
+	}
+	dst := filepath.Join(filepath.Dir(exe), filepath.Base(exe)+".rollback-staged")
+	if err := copyFile(backup, dst, 0o755); err != nil {
+		return "", fmt.Errorf("准备回退失败：%w", err)
+	}
+	return dst, nil
+}
+
+func restartServiceAfterApply() error {
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		slog.Warn("升级：不是 systemd 环境，二进制已替换，请手动重启服务以加载新版本")
+		return nil
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		slog.Warn("升级：找不到 systemctl，二进制已替换，请手动重启服务", "err", err)
+		return nil
+	}
+	out, err := exec.Command("systemctl", "restart", "goproxy").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl restart goproxy 失败（%v）：%s（二进制已经换好了，可手动重启）",
+			err, truncateForMsg(string(out)))
+	}
+	slog.Info("升级：已重启 systemd 服务 goproxy")
+	return nil
+}
+
+// applyCommand 返回「以 root 应用」的命令，控制台把它显示出来让人复制。
+func (um *upgradeManager) applyCommand(rollback bool) string {
+	flag := "-upgrade-apply"
+	if rollback {
+		flag = "-upgrade-rollback"
+	}
+	return fmt.Sprintf("sudo %s -c %s %s", shellQuote(um.exe), shellQuote(um.configDB), flag)
+}
+
+// shellQuote 在必要时给路径加单引号，让复制出来的命令能直接用。
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t'\"\\$&|;<>()") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

@@ -163,7 +163,7 @@ func TestDetectUpgradeEnvSupportsNormalPath(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "goproxy")
 	writeFileStr(t, exe, "old")
-	env := detectUpgradeEnv(exe)
+	env := detectUpgradeEnv(exe, filepath.Join(filepath.Dir(exe), "goproxy.db"))
 	if !env.supported() {
 		t.Fatalf("正常路径应当支持自升级，却被判为：%s", env.Reason)
 	}
@@ -185,7 +185,7 @@ func TestDetectUpgradeEnvRejectsGoBuildTemp(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(os.TempDir(), "go-build123")) })
 	exe := filepath.Join(dir, "goproxy")
 	writeFileStr(t, exe, "old")
-	env := detectUpgradeEnv(exe)
+	env := detectUpgradeEnv(exe, filepath.Join(filepath.Dir(exe), "goproxy.db"))
 	if env.supported() {
 		t.Fatalf("go-build 临时目录不该被支持")
 	}
@@ -195,7 +195,7 @@ func TestDetectUpgradeEnvRejectsGoBuildTemp(t *testing.T) {
 }
 
 func TestDetectUpgradeEnvRejectsMissingExe(t *testing.T) {
-	env := detectUpgradeEnv("")
+	env := detectUpgradeEnv("", "")
 	if env.supported() {
 		t.Fatal("拿不到可执行文件路径时不该支持自升级")
 	}
@@ -597,7 +597,7 @@ func TestVerifyBinaryAcceptsRealGoproxy(t *testing.T) {
 
 func TestNewUpgradeManagerWiresRealBehaviours(t *testing.T) {
 	// 注入点必须有默认值，否则生产路径上 verify/restart 会是 nil 调用
-	um := newUpgradeManagerFor(filepath.Join(t.TempDir(), "goproxy"))
+	um := newUpgradeManagerFor(filepath.Join(t.TempDir(), "goproxy"), filepath.Join(t.TempDir(), "goproxy.db"))
 	if um.verify == nil || um.restart == nil || um.restartDelay != upgradeRestartDelay {
 		t.Fatalf("默认注入点没接上：verify=%v restart=%v delay=%v",
 			um.verify != nil, um.restart != nil, um.restartDelay)
@@ -613,7 +613,7 @@ func testManager(t *testing.T) (*upgradeManager, string) {
 	t.Helper()
 	exe := filepath.Join(t.TempDir(), "goproxy")
 	writeFileStr(t, exe, "OLD-BINARY")
-	um := newUpgradeManagerFor(exe)
+	um := newUpgradeManagerFor(exe, filepath.Join(filepath.Dir(exe), "goproxy.db"))
 	um.verify = func(string) (buildVersion, string, error) {
 		return parseBuildVersion("v9.9.9"), "deadbee", nil
 	}
@@ -775,4 +775,268 @@ func TestTwoInstallsThroughManagerInARow(t *testing.T) {
 	}
 	// 第二次替换会把「第一次换上去的那份」备份下来
 	assertContent(t, exe+".old", "V1")
+}
+
+// ---------------------------------------------------------------------------
+// 托管升级（binary 目录写不进去时：控制台暂存，root 应用）
+//
+// 这条路的现实来源：install.sh 装出来的实例里服务以 goproxy 身份跑，
+// ReadWritePaths 只放行 $STATE_DIR 与 $CONFIG_DIR，而 /usr/local/bin 归 root，
+// 于是进程死活写不进二进制目录  但它仍然能下载、校验、验证。
+// ---------------------------------------------------------------------------
+
+// makeExeDirReadOnly 让「二进制目录不可写」在测试里可复现。
+//
+// Windows 上造不出真正不可写的目录（目录只读属性与 Unix 权限位不是一回事），
+// 所以在判断函数上做替换；新增的每处替换都必须自己恢复，避免串到别的用例。
+func makeExeDirReadOnly(t *testing.T, exeDir string) {
+	t.Helper()
+	saved := upgradeDirWritable
+	t.Cleanup(func() { upgradeDirWritable = saved })
+	upgradeDirWritable = func(d string) bool {
+		return filepath.Clean(d) != filepath.Clean(exeDir)
+	}
+}
+
+func TestDetectUpgradeEnvDelegatesWhenExeDirReadOnly(t *testing.T) {
+	exeDir := t.TempDir()
+	stateDir := t.TempDir()
+	exe := filepath.Join(exeDir, "goproxy")
+	writeFileStr(t, exe, "old")
+	cfg := filepath.Join(stateDir, "goproxy.db")
+
+	makeExeDirReadOnly(t, exeDir)
+
+	env := detectUpgradeEnv(exe, cfg)
+	if !env.supported() {
+		t.Fatalf("二进制目录不可写时应当降级为托管升级，而不是直接不支持：%s", env.Reason)
+	}
+	if env.Writable {
+		t.Error("不该认为二进制目录可写")
+	}
+	if !env.Delegated {
+		t.Error("应当标记为 Delegated")
+	}
+	if env.canSwap() {
+		t.Error("canSwap 应为 false：进程不能自己换")
+	}
+	want := filepath.Join(stateDir, "upgrade")
+	if env.StageDir != want {
+		t.Errorf("暂存目录 = %q，期望 %q", env.StageDir, want)
+	}
+	if fi, err := os.Stat(want); err != nil || !fi.IsDir() {
+		t.Errorf("暂存目录应当被建出来：%v", err)
+	}
+}
+
+func TestDetectUpgradeEnvUnsupportedWhenNothingWritable(t *testing.T) {
+	exeDir := t.TempDir()
+	exe := filepath.Join(exeDir, "goproxy")
+	writeFileStr(t, exe, "old")
+
+	saved := upgradeDirWritable
+	t.Cleanup(func() { upgradeDirWritable = saved })
+	upgradeDirWritable = func(string) bool { return false }
+
+	env := detectUpgradeEnv(exe, filepath.Join(exeDir, "goproxy.db"))
+	if env.supported() {
+		t.Fatal("两边都写不进去时应当判为不支持")
+	}
+	if !strings.Contains(env.Reason, "没有写权限") {
+		t.Errorf("原因里应当说明写权限问题：%s", env.Reason)
+	}
+}
+
+func TestStagedCandidatesCoversDelegatedDir(t *testing.T) {
+	exeDir := t.TempDir()
+	stateDir := t.TempDir()
+	exe := filepath.Join(exeDir, "goproxy")
+	cfg := filepath.Join(stateDir, "goproxy.db")
+	um := newUpgradeManagerFor(exe, cfg)
+
+	got := um.stagedCandidates()
+	if len(got) != 2 {
+		t.Fatalf("应当有两个候选暂存位，得到 %v", got)
+	}
+	if got[0] != exe+".staged" {
+		t.Errorf("第一个候选应当是二进制旁边：%q", got[0])
+	}
+	if want := filepath.Join(stateDir, "upgrade", "goproxy.staged"); got[1] != want {
+		t.Errorf("第二个候选应当是状态目录：%q，期望 %q", got[1], want)
+	}
+	// 文件放在状态目录里也必须能被找出来（root 应用那条路依赖它）
+	if err := os.MkdirAll(filepath.Dir(got[1]), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileStr(t, got[1], "STAGED")
+	if found := um.findStaged(); found != got[1] {
+		t.Errorf("findStaged = %q，期望 %q", found, got[1])
+	}
+}
+
+func TestApplyCommandIsCopyPasteable(t *testing.T) {
+	dir := t.TempDir()
+	um := newUpgradeManagerFor(filepath.Join(dir, "goproxy"), "/etc/goproxy/goproxy.db")
+	cmd := um.applyCommand(false)
+	if !strings.HasSuffix(cmd, "-upgrade-apply") || !strings.Contains(cmd, um.exe) {
+		t.Errorf("applyCommand 不像一条能跑的 sudo 命令：%q", cmd)
+	}
+	if !strings.Contains(cmd, "-c /etc/goproxy/goproxy.db ") {
+		t.Errorf("applyCommand 少了 -c：%q", cmd)
+	}
+	if got := um.applyCommand(true); !strings.HasSuffix(got, "-upgrade-rollback") {
+		t.Errorf("回退命令不对：%q", got)
+	}
+
+	// 路径里有空格要加引号，否则复制出去就是一串报错
+	um2 := newUpgradeManagerFor("/opt/my proxy/goproxy", "/etc/my state/goproxy.db")
+	got := um2.applyCommand(false)
+	if !strings.Contains(got, "'/opt/my proxy/goproxy'") || !strings.Contains(got, "'/etc/my state/goproxy.db'") {
+		t.Errorf("带空格的路径没有加引号：%s", got)
+	}
+}
+
+func TestUpgradeDelegatesToRootOnReadOnlyExeDir(t *testing.T) {
+	exeDir := t.TempDir()
+	stateDir := t.TempDir()
+	exe := filepath.Join(exeDir, "goproxy")
+	writeFileStr(t, exe, "OLD-BINARY")
+	cfg := filepath.Join(stateDir, "goproxy.db")
+
+	um := newUpgradeManagerFor(exe, cfg)
+	um.verify = func(string) (buildVersion, string, error) {
+		return parseBuildVersion("v9.9.9"), "deadbee", nil
+	}
+	um.restartDelay = 0
+	um.restart = func(upgradeEnv) error {
+		t.Error("托管模式下不该由服务自己替换进程")
+		return nil
+	}
+	makeExeDirReadOnly(t, exeDir)
+
+	app := &App{upgrade: um}
+	wantStage := filepath.Join(stateDir, "upgrade", "goproxy.staged")
+
+	// 1) 上传：应当落到状态目录，而不是（不可写的）二进制旁边
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile("file", "goproxy-linux-amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write([]byte("NEW-BINARY")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	app.handleUpgradeUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("上传失败 %d：%s", rec.Code, rec.Body.String())
+	}
+	var staged upgradeStagedView
+	if err := json.Unmarshal(rec.Body.Bytes(), &staged); err != nil {
+		t.Fatal(err)
+	}
+	if staged.Path != wantStage {
+		t.Errorf("暂存路径 = %q，期望 %q", staged.Path, wantStage)
+	}
+
+	// 2) 安装：回 200（已暂存，不是失败）+ needs_root + 命令，且绝对不能动 exe
+	rec2 := httptest.NewRecorder()
+	app.handleUpgradeInstall(rec2, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/install",
+		strings.NewReader(`{"source":"upload"}`)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("托管安装应当回 200，得到 %d：%s", rec2.Code, rec2.Body.String())
+	}
+	var out upgradeInstallResult
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.NeedsRoot || !strings.Contains(out.ApplyCommand, "-upgrade-apply") {
+		t.Errorf("应当要求 root 应用并给出命令：%+v", out)
+	}
+	if out.StagedPath != wantStage || out.StagedSHA256 == "" {
+		t.Errorf("应当报出待应用文件的落点与哈希：%+v", out)
+	}
+	assertContent(t, exe, "OLD-BINARY")
+	if _, err := os.Stat(exe + ".old"); !os.IsNotExist(err) {
+		t.Error("托管模式下不该产生 .old（那是 root 应用时才备份的）")
+	}
+	if _, err := os.Stat(wantStage); err != nil {
+		t.Errorf("暂存文件应当留着等 root 应用：%v", err)
+	}
+
+	// 3) 状态接口：needs_root + 两个命令 + 暂存目录 + 能看到暂存文件
+	rec3 := httptest.NewRecorder()
+	app.handleUpgradeState(rec3, httptest.NewRequest(http.MethodGet, "/_goproxy/upgrade", nil))
+	var st upgradeStateResponse
+	if err := json.Unmarshal(rec3.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if !st.Supported || st.Writable || !st.NeedsRoot {
+		t.Errorf("状态不对：supported=%v writable=%v needs_root=%v", st.Supported, st.Writable, st.NeedsRoot)
+	}
+	if st.ApplyCommand == "" || st.RollbackCommand == "" || st.StageDir != filepath.Join(stateDir, "upgrade") {
+		t.Errorf("状态里应当带上命令与暂存目录：%+v", st)
+	}
+	if !st.Staged.Present {
+		t.Error("状态里应当看到待安装的暂存文件")
+	}
+
+	// 4) 回退：同样只给命令
+	writeFileStr(t, exe+".old", "PREVIOUS-BINARY")
+	rec4 := httptest.NewRecorder()
+	app.handleUpgradeRollback(rec4, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/rollback",
+		strings.NewReader("{}")))
+	if rec4.Code != http.StatusOK {
+		t.Fatalf("托管回退应当回 200，得到 %d：%s", rec4.Code, rec4.Body.String())
+	}
+	var rb upgradeInstallResult
+	if err := json.Unmarshal(rec4.Body.Bytes(), &rb); err != nil {
+		t.Fatal(err)
+	}
+	if !rb.NeedsRoot || !strings.Contains(rb.ApplyCommand, "-upgrade-rollback") {
+		t.Errorf("回退应当要求 root 应用：%+v", rb)
+	}
+	assertContent(t, exe, "OLD-BINARY")
+}
+
+// TestRollbackSwapDoesNotClobberItsSource 盯住回退时的那个别名陷阱。
+//
+// swapBinary 的第一步是「把当前二进制备份到 backupPath」；如果回退的源就是
+// backupPath 自己，这一步会先把源覆盖成当前版本，最后装上去的还是原来那一版
+// 现象是「回退成功但版本没变」。所以回退必须先复制出一份暂存的源。
+func TestRollbackSwapDoesNotClobberItsSource(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "goproxy")
+	backup := exe + ".old"
+	writeFileStr(t, exe, "CURRENT")
+	writeFileStr(t, backup, "PREVIOUS")
+
+	src, err := prepareRollbackSource(exe, backup)
+	if err != nil {
+		t.Fatalf("prepareRollbackSource: %v", err)
+	}
+	if filepath.Clean(src) == filepath.Clean(backup) {
+		t.Fatal("回退的源不能就是备份文件本身")
+	}
+	if err := swapBinary(exe, src, backup, exe+".swap-old-test"); err != nil {
+		t.Fatalf("swapBinary: %v", err)
+	}
+	assertContent(t, exe, "PREVIOUS")   // 真的回退了
+	assertContent(t, backup, "CURRENT") // 备份换成「刚离开的那一版」，还能再切回去
+}
+
+// TestPrepareRollbackSourceWithoutBackup 备份不存在时要给出能看懂的错。
+func TestPrepareRollbackSourceWithoutBackup(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "goproxy")
+	writeFileStr(t, exe, "CURRENT")
+	if _, err := prepareRollbackSource(exe, exe+".old"); err == nil {
+		t.Fatal("没有备份时应当报错")
+	}
 }
