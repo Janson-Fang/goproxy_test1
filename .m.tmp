@@ -1,0 +1,4 @@
+chore: 把提交信息临时文件挡在仓库外
+
+上一次 commit 用 git add -A 时把 .git-commit-msg.tmp 一起带进去了 ——
+它只是 git commit -F 的输入，属于工具链中间产物。补进 .gitignore 并删除。

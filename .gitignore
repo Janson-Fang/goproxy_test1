@@ -7,6 +7,9 @@ data/
 __pycache__/
 *.pyc
 .release-notes.tmp
+# 写提交信息用的临时文件（git commit -F 的输入）。它只是工具链的中间产物，
+# 误提交过一次，所以显式挡掉。
+.git-commit-msg.tmp
 
 # 配置数据库（v0.9.0 起配置的真源）。本地跑起来就会生成，
 # 里面带着 admin_token 与密码哈希，绝对不要提交。
