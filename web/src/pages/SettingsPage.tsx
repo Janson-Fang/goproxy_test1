@@ -329,7 +329,9 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
           <dl className="kv">
             <dt>配置来源</dt>
             <dd>
-              单一 JSON 文件（SQLite 尚未启用）。也可以直接改文件 —— 进程每秒轮询 mtime，改了会自动热重载。
+              SQLite 数据库（启动参数 <code>-c</code> 指定路径）。所有修改都经管理接口，保存即生效；
+              批量或离线改动用命令行 <code>-config-export</code> / <code>-config-import</code>，
+              导入后需重启或调一次 <code>POST /_goproxy/reload</code> 才会生效。
             </dd>
             <dt>路由条数</dt>
             <dd>{cfg.route_count}</dd>

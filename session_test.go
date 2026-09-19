@@ -14,7 +14,7 @@ package main
 
 import (
 	"net/http"
-	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -968,21 +968,27 @@ func TestCSPDoesNotAllowInlineScript(t *testing.T) {
 // 500 响应不能回显内部错误详情。
 func TestInternalErrorDoesNotLeakDetails(t *testing.T) {
 	e := newTestEnv(t, "s3cret", "")
-	// 用一个会触发内部错误的路径：把配置文件删掉再请求需要读它的接口
-	// （handleGetConfig 读文件失败 → writeErr 走 500 分支）
-	if err := os.Remove(e.path); err != nil {
-		t.Fatalf("删除配置文件失败: %v", err)
-	}
+
+	// 制造一个「读配置必然失败」的状态：把库路径指到一个打不开的位置
+	// （父目录不存在，SQLite 不会替你把目录建出来）。
+	//
+	// v0.9.0 之前这里是「把 config.json 删掉」，换成 SQLite 之后那招不灵了：
+	// 连接池已经握着库，删掉文件只会让下一次读看到「刚建好的空库」，
+	// 报出来的是一句**带库路径**的首次使用引导（ErrNoConfig），
+	// 既不是内部错误，也正好会把本用例要防的「泄露路径」变成误报。
+	bad := filepath.Join(t.TempDir(), "no-such-dir", "goproxy.db")
+	e.app.configDB = bad
 
 	rr := e.do(t, "GET", "/_goproxy/config", "")
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("期望 500，实际 %d：%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if strings.Contains(body, e.path) {
-		t.Errorf("500 响应泄露了文件路径：%s", body)
+	if strings.Contains(body, bad) {
+		t.Errorf("500 响应泄露了配置库路径：%s", body)
 	}
-	if strings.Contains(body, "no such file") || strings.Contains(body, "cannot find") {
+	if strings.Contains(body, "no such file") || strings.Contains(body, "cannot find") ||
+		strings.Contains(body, "unable to open") {
 		t.Errorf("500 响应泄露了系统错误原文：%s", body)
 	}
 	if !strings.Contains(body, "internal") {

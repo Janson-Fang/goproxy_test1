@@ -22,7 +22,12 @@ import (
 )
 
 type App struct {
-	cfgPath   string
+	// configDB 是配置数据库（SQLite）的路径。
+	//
+	// v0.9.0 起它是配置的唯一真相源。以前这里放的是 config.json 的路径，
+	// 进程每秒轮询它的 mtime 来发现「有人手工改了配置」—— 那条路随之下线：
+	// 配置只经管理接口修改，保存即生效（见 admin_api.go 的 mutate）。
+	configDB  string
 	transport *http.Transport
 	listeners *ListenerManager
 	metrics   *Metrics
@@ -33,8 +38,6 @@ type App struct {
 
 	mu        sync.Mutex
 	adminAddr string
-	lastMod   time.Time
-	lastSize  int64
 
 	// adminToken 管理接口令牌，用于 Authorization: Bearer。
 	// v0.6.0 起回环不再免认证，所以它不再是「只有外部访问才需要」的东西。
@@ -67,9 +70,8 @@ type App struct {
 	accessLog atomic.Bool
 }
 
-func NewApp(cfgPath string) (*App, error) {
-	st, err := os.Stat(cfgPath)
-	if err != nil {
+func NewApp(configDB string) (*App, error) {
+	if err := prepareConfigStore(configDB); err != nil {
 		return nil, err
 	}
 	// 先放一个空账号表而不是留 nil：nil 会让「还没 reload」这个很短的时间窗里
@@ -79,16 +81,62 @@ func NewApp(cfgPath string) (*App, error) {
 		return nil, err
 	}
 	return &App{
-		cfgPath:       cfgPath,
+		configDB:      configDB,
 		transport:     newTransport(),
 		listeners:     NewListenerManager(),
 		metrics:       NewMetrics(),
 		logs:          newLogBuffer(logRingSize),
 		sessions:      newSessionStore(),
 		adminAccounts: empty,
-		lastMod:       st.ModTime(),
-		lastSize:      st.Size(),
 	}, nil
+}
+
+// prepareConfigStore 打开配置数据库，并在库还是空的时候用旁边的 config.json
+// 初始化一次 —— 这是给「已经跑着 config.json 的老部署」准备的升级通道。
+//
+// 只导入一次：之后 config.json 不再被读取。如果每次都「库为空就导入」，
+// 那么用户哪天清空配置（删光所有路由）重启后，旧文件里的内容会突然复活，
+// 那比不导入更难排查。
+func prepareConfigStore(configDB string) error {
+	// 最常见的升级误操作：-c 还指在 config.json 上。
+	// 不拦的话会安静地在旁边建一个新的空库，而用户的配置还在原文件里没人读 ——
+	// 现象是「升级完配置全没了」，但文件明明还在。
+	if fi, err := os.Stat(configDB); err == nil && !fi.IsDir() && !isSQLiteFile(configDB) {
+		return fmt.Errorf(
+			"%s 不是 SQLite 数据库（看起来还是旧版的 JSON 配置文件）。\n"+
+				"    配置源已经换成 SQLite，请二选一：\n"+
+				"      1. 保留 -c 指向它，另外执行一次导入：goproxy -config-import %s -c goproxy.db\n"+
+				"      2. 直接把 -c 改成 goproxy.db，启动时会自动导入同目录下的 config.json（只导一次）\n"+
+				"    详见 README 的「从 v0.8.x 升级」",
+			configDB, configDB)
+	}
+
+	st, err := storeFor(configDB)
+	if err != nil {
+		return err
+	}
+	empty, err := st.isEmpty()
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return nil
+	}
+
+	seed := filepath.Join(filepath.Dir(configDB), "config.json")
+	if seed == configDB {
+		return nil // -c 指的就是那个 config.json，上面已经拦过了
+	}
+	imported, err := st.seedFromJSONFile(seed)
+	if err != nil {
+		return err
+	}
+	if imported {
+		slog.Info("已把旧的 config.json 导入配置数据库（只导入这一次）",
+			"file", seed, "db", configDB)
+		slog.Info("从现在起配置以数据库为准，config.json 不再被读取，可以留作备份或自行删除")
+	}
+	return nil
 }
 
 // warnIfNoAdminCredentials 在管理端口开着但没有任何凭据时给出明确指引。
@@ -115,34 +163,35 @@ func (a *App) warnIfNoAdminCredentials() {
 	slog.Warn("生成 password_hash 的命令", "cmd", "goproxy -hash-password <你的密码>")
 }
 
-// warnIfConfigUnwritable 启动时探一下配置目录能不能写。
+// warnIfConfigUnwritable 启动时探一下配置数据库所在目录能不能写。
 //
-// 管理接口改配置走的是原子写（写 config.json.tmp，再 rename 覆盖）。目录一旦
-// 不可写，增删改路由、POST /reload、PATCH /config 会全部失败 —— 而失败只在
-// 真正点下去那一刻才暴露，很容易被当成接口 bug 去查。
+// 为什么换成 SQLite 之后这件事**没有变简单、反而更要注意**：数据库写入时要在
+// 库文件旁边建 -wal / -shm（回滚时还有 -journal）这类临时文件，要求的是
+// 「整个目录可写」，而不只是「库文件本身可写」。目录不可写时读取一切正常、
+// 只有写入失败 —— 现象是「看得到、改不了」，很容易被当成接口 bug 去查。
 //
 // 实际踩过：systemd 的 ProtectSystem=strict 把 /etc 挂成只读，单元里
 // ReadWritePaths 又只放行了状态目录，于是「删除路由」报
 //
-//	open /etc/goproxy/config.json.tmp: read-only file system
+//	attempt to write a readonly database
 //
 // 只告警不退出：配置只读时纯转发仍然完全可用，不该因此起不来。
 func (a *App) warnIfConfigUnwritable() {
 	if err := a.configWriteProbe(); err != nil {
 		slog.Warn("配置目录不可写：管理接口的增删改路由会全部失败",
-			"dir", filepath.Dir(a.cfgPath),
+			"dir", filepath.Dir(a.configDB),
 			"err", err,
 			"hint", "systemd 需要把该目录加进 ProtectSystem=strict 的 ReadWritePaths，并让服务账号拥有它；"+
-				"Docker 要挂目录而不是单个文件（单文件挂载会让 rename 撞上 EBUSY）")
+				"Docker 要挂目录而不是单个文件（数据库要在旁边写 -wal / -shm，单文件挂载会让它们建不出来）")
 	}
 }
 
-// configWriteProbe 探一下能不能在配置目录里建文件，返回 nil 表示原子写没问题。
+// configWriteProbe 探一下能不能在配置目录里建文件，返回 nil 表示数据库还能写。
 //
 // 用 CreateTemp + 立即删除，而不是看权限位：ACL、只读挂载、SELinux
 // 都能让权限位显示「可写」而实际写不进去。真正建一个文件才算数。
 func (a *App) configWriteProbe() error {
-	f, err := os.CreateTemp(filepath.Dir(a.cfgPath), ".writable-probe-*")
+	f, err := os.CreateTemp(filepath.Dir(a.configDB), ".writable-probe-*")
 	if err != nil {
 		return err
 	}
@@ -158,7 +207,7 @@ func (a *App) reload() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	cfg, err := loadConfig(a.cfgPath)
+	cfg, err := loadConfig(a.configDB)
 	if err != nil {
 		return err
 	}
@@ -663,7 +712,7 @@ func serveAdminIndex(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	io.WriteString(w, "goproxy admin\n"+
 		"  管理控制台（浏览器打开）  "+uiPrefix+"\n"+
-		"  登录用 config.json 里 admin_users 配置的用户名 / 密码\n"+
+		"  登录用配置里 admin_users 的用户名 / 密码（或 admin_token）\n"+
 		"  以下接口全部需要凭据（会话 Cookie 或 Bearer 令牌），本机访问也不例外：\n"+
 		"  /healthz  /readyz  /metrics\n"+
 		"  /_goproxy/login           POST {username,password} 或 {token} 换取会话 Cookie\n"+
@@ -767,36 +816,20 @@ func (a *App) adminMux() *http.ServeMux {
 	return mux
 }
 
-// watchLoop 轮询配置文件 mtime，变了就热重载。
-// 用轮询而不是 fsnotify / SIGHUP，是为了让 demo 在 Linux 和 Windows 上行为一致。
-func (a *App) watchLoop(ctx context.Context) {
-	t := time.NewTicker(time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			st, err := os.Stat(a.cfgPath)
-			if err != nil {
-				continue
-			}
-			a.mu.Lock()
-			changed := st.ModTime().After(a.lastMod) || st.Size() != a.lastSize
-			if changed {
-				a.lastMod = st.ModTime()
-				a.lastSize = st.Size()
-			}
-			a.mu.Unlock()
-			if changed {
-				slog.Info("检测到配置变化，开始热重载")
-				if err := a.reload(); err != nil {
-					slog.Error("热重载失败", "err", err)
-				}
-			}
-		}
-	}
-}
+// 这里曾经有一个 watchLoop：每秒 stat 一次 config.json 的 mtime / size，
+// 变了就热重载，用来支持「手工编辑配置文件」。
+//
+// v0.9.0 换到 SQLite 之后它被**去掉**了，而不是换成「轮询数据库文件」。
+// 配置现在只经管理接口修改，而写接口保存成功后自己就会调 reload()，
+// 本来就不需要外部的变化检测。留一个轮询只会带来两个坏处：
+// 每次保存都要等下一次 tick 才发现变化（平白慢一秒），
+// 以及暗示「直接拿 sqlite3 改库」是支持的 —— 那条路会绕过校验、自锁检查和
+// 引用完整性，而这些检查恰恰是配置安全的地方。
+//
+// 需要批量或离线改配置时走命令行：
+//
+//	goproxy -config-export config.json   # 导出成人可读的 JSON，改完再导入
+//	goproxy -config-import config.json   # 导入（走完整校验，失败不动原配置）
 
 // statsLoop 定期把熔断器状态同步到指标。
 // 熔断状态是「当前值」而不是累加值，只能采样，不能靠请求触发。
@@ -899,7 +932,6 @@ func (a *App) Run(ctx context.Context) error {
 		}()
 	}
 
-	go a.watchLoop(ctx)
 	go a.statsLoop(ctx)
 	go a.sampleLoop(ctx)
 	go a.sessionSweepLoop(ctx)
@@ -917,6 +949,42 @@ func (a *App) Run(ctx context.Context) error {
 	return nil
 }
 
+// runConfigIO 处理 -config-import / -config-export。
+//
+// 导入和导出共用这一次「打开数据库」：两个子命令都要先有库。
+func runConfigIO(configDB, importPath, exportPath string) error {
+	st, err := storeFor(configDB)
+	if err != nil {
+		return err
+	}
+
+	if exportPath != "" {
+		raw, err := st.exportJSON()
+		if err != nil {
+			return err
+		}
+		// 0600：导出的 JSON 里有 admin_token 与密码哈希，不该让同机其它用户读到。
+		if err := os.WriteFile(exportPath, raw, 0o600); err != nil {
+			return fmt.Errorf("写出 %s 失败: %w", exportPath, err)
+		}
+		slog.Info("配置已导出", "file", exportPath, "bytes", len(raw))
+		return nil
+	}
+
+	raw, err := os.ReadFile(importPath)
+	if err != nil {
+		return fmt.Errorf("读取 %s 失败: %w", importPath, err)
+	}
+	rev, err := st.importJSON(raw)
+	if err != nil {
+		return err
+	}
+	slog.Info("配置已导入", "file", importPath, "revision", rev[:12])
+	slog.Info("若服务正在运行，需重启或调一次 POST /_goproxy/reload 才会生效" +
+		"（导入只写库，不碰进程里已经加载的路由表）")
+	return nil
+}
+
 // 编译时通过 -ldflags "-X main.version=... -X main.commit=..." 注入
 var (
 	version = "dev"
@@ -924,12 +992,16 @@ var (
 )
 
 func main() {
-	cfgPath := flag.String("c", "config.json", "配置文件路径")
+	configDB := flag.String("c", "goproxy.db", "配置数据库（SQLite）路径")
 	logLevel := flag.String("log-level", "info", "日志级别: debug|info|warn|error")
 	textLog := flag.Bool("text-log", false, "输出人类可读日志（默认 JSON）")
 	showVer := flag.Bool("version", false, "打印版本信息并退出")
 	hashPw := flag.String("hash-password", "",
-		"把给定密码算成 bcrypt 哈希并退出（用于填进 config.json 的 admin_users[].password_hash）")
+		"把给定密码算成 bcrypt 哈希并退出（用于填进控制台的 admin_users[].password_hash）")
+	importCfg := flag.String("config-import", "",
+		"把一份 JSON 配置导入数据库后退出，例如 -c goproxy.db -config-import config.json")
+	exportCfg := flag.String("config-export", "",
+		"把数据库里的配置导出成 JSON 后退出，例如 -c goproxy.db -config-export config.json")
 	flag.Parse()
 
 	if *showVer {
@@ -946,7 +1018,7 @@ func main() {
 		// 只往 stdout 打哈希本身，方便直接 $(...) 取用。
 		// 提示语走 stderr，免得被一起捕获进去。
 		fmt.Println(string(h))
-		fmt.Fprintln(os.Stderr, "把上面这行填进 config.json 的 admin_users[].password_hash")
+		fmt.Fprintln(os.Stderr, "把上面这行填进控制台的 admin_users[].password_hash（账号在控制台的「配置」页维护）")
 		return
 	}
 
@@ -970,7 +1042,19 @@ func main() {
 	}
 	slog.SetDefault(slog.New(h))
 
-	app, err := NewApp(*cfgPath)
+	// 导入 / 导出：干完就退出，不起服务。
+	//
+	// 这两个子命令替代的是以前「直接编辑 config.json，进程靠 mtime 轮询热重载」
+	// 那条路。导入走完整校验（含旧写法拦截与默认值补齐），失败时数据库一个字节不动。
+	if *importCfg != "" || *exportCfg != "" {
+		if err := runConfigIO(*configDB, *importCfg, *exportCfg); err != nil {
+			slog.Error("配置导入/导出失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	app, err := NewApp(*configDB)
 	if err != nil {
 		slog.Error("初始化失败", "err", err)
 		os.Exit(1)

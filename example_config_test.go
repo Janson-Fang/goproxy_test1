@@ -7,6 +7,25 @@ import (
 	"testing"
 )
 
+// loadExampleConfig 读并解析 config.example.json。
+//
+// 走 parseConfigJSON 而不是 loadConfig：示例文件是一份 JSON，不是配置数据库。
+// 配置源换成 SQLite 之后，这两件事必须分清楚 —— 把 JSON 文件喂给
+// loadConfig 会当成数据库去开，报的是「file is not a database」，
+// 与「示例配错了」完全不是一回事。
+func loadExampleConfig(t *testing.T) ([]byte, *Config) {
+	t.Helper()
+	raw, err := os.ReadFile("config.example.json")
+	if err != nil {
+		t.Fatalf("读取 config.example.json 失败: %v", err)
+	}
+	cfg, err := parseConfigJSON(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 解析失败: %v", err)
+	}
+	return raw, cfg
+}
+
 // config.example.json 必须始终可加载。
 //
 // 它是用户照着抄的模板，也是 CI 打包进 tar 和镜像的文件。如果它自己都过不了
@@ -15,10 +34,7 @@ import (
 //
 // 这个测试同时充当「新增配置字段时别忘了更新示例」的提醒。
 func TestConfigExampleLoads(t *testing.T) {
-	raw, cfg, err := parseConfigFile("config.example.json")
-	if err != nil {
-		t.Fatalf("config.example.json 解析失败: %v", err)
-	}
+	raw, cfg := loadExampleConfig(t)
 	cfg.applyTopDefaults()
 	cfg.applyRouteDefaults()
 
@@ -49,10 +65,7 @@ func TestConfigExampleLoads(t *testing.T) {
 // 示例里手动证书引用的路径必须是「相对 cert_dir 的相对路径」，
 // 不能是绝对路径 —— 绝对路径绑死在某一台机器上，别人抄过去必然报错。
 func TestConfigExampleUsesRelativeCertPaths(t *testing.T) {
-	_, cfg, err := parseConfigFile("config.example.json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, cfg := loadExampleConfig(t)
 	cfg.applyTopDefaults()
 	cfg.applyRouteDefaults()
 

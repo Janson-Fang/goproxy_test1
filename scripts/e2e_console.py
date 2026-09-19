@@ -16,8 +16,8 @@
 
     python scripts/e2e_console.py
 
-脚本会自己 go build 出两个临时二进制，并把 config.json 复制到临时目录再跑，
-所以不会污染工作区。需要 PATH 里有 go。
+脚本会自己 go build 出两个临时二进制，把仓库里的 config.json 复制到临时目录
+导入一份临时配置库再跑，所以不会污染工作区。需要 PATH 里有 go。
 
 自检需要**独占** config.json 里涉及的全部端口（含管理端口 9080）。若本机已经跑着
 一份实例，脚本会直接报错退出 —— 而不是连上那个实例、把它的响应当成自己的来断言。
@@ -243,7 +243,10 @@ def run_auth_section(tmp, bins):
     port_admin = 9081
     port_console = 9084  # 控制台经代理发布出来的端口，见下面 cfg["routes"]
     port_biz = 9082
+    # 第二个实例要**独立的库**：它和主实例不是同一份配置，也不该共享
+    # （同库双进程是 SQLite 单写者模型下最容易出问题的地方）。
     auth_cfg_path = os.path.join(tmp, "auth-config.json")
+    auth_db_path = os.path.join(tmp, "auth-config.db")
 
     # 用二进制自己算哈希，而不是在这里实现一遍 bcrypt ——
     # 那样测的就不是「服务端能不能校验它自己生成的哈希」了。
@@ -286,6 +289,16 @@ def run_auth_section(tmp, bins):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     del port_biz
 
+    # 这份 JSON 只是种子，跑起来的是独立那个库（见上面 auth_db_path 的说明）。
+    # 导入失败要当场报到，别让后面所有断言撞在 401 上还看不出原因。
+    imp = subprocess.run(
+        [bins["goproxy-test"], "-c", auth_db_path, "-config-import", auth_cfg_path],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if imp.returncode != 0:
+        check("认证实例的配置导入", False, (imp.stdout + imp.stderr)[:300])
+        return
+
     if port_in_use(port_admin):
         check("认证实例端口空闲", False, "%d 已被占用" % port_admin)
         return
@@ -294,7 +307,7 @@ def run_auth_section(tmp, bins):
         return
 
     proc = subprocess.Popen(
-        [bins["goproxy-test"], "-c", auth_cfg_path, "-text-log"],
+        [bins["goproxy-test"], "-c", auth_db_path, "-text-log"],
         cwd=ROOT,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -602,7 +615,22 @@ def run_auth_section(tmp, bins):
             pass
 
 
-def run_acl_section(cfg_path):
+def cli_config_io(bins, db_path, export_to=None, import_from=None):
+    """调命令行导出一份 / 导入一份配置，返回 CompletedProcess。
+
+    这是**不经过管理接口**改配置的唯一途径，也正是 SelfLockout 护栏给出的
+    退路（见 admin_api.go 的 escapeHint）。所以它值得被自检真的跑一遍：
+    那条提示要是失效了，用户就只能登机器改数据库了。
+    """
+    args = [bins["goproxy-test"], "-c", db_path]
+    if export_to:
+        args += ["-config-export", export_to]
+    else:
+        args += ["-config-import", import_from]
+    return subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
+
+
+def run_acl_section(db_path, bins, restart_proxy):
     """三层 IP 名单、命名地址列表库与命中测试的端到端验证。
 
     v0.7.0 把原来「mode 二选一」的路由级 ACL 换成了三份可以并存的名单：
@@ -623,7 +651,11 @@ def run_acl_section(cfg_path):
       · 落地类 —— 把名单配到真实配置里再从真实端口打过去，确认 403 真的发生。
     只做前者会漏掉「判定对了但请求管线没接上」；
     只做后者则只能看到 403，看不出是哪一层拦的。
+
+    最后一小节的「全局黑名单把管理端口也封掉」会在收尾时报两个额外的结论：
+    命令行导入这条路能用，以及「被自己关在门外」之后靠**重启**能恢复回来。
     """
+
     # 响应体是 bytes，而错误信息里是中文 —— Python 的 bytes 字面量只允许 ASCII，
     # 所以想断言中文文案时得自己 encode 一次。
     def inbody(text):
@@ -686,13 +718,13 @@ def run_acl_section(cfg_path):
 
     # ---- 自锁护栏 ----
     # 全局黑名单同样作用于管理端口，所以「覆盖自己来源」的一次保存会把控制台关在门外。
-    # 后端必须在写路径上拦住它，而且**磁盘不能被动过** ——
+    # 后端必须在写路径上拦住它，而且**库里的配置不能被动过** ——
     # 否则用户以为没保存成功，实际已经写进去了，下一个请求就进不来。
     st, h, b = post("/_goproxy/config", {"global_ip_deny": ["127.0.0.1"]}, method="PATCH")
     check("全局黑名单覆盖自己来源 -> 409 拒绝保存", st == 409, "实际 %s :: %s" % (st, b[:220]))
     check("  错误码是 self_lockout", b"self_lockout" in b, b[:220])
     st, _h, b = get("/_goproxy/config")
-    check("  被拒后磁盘配置未被改动",
+    check("  被拒后库里的配置未被改动",
           (json.loads(b).get("global_ip_deny") or []) == [],
           str(json.loads(b).get("global_ip_deny")))
 
@@ -715,7 +747,7 @@ def run_acl_section(cfg_path):
     check("回显三条", isinstance(gd, list) and len(gd) == 3, str(gd))
     check("  带备注的条目回写成对象", isinstance(gd[0], dict) and gd[0].get("note") == "e2e 全局封禁", str(gd[:1]))
     # 这条是刻意的取舍：没有备注就走字符串简写，否则一次控制台保存会把
-    # config.json 里每条规则都撑成 {"cidr": …}，配置文件不再是给人读的。
+    # 每条规则都撑成 {"cidr": …}，导出来的配置就不再是给人读的。
     check("  没备注的条目回写成字符串简写", gd[1] == "203.0.113.99", str(gd[1:2]))
 
     # ---- 命名地址列表库：新建 / 校验 / 改名 / 删除 ----
@@ -766,7 +798,7 @@ def run_acl_section(cfg_path):
     check("空的白名单 -> 400 拒绝", st == 400 and b"invalid_config" in b,
           "实际 %s :: %s" % (st, b[:250]))
     st, _h, b = get("/_goproxy/config")
-    check("  被拒后名单库里没有它（没落盘）",
+    check("  被拒后名单库里没有它（没落库）",
           "e2e 空白名单" not in {d["name"] for d in (json.loads(b).get("ip_lists") or [])},
           str(json.loads(b).get("ip_lists")))
 
@@ -975,23 +1007,41 @@ def run_acl_section(cfg_path):
     # ---- 全局黑名单真的作用于所有入口（含管理端口）----
     #
     # 这件事**没法通过 PATCH 验证** —— 上面刚确认过自锁护栏会拦下它。
-    # 唯一的途径是改配置文件（护栏刻意留的退路），靠热重载生效。
-    # 所以这里直接写盘：这是唯一能观察到「业务端口 403 + 管理端口 403」的办法。
-    original = open(cfg_path, encoding="utf-8").read()
-    before_gd = json.loads(original).get("global_ip_deny") or []
+    # 唯一的途径是命令行导入（护栏刻意留的退路）。
+    #
+    # v0.9.0 之前这里是「直接写盘，等 1 秒的 mtime 轮询捡起来」。配置源换成 SQLite
+    # 之后那条路不存在了：配置只认库，磁盘上那份 JSON 早已不再被读取。退路变成
+    #   -config-export 导出 → 改 → -config-import 导回 → 生效
+    # 这段就按这条退路完整走一遍，包括最后那一步**重启**。
+    #
+    # 顺序上有个关键细节：导入只写库，不碰进程里已经加载的路由表，所以紧接着那次
+    # reload 还进得来（此刻生效的还是**旧**配置，它允许 127.0.0.1）。一旦新配置
+    # 生效，管理端口也被封了 —— 再想靠 HTTP 恢复就没路了，只能重启进程。
+    # 这也正是恢复那一段必须用 restart_proxy 而不是再调一次 reload 的原因。
+    backup = os.path.join(os.path.dirname(db_path), "global-deny-backup.json")
+    hot = os.path.join(os.path.dirname(db_path), "global-deny-hot.json")
+
+    r = cli_config_io(bins, db_path, export_to=backup)
+    check("命令行导出配置 -> 成功", r.returncode == 0, (r.stdout + r.stderr)[:200])
+    before_gd = json.load(open(backup, encoding="utf-8")).get("global_ip_deny") or []
+
     try:
-        live = json.loads(original)
+        live = json.load(open(backup, encoding="utf-8"))
         live["global_ip_deny"] = ["127.0.0.1/32"]
-        tmpf = cfg_path + ".e2e-tmp"
-        with open(tmpf, "w", encoding="utf-8") as f:
+        with open(hot, "w", encoding="utf-8") as f:
             json.dump(live, f, ensure_ascii=False, indent=2)
-        os.replace(tmpf, cfg_path)
+
+        r = cli_config_io(bins, db_path, import_from=hot)
+        check("命令行导入「封掉本机」的配置 -> 成功", r.returncode == 0, (r.stdout + r.stderr)[:200])
+
+        # 导入只写库。让它生效要么重启，要么调一次 reload —— 这里走 reload，
+        # 顺带验证「导入之后不重启也能生效」这条（README 里就是这么写的）。
+        st, h, b = post("/_goproxy/reload", None)
+        check("导入后调 reload -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
 
         # 等**管理端口**自己被封。它同时是两个信号：
-        #   · 热重载真的把这版文件吃进去了（写盘 → 生效隔着一次 1s 的 mtime 轮询）
+        #   · 导入 + reload 这条路真的把新配置吃进去了
         #   · 全局黑名单确实作用于管理端口，而不只是业务端口
-        # 必须给足时间。第一版写成「写完立刻查一次」，窗口只有零点几秒，
-        # 永远看不到生效 —— 现象是「功能没做」，实际是测试没等。
         admin_body, st = None, None
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -1000,7 +1050,7 @@ def run_acl_section(cfg_path):
                 admin_body = b
                 break
             time.sleep(0.3)
-        check("全局黑名单经热重载生效：管理端口 403", admin_body is not None,
+        check("全局黑名单生效：管理端口 403", admin_body is not None,
               "等了 15s 管理端口仍是 %s" % st)
         if admin_body is not None:
             check("  管理端口的 403 带 acl_global_deny",
@@ -1014,11 +1064,18 @@ def run_acl_section(cfg_path):
         check("业务端口同样 403，且原因来自全局层",
               b"acl_global_deny" in body, body[:180])
     finally:
-        # 务必恢复：不恢复的话后面（以及人工接手时的）任何请求都进不来。
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(original)
+        # 恢复。**不能只 reload** —— 此刻生效的配置把 127.0.0.1 一起封了，
+        # 连 POST /_goproxy/reload 都进不来（下面第一次 get 就会是 403）。
+        # 先把备份导回库，再重启进程；重启读的正是刚导回去的那份。
+        #
+        # 这一整段就是「被自己关在门外」之后的操作手册，所以它必须真的能跑通 ——
+        # 不然我们给用户的那句提示只是一句没有验证过的话。
+        r = cli_config_io(bins, db_path, import_from=backup)
+        check("恢复：把备份配置导回库", r.returncode == 0, (r.stdout + r.stderr)[:200])
+        check("恢复：重启进程", restart_proxy(), "重启后管理端口没起来")
 
-    # 恢复同样要等热重载生效 —— 管理端口回到 200 才算真的恢复。
+    # 重启之后管理端口要能正常应答 —— 「被自己封住 → 导回 + 重启」这条退路的
+    # 可验证形式。
     st, b = None, b""
     end = time.time() + 15
     while time.time() < end:
@@ -1026,12 +1083,13 @@ def run_acl_section(cfg_path):
         if st == 200:
             break
         time.sleep(0.4)
-    check("清掉全局黑名单后管理端口恢复（热重载）", st == 200, "等了 15s 仍是 %s" % st)
+    check("重启后管理端口恢复 200", st == 200, "等了 15s 仍是 %s" % st)
     gd = (json.loads(b).get("global_ip_deny") or []) if st == 200 else None
-    check("  恢复后的名单回到写盘前那一份（没被临时规则污染）",
+    check("  恢复后的名单回到导入前那一份（没被临时规则污染）",
           gd == before_gd, "%s != %s" % (gd, before_gd))
 
     # 清干净：把全局黑名单显式清空，验证「传空数组 = 清空」这条语义。
+    # （这一步在重启之后做，走的是普通管理接口 —— 进程已经恢复成允许本机了。）
     st, h, b = post("/_goproxy/config", {"global_ip_deny": []}, method="PATCH")
     check("清空全局黑名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
     st, _h, b = get("/_goproxy/config")
@@ -1066,36 +1124,52 @@ def main():
         print("== 编译测试二进制 ==")
         bins = build_binaries(tmp)
 
-        # config.json 会被 CRUD 测试改写（写接口落盘时会重新格式化），
-        # 所以复制一份到临时目录里跑，别把仓库里的演示配置改脏。
-        cfg = os.path.join(tmp, "config.json")
-        shutil.copyfile(os.path.join(ROOT, "config.json"), cfg)
-        # 第 8 节会把 cfg 重新绑定成「解析出来的配置 dict」，而第 11 节需要的是路径
-        # （它要直接写盘来验证全局黑名单对管理端口生效，那条路没法走 PATCH）。
-        # 在这里先留一份，别指望几十行之后还分得清 cfg 是哪一层的。
-        cfg_path = cfg
+        # v0.9.0 起配置的真源是 SQLite 数据库，config.json 只是**种子**：
+        # 库为空时导入一次，之后它就不再被读取。
+        #
+        # 所以这里不再把 config.json 当配置跑，而是复制一份到临时目录、
+        # 显式导入到临时库里。自检里的 CRUD 改的是那个库，仓库里的
+        # 演示配置照样不会被改脏 —— 和以前的目标一样，换了个落点。
+        #
+        # 走显式的 -config-import 而不是靠启动时的自动导入：导入失败时
+        # 要能在这里把报错打出来，而不是等到「管理端口没起来」再回头猜。
+        seed_path = os.path.join(tmp, "config.json")
+        shutil.copyfile(os.path.join(ROOT, "config.json"), seed_path)
+        db_path = os.path.join(tmp, "goproxy.db")
 
-        # 管理地址以临时配置为准，别写死 9080。
+        # 管理地址以种子配置为准，别写死 9080。
         global ADMIN, AUTH_HEADERS
-        cfg_data = json.load(open(cfg, encoding="utf-8"))
+        cfg_data = json.load(open(seed_path, encoding="utf-8"))
         admin_addr = cfg_data.get("admin_addr") or "127.0.0.1:9080"
         ADMIN = "http://" + admin_addr
         admin_port = int(admin_addr.rsplit(":", 1)[1])
 
-        # v0.6.0 起管理接口一律要凭据（回环也不例外），所以必须往这份临时配置里
-        # 塞一个 admin_token，否则后面的每个断言都会撞在 401 上。
+        # v0.6.0 起管理接口一律要凭据（回环也不例外），所以种子配置里必须带一个
+        # admin_token，否则后面的每个断言都会撞在 401 上。
         #
         # 为什么用 admin_token 而不是 admin_users：这些用例是「脚本访问」，
         # 走 Bearer 最直接，不用维持一个 CookieJar。登录本身由第 10 节专门测。
+        #
+        # 注意这一步必须在**导入之前**做：导入之后磁盘上那份 JSON 就再也
+        # 不被读取了，改它只是改了个没人看的文件。
         cfg_data["admin_token"] = E2E_ADMIN_TOKEN
-        with open(cfg, "w", encoding="utf-8") as f:
+        with open(seed_path, "w", encoding="utf-8") as f:
             json.dump(cfg_data, f, ensure_ascii=False, indent=2)
+
+        seed = subprocess.run(
+            [bins["goproxy-test"], "-c", db_path, "-config-import", seed_path],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if seed.returncode != 0:
+            print("导入种子配置失败：\n%s\n%s" % (seed.stdout[-2000:], seed.stderr[-2000:]))
+            return 1
         AUTH_HEADERS = {"Authorization": "Bearer " + E2E_ADMIN_TOKEN}
 
         # 端口预检。这一步不能省：如果 9080 上已经跑着一个实例（本机开发时很常见），
         # 自检自己起的那份会因端口被占而退出，而 wait_port 却立刻成功，
-        # 于是所有断言都打在**别人那个进程**上 —— 全绿，但什么也没验证到，
-        # 还会把仓库里的 config.json 改脏（CRUD 落盘的正是那个实例的配置）。
+        # 于是所有断言都打在**别人那个进程**上 —— 全绿，但什么也没验证到。
+        # （以前这一条还会把仓库里的 config.json 改脏；现在配置落在临时库里，
+        #   但「测的必须是自己的进程」这个理由没有任何变化。）
         busy = [p for p in required_ports(cfg_data, admin_port) if port_in_use(p)]
         if busy:
             print("以下端口已被占用: %s" % ", ".join(str(p) for p in busy))
@@ -1114,13 +1188,36 @@ def main():
                 return 1
 
         print("== 启动 goproxy ==")
-        proxy = spawn([bins["goproxy-test"], "-c", cfg, "-text-log"])
+        proxy = spawn([bins["goproxy-test"], "-c", db_path, "-text-log"])
         if not wait_port(admin_port, proc=proxy):
             print(
                 "管理端口 %d 没起来（进程存活=%s，退出码=%s）"
                 % (admin_port, proxy.poll() is None, proxy.returncode)
             )
             return 1
+
+        def restart_proxy():
+            """重启反代进程，返回 True 表示新进程的管理端口起来了。
+
+            只有一处需要它：第 11 节刻意把管理端口自己也封掉，而那时进程里
+            生效的配置会拒绝**所有**来源 —— 连 POST /_goproxy/reload 都进不去。
+            「改库 + 重启」正是给那个护栏留的退路，所以这里得能真的走一遍，
+            否则第 11 节的结论就只停在纸面上。
+            """
+            nonlocal proxy
+            proxy.terminate()
+            try:
+                proxy.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proxy.kill()
+                try:
+                    proxy.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proxy in procs:
+                procs.remove(proxy)
+            proxy = spawn([bins["goproxy-test"], "-c", db_path, "-text-log"])
+            return wait_port(admin_port, 20, proc=proxy)
 
         # 配置里写着要监听的端口必须真的起来，少了就是监听失败。
         for port in config_listen_ports(cfg_data):
@@ -1427,9 +1524,9 @@ def main():
         print("\n== 10. 认证与会话 ==")
         run_auth_section(tmp, bins)
 
-        # 放在最后：这一节会（刻意地）把管理端口也一起封掉，再恢复回来。
-        # 后面若还有用例，就会撞在「刚被自己封掉的管理接口」上。
-        run_acl_section(cfg_path)
+        # 放在最后：这一节会（刻意地）把管理端口也一起封掉，再靠「导回配置 +
+        # 重启进程」恢复。后面若还有用例，就会撞在「刚被自己封掉的管理接口」上。
+        run_acl_section(db_path, bins, restart_proxy)
 
     finally:
         for p in procs:

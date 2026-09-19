@@ -190,7 +190,7 @@ func TestUIStaticShellIsOpenButAPIsStayGuarded(t *testing.T) {
 // 一份凭据都没配时，管理接口对所有来源都返回 403 + 专门的错误码。
 //
 // 这个错误码必须和「密码错了」的 401 区分开：前端拿到 403 才知道要提示
-// 「去 config.json 配一个账号」，而不是让运维反复怀疑自己密码打错了。
+// 「去配一个管理员账号」，而不是让运维反复怀疑自己密码打错了。
 // 旧版本这里叫 admin_token_not_set，v0.6.0 起令牌不再是唯一凭据，故改名。
 func TestNoCredentialsConfiguredRejectsEverySource(t *testing.T) {
 	env := newTestEnv(t, "", "")

@@ -68,7 +68,7 @@ func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
 		Now:         formatLogTime(time.Now()),
 		StartedAt:   formatLogTime(a.metrics.StartedAt()),
 		UptimeSecs:  a.metrics.UptimeSeconds(),
-		ConfigPath:  a.cfgPath,
+		ConfigPath:  a.configDB,
 		Ports:       a.listeners.Ports(),
 		ReloadTotal: a.metrics.ReloadTotal(),
 		Summary:     a.metrics.Global(),
@@ -82,9 +82,9 @@ func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// 配置文件的统计读不到就留空，不要因此让整个状态接口失败 ——
+	// 配置的统计读不到就留空，不要因此让整个状态接口失败 ——
 	// 恰恰是配置出问题的时候最需要看到运行状态。
-	if raw, cfg, err := readConfigFile(a.cfgPath); err == nil {
+	if raw, cfg, err := readConfigFile(a.configDB); err == nil {
 		resp.ConfigRevision = revisionOf(raw)
 		resp.RoutesConfigured = len(cfg.Routes)
 	} else {

@@ -86,19 +86,12 @@ func writeSelfSigned(t *testing.T, dir, base string, hosts ...string) (certPath,
 	return certPath, keyPath
 }
 
-// writeConfig 把配置写到临时文件并加载（走真实的 parse + 默认值 + 校验流程）。
+// writeConfig 把配置写进一个临时数据库并加载（走真实的落库 + 默认值 + 校验流程）。
 func writeConfig(t *testing.T, cfg *Config) (*Config, string) {
 	t.Helper()
 
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	b, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		t.Fatalf("序列化配置失败: %v", err)
-	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		t.Fatalf("写配置失败: %v", err)
-	}
+	path := tempConfigDB(t)
+	seedConfig(t, path, cfg)
 	loaded, err := loadConfig(path)
 	if err != nil {
 		t.Fatalf("加载配置失败: %v", err)
@@ -177,22 +170,25 @@ func TestTLSModeWithoutGlobalSwitchIsRejected(t *testing.T) {
 }
 
 // writeConfigErr 是 writeConfig 的「期望失败」版本。
+//
+// 它不能像 writeConfig 那样用 t.Fatalf 收尾 —— 调用方要的正是「这一步会失败」。
+// 所以这里直接走「序列化 → 解析 → 补默认值 → 校验」，与 loadConfig 是同一套校验，
+// 只是不经过数据库：这些用例想验的是「配置本身非法」，而非法配置根本走不到落库那一步。
 func writeConfigErr(cfg *Config) (*Config, error) {
-	dir, err := os.MkdirTemp("", "goproxy-cfg")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(dir)
-
-	path := filepath.Join(dir, "config.json")
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
+	parsed, err := parseConfigJSON(b)
+	if err != nil {
 		return nil, err
 	}
-	return loadConfig(path)
+	parsed.applyTopDefaults()
+	parsed.applyRouteDefaults()
+	if err := parsed.validate(); err != nil {
+		return nil, err
+	}
+	return parsed, nil
 }
 
 // ACME 拿不到裸 IP 和通配域名的证书，这两种必须在写配置时就拦住。
@@ -333,11 +329,12 @@ func TestManualCertRelativePath(t *testing.T) {
 	}
 }
 
-// cert_dir 留空时，相对配置文件所在目录解析。
+// cert_dir 留空时，相对配置所在目录解析（换成 SQLite 之前是「配置文件所在目录」，
+// 基准物从 config.json 变成了 goproxy.db，规则本身没变）。
 func TestManualCertRelativeToConfigDir(t *testing.T) {
-	// 证书必须和配置文件放在同一个目录，才能验证「相对配置文件解析」
+	// 证书必须和配置库放在同一个目录，才能验证「相对配置库解析」
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.json")
+	dbPath := filepath.Join(dir, "goproxy.db")
 	writeSelfSigned(t, dir, "rel", "rel.example.com")
 
 	cfg := &Config{
@@ -347,14 +344,8 @@ func TestManualCertRelativeToConfigDir(t *testing.T) {
 				TLSMode: TLSModeManual, CertFile: "rel.crt", KeyFile: "rel.key"},
 		},
 	}
-	b, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cfgPath, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := loadConfig(cfgPath)
+	seedConfig(t, dbPath, cfg)
+	loaded, err := loadConfig(dbPath)
 	if err != nil {
 		t.Fatalf("加载配置失败: %v", err)
 	}

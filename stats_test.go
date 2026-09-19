@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -55,10 +54,8 @@ func newStatsEnv(t *testing.T) (*testEnv, []int) {
   ]
 }`, p[0], p[2], testToken, p[1], backend.URL)
 
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
-		t.Fatalf("写测试配置失败: %v", err)
-	}
+	path := filepath.Join(t.TempDir(), "goproxy.db")
+	seedRawConfig(t, path, []byte(cfg))
 	a, err := NewApp(path)
 	if err != nil {
 		t.Fatalf("NewApp 失败: %v", err)

@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -156,9 +155,10 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 			sleepConstant(start)
 			writeJSON(w, http.StatusForbidden, map[string]string{
 				"error": "admin_credentials_not_set",
-				"message": "服务端还没有配置任何管理凭据。请在 config.json 里设置 " +
-					"admin_users（用户名 + bcrypt 密码哈希，推荐）或 admin_token，" +
-					"保存后会自动热重载。",
+				"message": "服务端还没有配置任何管理凭据。请配置 " +
+					"admin_users（用户名 + bcrypt 密码哈希，推荐）或 admin_token。" +
+					"配置源是 SQLite 数据库，用命令行导入：goproxy -config-export 导出一份、" +
+					"填好凭据后再 -config-import 导回并重启。",
 			})
 			return
 		}
@@ -411,7 +411,8 @@ func (a *App) adminGuard(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusForbidden, map[string]string{
 				"error": "admin_credentials_not_set",
 				"message": "该请求需要认证，但配置里既没有 admin_users 也没有 admin_token，已拒绝。" +
-					"请在 config.json 里配置后重载（admin_users 用 bcrypt 的 password_hash，推荐）。",
+					"请用命令行导入一份带凭据的配置：goproxy -config-export 导出、" +
+					"填好 admin_users（用 bcrypt 的 password_hash，推荐）再 -config-import 导回并重启。",
 			})
 			return
 		}
@@ -510,15 +511,26 @@ func (a *App) consoleClientIPs(r *http.Request) []string {
 	return out
 }
 
+// escapeHint 是「护栏挡住了你，但这条配置确实要这么写」时给出的退路。
+//
+// v0.9.0 之前这里写的是「改配置文件后重启」—— 那时配置就是一份 config.json，
+// 手工编辑它是真实可走的一条路。现在配置的真源是 SQLite 库，没有可编辑的
+// 文本文件了，准确的退路是命令行导出 / 导入：导出一份 JSON、改完导回去、
+// 重启生效。**不只是文字问题**：让人去找一个不存在的文件夹，等于没给退路。
+//
+// 前端（global_ip_deny 的护栏提示）用的是同一句话，改动时要一起改。
+const escapeHint = "如果确实要这么配：用 goproxy -config-export 导出一份 JSON、" +
+	"改完之后再用 goproxy -config-import 导回并重启进程 —— 那条路不受此检查限制。"
+
 // guardSelfLockout 检查新配置会不会把「正在改配置的这个人」挡在外面。
 //
 // 为什么需要它：管理端口也在全局黑名单的管辖范围内（这是明确的设计选择，
 // 见 config.go 的 GlobalIPDeny 注释），而控制台正是改配置的地方。于是在控制台
 // 上加一条写错的网段，就能在点下保存的瞬间让自己失去控制台 —— 只能登机器
-// 改文件重启。这个组合必须有人兜住。
+// 改配置。这个组合必须有人兜住。
 //
 // 这是**护栏，不是权限**：它挡的是无心之失，不是禁止这么配。真要封掉自己
-// 所在的网段，改配置文件后重启即可 —— 那条路永远留着，也不该被这里限制。
+// 所在的网段，走命令行导入即可 —— 那条路永远留着，也不该被这里限制。
 //
 // 只检查全局黑名单，不检查路由级名单：路由名单的锁定范围限于那条路由所挂的
 // 端口，界面上 target 和端口都摆在同一屏，属于「看得见」的风险；而全局名单
@@ -541,8 +553,8 @@ func (a *App) guardSelfLockout(r *http.Request, next *Config) error {
 		return &apiError{http.StatusConflict, "self_lockout", fmt.Sprintf(
 			"这条规则会把你关在门外，已拒绝保存：新的 global_ip_deny 命中 %s（来自规则 %s%s），"+
 				"而它同样作用于管理端口 —— 保存生效之后，你现在用的这个控制台就打不开了。\n\n"+
-				"如果确实要封这个网段：改配置文件后重启进程即可，那条路不受此检查限制。",
-			ip, m.Rule, noteSuffix(m.Note))}
+				"%s",
+			ip, m.Rule, noteSuffix(m.Note), escapeHint)}
 	}
 	return nil
 }
@@ -628,8 +640,9 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // mutate 执行「读配置 → 改 → 校验 → 原子写回 → 热重载」，全程串行。
 //
-// 事务的源永远是磁盘上的文件，而不是内存里的路由表 ——
-// 这样即使用户手工编辑过 config.json，界面的一次保存也不会把它悄悄覆盖掉。
+// 事务的源永远是**库里的当前内容**，而不是内存里的路由表 ——
+// 这样即使有人绕过控制台直接改过库（命令行导入），界面的一次保存也是基于
+// 那份最新内容做的增量修改，而不是把它悄悄覆盖掉。
 //
 // ifMatch 非空时要求与当前 revision 一致，用来挡住两个页签互相覆盖（lost update）。
 // 返回写回后的 revision 与最终生效的配置。
@@ -640,7 +653,7 @@ func (a *App) mutate(r *http.Request, ifMatch string, fn func(cfg *Config) error
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 
-	raw, cfg, err := parseConfigFile(a.cfgPath)
+	raw, cfg, err := parseConfigFile(a.configDB)
 	if err != nil {
 		return "", nil, err
 	}
@@ -673,22 +686,17 @@ func (a *App) mutate(r *http.Request, ifMatch string, fn func(cfg *Config) error
 		}
 	}
 
-	_, newRev, err := saveConfig(a.cfgPath, cfg)
+	_, newRev, err := saveConfig(a.configDB, cfg)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// 把 watcher 的基线推到新文件上，免得 watchLoop 再触发一次重复重载
-	if st, serr := os.Stat(a.cfgPath); serr == nil {
-		a.mu.Lock()
-		a.lastMod, a.lastSize = st.ModTime(), st.Size()
-		a.mu.Unlock()
-	}
-
 	if err := a.reload(); err != nil {
-		// 已经落盘了才发现在运行时加载不了 —— 立刻回滚，别留下一个坏配置
-		if werr := os.WriteFile(a.cfgPath, raw, 0o644); werr != nil {
-			return "", nil, fmt.Errorf("新配置无法生效（%v），且回滚文件失败：%w", err, werr)
+		// 已经写库了才发现在运行时加载不了 —— 立刻回滚，别留下一个坏配置。
+		// 回滚写的是保存前那份内容（raw），而不是「撤销刚才那次写入」：
+		// 按内容回滚是幂等的，也不必依赖「期间没有别的写入」这个假设。
+		if werr := restoreConfig(a.configDB, raw); werr != nil {
+			return "", nil, fmt.Errorf("新配置无法生效（%v），且回滚失败：%w", err, werr)
 		}
 		if rerr := a.reload(); rerr != nil {
 			return "", nil, fmt.Errorf("新配置无法生效（%v），回滚后旧配置也加载不了：%v", err, rerr)
@@ -749,7 +757,7 @@ func (a *App) routeViews(routes []RouteConfig) []routeView {
 // ---------- 路由 CRUD ----------
 
 func (a *App) handleListRoutes(w http.ResponseWriter, r *http.Request) {
-	raw, cfg, err := readConfigFile(a.cfgPath)
+	raw, cfg, err := readConfigFile(a.configDB)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -760,7 +768,7 @@ func (a *App) handleListRoutes(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleGetRoute(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_, cfg, err := readConfigFile(a.cfgPath)
+	_, cfg, err := readConfigFile(a.configDB)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -964,7 +972,7 @@ func (a *App) handleACLTest(w http.ResponseWriter, r *http.Request) {
 
 	// 名单读的是**磁盘上的配置**，不是内存里已生效的路由表。
 	// 命中测试要回答的是「保存之后会怎样」，所以必须和写路径看同一份源。
-	_, cfg, err := readConfigFile(a.cfgPath)
+	_, cfg, err := readConfigFile(a.configDB)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1045,7 +1053,7 @@ type configView struct {
 }
 
 func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	raw, cfg, err := readConfigFile(a.cfgPath)
+	raw, cfg, err := readConfigFile(a.configDB)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1115,7 +1123,7 @@ func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	if _, ok := keys["admin_addr"]; ok {
 		writeErr(w, badRequest("admin_addr_immutable",
 			"admin_addr 属于启动期配置：监听套接字在进程启动时就绑定了，运行期改它不生效，"+
-				"还可能把自己关在门外。请改配置文件后重启进程。"))
+				"还可能把自己关在门外。"+escapeHint))
 		return
 	}
 	if _, ok := keys["routes"]; ok {

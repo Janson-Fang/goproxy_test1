@@ -10,19 +10,29 @@ services:
     volumes:
       # 配置要挂「目录」，不能挂单个文件。
       #
-      # 单文件挂载（- ./config.json:/etc/goproxy/config.json）会让这个文件在容器里
-      # 变成一个挂载点，而配置的原子写最后一步正是 rename 覆盖它 —— Linux 内核在
-      # vfs_rename 里禁止 rename 到挂载点，直接返回 EBUSY。所以光把 :ro 改成 :rw
-      # 是没用的，只会把 read-only file system 换成 device or resource busy。
+      # v0.9.0 起配置的真源是目录里的 goproxy.db（SQLite），而不是 config.json。
+      # 挂单个文件有两个问题，两个都是硬故障：
+      #   · 数据库写入时必须在库文件**旁边**建 -wal / -shm。单文件挂载时
+      #     那些兄弟文件落在容器的临时层里，容器一重建就丢，库可能处于
+      #     不完整的状态；挂目录才能让它们跟库在一起。
+      #   · 单文件挂载会让那个文件在容器里成为一个挂载点，而旧版本（v0.8.x）
+      #     的配置写回最后一步是 rename 覆盖它 —— Linux 内核在 vfs_rename 里
+      #     禁止 rename 到挂载点，直接返回 EBUSY。所以光把 :ro 改成 :rw 是
+      #     没用的，只会把 read-only file system 换成 device or resource busy。
       #
-      # 宿主机目录的属主要给容器里的 uid 10001（goproxy），否则一样写不进去：
+      # 这个目录里放什么：
+      #   goproxy.db   配置数据库，第一次启动时自动创建（由下面的 config.json 导入）
+      #   config.json  只在**第一次**启动时被导入一次，之后不再被读取。
+      #                想改配置用控制台，或者 config-export / config-import。
+      #
+      # 宿主机目录的属主要给容器里的 uid 10001（goproxy），否则写不进去：
       #   mkdir -p config && cp config.json config/ && sudo chown -R 10001:10001 config
       - ./config:/etc/goproxy:rw
 
       # 证书与 ACME 缓存必须持久化。默认 tls.cert_dir / tls.acme.cache_dir 是
-      # 相对路径（相对配置文件所在目录，即 /etc/goproxy/），所以这里把整个
-      # /etc/goproxy/data 挂出来最省事。也可以把配置里的路径改成绝对路径
-      # /var/lib/goproxy 再挂那个目录。
+      # 相对路径（相对**配置库**所在目录，即 /etc/goproxy/，和以前相对配置文件
+      # 所在目录是同一个地方），所以这里把整个 /etc/goproxy/data 挂出来最省事。
+      # 也可以把配置里的路径改成绝对路径 /var/lib/goproxy 再挂那个目录。
       #
       # 为什么必须持久化：Let's Encrypt 对「同一域名重复签发」有每周限额，
       # 冷启动反复申请会直接被限流，把站点证书搞成长期不可用。
@@ -49,7 +59,7 @@ services:
       #
       # 令牌从环境变量读，不写死在这里 —— compose 文件经常进版本库，
       # 把令牌明文提交进去等于把它公开了。启动前先 export：
-      #   export GPROXY_ADMIN_TOKEN='...'    # 与 config.json 里的 admin_token 一致
+      #   export GPROXY_ADMIN_TOKEN='...'    # 与配置里的 admin_token 一致
       #
       # 注意 $$ 是 compose 的转义：它会把 $$ 还原成 $，交给容器内的 sh 展开。
       # 写单个 $ 的话 compose 会在宿主机上就把它展开掉，容器里拿到的是空值。

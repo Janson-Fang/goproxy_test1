@@ -7,3 +7,9 @@ data/
 __pycache__/
 *.pyc
 .release-notes.tmp
+
+# 配置数据库（v0.9.0 起配置的真源）。本地跑起来就会生成，
+# 里面带着 admin_token 与密码哈希，绝对不要提交。
+goproxy.db
+goproxy.db-wal
+goproxy.db-shm

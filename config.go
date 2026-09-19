@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,7 +69,8 @@ type Config struct {
 	//
 	// 注意它**作用于管理端口**。因此在控制台里保存一条会挡住自己的规则是
 	// 危险的，写接口会先做一次自检并拒绝（见 admin_api.go 的 guardSelfLockout）。
-	// 万一从别的途径写死了，仍然可以手工改配置文件后重启恢复。
+	// 万一从别的途径写死了，仍然可以在本机用 goproxy -config-export 导出配置、
+	// 改完再 -config-import 导回并重启来恢复。
 	GlobalIPDeny []IPRule `json:"global_ip_deny,omitempty"`
 
 	// IPLists 是可复用的命名地址列表库。
@@ -97,12 +96,15 @@ type Config struct {
 
 	Routes []RouteConfig `json:"routes"`
 
-	// cfgPath 是配置文件的路径，不序列化。
+	// baseDir 是配置数据库所在的目录，不序列化。
 	//
 	// 存它是为了解析证书文件里的相对路径：进程的工作目录取决于怎么启动的
 	// （systemd 是 /、docker 是 /、手动是当前目录），拿它当基准太不稳，
-	// 相对配置文件所在目录才符合直觉。
-	cfgPath string `json:"-"`
+	// 相对配置库所在目录才符合直觉。
+	//
+	// 换成 SQLite 之前这里存的是「配置文件路径」，取它的 Dir 当基准 ——
+	// 规则没变，只是基准物从 config.json 变成了 goproxy.db。
+	baseDir string `json:"-"`
 }
 
 type RouteConfig struct {
@@ -174,8 +176,12 @@ const (
 //
 //	"ip_lists": [
 //	  {"name": "办公网", "kind": "allow", "rules": ["10.0.0.0/8", {"cidr": "10.1.2.3", "note": "临时接入"}]},
-//	  {"name": "爬虫",   "kind": "deny",  "rules": ["203.0.113.66 扫目录"]}
+//	  {"name": "爬虫",   "kind": "deny",  "rules": [{"cidr": "203.0.113.66", "note": "扫目录"}]}
 //	]
+//
+// 注意 rules 里的字符串简写**只放地址本身**，备注要写就得用对象形式：
+// 简写是整串当 CIDR 解析的，"203.0.113.66 扫目录" 会被当成一个非法地址
+// （解析报错，而不是「把后半截当备注」）。
 //
 // Name 既是显示名也是引用键（路由的 acl.lists 里写的就是它）。用名字当键
 // 而不是引入一套 id：配置文件是给人读的，"lists": ["办公网"] 比 "lists": ["l-3f2a"]
@@ -222,15 +228,19 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, err
 }
 
-// readConfigFile 读文件并返回「可运行的」配置（默认值已补齐）。
-// raw 是文件原始字节，用于算 revision，或在写坏时原样回滚。
+// readConfigFile 读出「可运行的」配置（默认值已补齐），并同时返回它的
+// 规范化 JSON 字节 —— ETag 就是这份字节的哈希。
+//
+// 名字里的 File 是历史遗留：v0.9.0 起配置源是 SQLite，path 指的是数据库
+// 文件。保留函数名与签名是为了让下游（reload、管理接口、各测试）一行不用改，
+// 换的只是最底下那一层。
 func readConfigFile(path string) (raw []byte, cfg *Config, err error) {
 	raw, cfg, err = parseConfigFile(path)
 	if err != nil {
 		return nil, nil, err
 	}
 	// 两份默认值都要补：漏掉 applyRouteDefaults 的话，
-	// 配置文件里少写 path_prefix 的路由会直接加载失败。
+	// 配置里少写 path_prefix 的路由会直接加载失败。
 	cfg.applyTopDefaults()
 	cfg.applyRouteDefaults()
 	if err := cfg.validate(); err != nil {
@@ -239,24 +249,43 @@ func readConfigFile(path string) (raw []byte, cfg *Config, err error) {
 	return raw, cfg, nil
 }
 
-// parseConfigFile 只做「读 + 反序列化」，一个默认值都不补。
-// 管理接口的写路径靠它知道「文件里究竟写了什么」。
+// parseConfigFile 读出配置，但**不补默认值、不做校验**。
+// 管理接口的写路径靠它拿到「库里的原始内容」，改完之后自己补默认值再校验。
+//
+// 返回的 raw 是从表里组装出来的规范化 JSON，不是磁盘上的原始字节 ——
+// 这反而是个改进：同一个语义的配置无论经过几次读写，算出的 revision 都一样。
 func parseConfigFile(path string) (raw []byte, cfg *Config, err error) {
-	raw, err = os.ReadFile(path)
+	st, err := storeFor(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取配置文件失败: %w", err)
+		return nil, nil, err
 	}
-	cfg = &Config{}
+	raw, cfg, err = st.read()
+	if err != nil {
+		if errors.Is(err, ErrNoConfig) {
+			return nil, nil, fmt.Errorf(
+				"配置数据库 %s 里还没有任何配置。首次使用请导入一份配置："+
+					"goproxy -config-import <config.json>，或把 config.json 放在它旁边后重启"+
+					"（只在库为空时导入一次）", path)
+		}
+		return nil, nil, err
+	}
+	return raw, cfg, nil
+}
+
+// parseConfigJSON 从 JSON 字节解析配置：反序列化 + 旧写法拦截，不碰存储。
+//
+// 导入路径（首次种子、命令行 -config-import）和控制台示例配置的测试都走它 ——
+// 这些场景手里就是一份 JSON，不该被拖去开数据库。
+func parseConfigJSON(raw []byte) (*Config, error) {
+	cfg := &Config{}
 	if err := json.Unmarshal(raw, cfg); err != nil {
-		return nil, nil, fmt.Errorf("解析配置文件失败: %w", err)
+		return nil, fmt.Errorf("解析配置 JSON 失败: %w", err)
 	}
 	// 旧写法必须在这里就拦住，不能等到用了才发现在静默失效。
 	if err := rejectLegacyACL(raw); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	// 证书相对路径的解析基准。反序列化完成后再设，避免被 JSON 里的同名字段覆盖。
-	cfg.cfgPath = path
-	return raw, cfg, nil
+	return cfg, nil
 }
 
 // rejectLegacyACL 拦住两种已经不再支持的旧 acl 写法，并给出迁移映射：
@@ -794,59 +823,26 @@ func (c *Config) allListenPorts() []int {
 
 func (r RouteConfig) enabled() bool { return r.Enabled == nil || *r.Enabled }
 
-// ---------- 配置文件写入 ----------
+// ---------- 配置写入 ----------
 
-// revisionOf 用文件字节的 sha256 作为配置版本号，供 ETag / If-Match 做乐观并发。
+// revisionOf 用配置字节的 sha256 作为配置版本号，供 ETag / If-Match 做乐观并发。
 // 用它而不是 mtime：mtime 精度可能只有秒，同一秒内两次修改会撞车。
 func revisionOf(raw []byte) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
 
-// saveConfig 原子写回配置文件：
+// saveConfig 把整份配置写进数据库，返回写入后的规范化字节与版本号。
 //
-//  1. 把现有内容备份到 <path>.bak
-//  2. 写同目录临时文件并 fsync（保证内容真的落盘）
-//  3. rename 覆盖 —— POSIX 上原子；Windows 上 Go 走 MoveFileEx 也是替换语义
+// v0.9.0 起这件事是**一个事务**：以前「备份到 .bak → 写 .tmp → fsync →
+// rename 覆盖」是靠这段代码手工拼出来的原子性，现在由数据库保证，
+// 顺带把「历史版本」从一份 .bak 变成了可回溯的若干份。
 //
-// 直接截断重写是不可接受的：写到一半断电就会留下一个解析不了的配置，
-// 而进程重启后读的就是这个文件。
+// 签名与返回值保持原样：调用方（mutate）拿 raw 做回滚、拿 rev 回给客户端。
 func saveConfig(path string, cfg *Config) (raw []byte, rev string, err error) {
-	b, err := json.MarshalIndent(cfg, "", "  ")
+	st, err := storeFor(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("序列化配置失败: %w", err)
+		return nil, "", err
 	}
-	b = append(b, '\n')
-
-	// 备份失败不阻断主流程，但一定要留痕
-	if old, rerr := os.ReadFile(path); rerr == nil && len(old) > 0 {
-		if werr := os.WriteFile(path+".bak", old, 0o644); werr != nil {
-			slog.Warn("配置备份写入失败", "path", path+".bak", "err", werr)
-		}
-	}
-
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, "", fmt.Errorf("创建临时配置文件失败: %w", err)
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return nil, "", fmt.Errorf("写临时配置文件失败: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return nil, "", fmt.Errorf("临时配置文件 fsync 失败: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return nil, "", fmt.Errorf("关闭临时配置文件失败: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return nil, "", fmt.Errorf("替换配置文件失败: %w", err)
-	}
-	return b, revisionOf(b), nil
+	return st.write(cfg)
 }

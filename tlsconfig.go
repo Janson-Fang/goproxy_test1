@@ -309,9 +309,9 @@ func (c *Config) resolveCertPath(p string) string {
 	}
 	dir := strings.TrimSpace(c.TLS.CertDir)
 	if dir == "" {
-		// 没配 cert_dir 时相对配置文件所在目录解析 —— 进程的工作目录
+		// 没配 cert_dir 时相对配置库所在目录解析 —— 进程的工作目录
 		// 取决于怎么启动的（systemd / docker / 手动），拿它当基准太不稳。
-		dir = filepath.Dir(c.cfgPath)
+		dir = c.baseDir
 		if dir == "" {
 			dir = "."
 		}

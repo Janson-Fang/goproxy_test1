@@ -3,13 +3,14 @@
 用 Go 写的 L7 HTTP 反向代理，核心验证 **「同一 IP 不同端口 → 不同后端」**，以及按域名 / 路径分流。
 
 已完成：转发、多端口分流、热重载、限流、熔断、访问控制（三层 IP 名单 / Basic / JWT）、TLS / ACME 自动证书、
-多用户登录与会话保护、管理写接口、监控数据源、网页版管理控制台。
-**故意不做**：SQLite（配置仍是 JSON 文件）、泛域名自动证书、mTLS。
+多用户登录与会话保护、管理写接口、监控数据源、网页版管理控制台，以及**配置存进 SQLite**（v0.9.0 起）。
+**故意不做**：泛域名自动证书、mTLS。
 
-> **破坏性变更速查** —— 用旧写法的配置**进程会拒绝启动**并打印迁移映射，迁移步骤见文末[升级](#升级三版都是破坏性变更)：
+> **破坏性变更速查** —— 用旧写法的配置**进程会拒绝启动**并打印迁移映射，迁移步骤见文末[升级](#升级四版都是破坏性变更)：
 >
 > | 版本 | 变更 |
 > |---|---|
+> | **v0.9.0** | 配置源从 `config.json` 换成 SQLite；旧文件只在**首次启动时导入一次**，之后不再被读取 |
 > | **v0.8.0** | IP 名单不再内联写在路由里，改成顶层 `ip_lists` 集中定义、路由按名字引用 |
 > | **v0.7.0** | 路由名单从 `acl.mode` 二选一改成可并存的 `allow` / `deny`，并新增全入口 `global_ip_deny` |
 > | **v0.6.0** | 控制台改为用户名 + 密码登录；本机不再免认证；三个探针也要凭据 |
@@ -28,18 +29,22 @@ go run ./backend -port 9003 -name 服务C &
 go run ./backend -port 9004 -name 服务D &
 
 # 2. 给控制台设一个管理员账号，把输出的哈希填进 config.json 的 admin_users
+#    （config.json 只在**首次启动**时被导入一次，之后配置以数据库为准）
 ./goproxy -hash-password '你的密码'
 
-# 3. 启动反代
-go run . -c config.json -text-log
+# 3. 启动反代（首次启动会建 goproxy.db 并把同目录的 config.json 导进去）
+go run . -c goproxy.db -text-log
 ```
 
-看到这两行就说明起来了（`ports` 里没有 9001–9004 —— 那是后端，不是监听端口）：
+看到这三行就说明起来了（`ports` 里没有 9001–9004 —— 那是后端，不是监听端口）：
 
 ```
+INFO 已把旧的 config.json 导入配置数据库（只导入这一次） file=config.json db=goproxy.db
 INFO 配置已生效 routes=5 ports=[8000 8081 8082 8083] admin=127.0.0.1:9080
 INFO 管理端口已启动 addr=127.0.0.1:9080
 ```
+
+第一行只在**第一次**出现 —— 之后配置以 `goproxy.db` 为准，`config.json` 不再被读取（详细见[配置存在哪儿](#配置存在哪儿sqlitev090-起)）。
 
 浏览器打开 **<http://127.0.0.1:9080/>** 就是控制台（会先跳登录页）。
 **没配任何凭据时**看到的是一张「还没有配置管理员账号」的指引页（含可直接照抄的命令），见[管理端认证](#管理端认证)。
@@ -79,7 +84,8 @@ curl -s http://127.0.0.1:8084/                       # 连接被拒绝（端口�
 
 ## 热重载：改配置不重启
 
-改 `config.json` 里任意一条路由（比如加一个 `listen_port: 8085`）保存，一秒内日志会出现：
+改配置的唯一入口是**管理接口**（控制台里保存，或 curl 打 `POST` / `PATCH` / `DELETE /_goproxy/*`）。
+保存成功后进程在同一个请求里完成热重载，日志会出现：
 
 ```
 INFO 检测到配置变化，开始热重载
@@ -87,9 +93,76 @@ INFO 开始监听 port=8085
 INFO 配置已生效 routes=6 ports=[8000 8081 8082 8083 8085]
 ```
 
-新端口立刻可用，**已有连接不受影响**；删除端口同理。手动触发：`curl -X POST http://127.0.0.1:9080/_goproxy/reload`。
+新端口立刻可用，**已有连接不受影响**；删除端口同理。手动重读一遍库：`curl -X POST http://127.0.0.1:9080/_goproxy/reload`。
+
+> v0.8.0 及更早版本会**每秒轮询 `config.json` 的 mtime**，直接改文件也能触发重载。
+> 配置搬进 SQLite 之后**这条路径没有了**：配置不再是一份「谁都能随手编辑的文本文件」，
+> 绕开校验、自锁检查和引用完整性去改配置本身就是不安全的。
+> 批量 / 离线改配置请走 `-config-export` → 改 → `-config-import`，导入后重启进程或调一次 `POST /_goproxy/reload`。
 
 > 热重载时**限流器 / 熔断器实例会被复用**（配置没变的话）—— 否则改一次配置计数就清零，等于开了个绕过的口子。
+
+---
+
+## 配置存在哪儿（SQLite，v0.9.0 起）
+
+配置不再是一份 `config.json`，而是一个 SQLite 数据库（路径由 `-c` 指定，默认 `goproxy.db`）。
+
+| | |
+|---|---|
+| **为什么换** | 旧实现里「先备份 → 写临时文件 → `rename`」这套原子性是代码手工拼出来的；「这份名单还被哪几条路由引用」是每次现扫内存算的（`listUsage`）；改名改写引用要靠调用方声明（`ip_list_renames`）。换成数据库之后这三件事分别由**事务**、**外键**、`ON UPDATE CASCADE` 承担 —— 「忘了写就出错」的逻辑写进约束里就不会忘 |
+| **谁在读** | 进程启动、热重载。**读成一份不可变快照常驻内存**，请求路径上完全不碰数据库 |
+| **谁在写** | 只有管理接口（控制台 / curl），写完全是事务性的 |
+| **不再支持的路径** | 文件轮询（已删）；直接拿 `sqlite3` 改库 —— 那条路会绕过校验、自锁检查和引用完整性，而这几样恰恰是配置安全的地方。要批量改就用下面两个命令行开关 |
+| **表结构** | `settings`（顶层标量）、`default_ports`、`trusted_proxies`、`global_ip_deny`、`admin_users`、`ip_lists` + `ip_list_rules`、`routes`、`route_acl_lists`（路由 → 名单引用）、`tls_settings`、`acme_hosts`、`config_history`。限流 / 熔断 / 认证这三段叶子配置仍然是整块 JSON 列 —— 它们要么整块配、要么整块不配，从来不会被单独查询或按字段过滤 |
+| **引用完整性** | `route_acl_lists.list_name` 上两条约束：`ON DELETE RESTRICT`（**还被引用的名单删不掉**，对应原来的 `listUsage` 扫描 + `409 list_in_use`）和 `ON UPDATE CASCADE`（**改名自动改写所有引用**，对应原来的 `renameListRefs`） |
+| **历史版本** | 每次写入前把上一版存进 `config_history` 表，**保留最近 20 版**并按 revision 去重。替代了原来的 `config.json.bak`（只留一版 = 改错两次就回不去了） |
+| **schema 版本** | `meta.schema_version`。用新二进制打开旧库会**明确报错**，而不是等某条 `SELECT` 报 `no such column` 才被发现 |
+| **并发** | 连接数固定为 1（SQLite 单写者，写入频率是「人手点一次保存」级别），DSN 上带 WAL + `busy_timeout(5000)` + `foreign_keys(1)` |
+
+对外一个字节都没变：`Config` 结构、HTTP 接口的 JSON 形状、`ETag` / `If-Match` 语义全部保持原样，前端不需要知道底下换了存储。
+
+### 批量 / 离线改配置：`-config-export` / `-config-import`
+
+日常改动走控制台就够了。这两个命令存在的理由是**自锁逃生**：万一 `global_ip_deny` 配错把自己关在门外，控制台就进不去了。
+
+```bash
+goproxy -c goproxy.db -config-export config.json   # 导出成人可读的 JSON
+# ……改这份 JSON……
+goproxy -c goproxy.db -config-import config.json   # 导回（走完整校验，失败一个字节都不动）
+curl -X POST http://127.0.0.1:9080/_goproxy/reload # 让运行中的进程重新读库（或重启进程）
+```
+
+导入走的**是和管理接口完全相同的校验**（`manual` 证书的相对路径以数据库所在目录为基准解析）——
+它不是一个「绕过校验的后门」，只是一个「不需要先进控制台」的入口。
+
+### 备份
+
+```bash
+# 要么直接拷库（连同 -wal / -shm 一起，或者干脆先停进程再拷）
+cp goproxy.db goproxy.db-wal goproxy.db-shm /backup/
+
+# 要么导一份 JSON（人可读、可 diff、能进版本控制）
+goproxy -c goproxy.db -config-export "/backup/goproxy-$(date +%F).json"
+```
+
+> 想「回滚到上一版」不用翻备份：库里 `config_history` 就留着最近 20 版，可以 `-config-export` 之后对着 diff 手工改回去。
+
+### 首次导入：`config.json` 只在第一次被读
+
+`-c` 指向一个**空库**（或还不存在的库）时，进程会尝试导入**同目录下的 `config.json`**，**只导一次**。
+
+- **为什么只导一次**：如果每次都「库为空就导入」，那你哪天删光所有路由、重启，旧文件里的内容会**突然复活** —— 那比不导入更难排查。
+- `-c` 还指着 `config.json`（旧 JSON 文件）会**直接报错**并给出两条出路，而不是安静地在旁边建个空库让你以为「升级完配置全没了」：
+
+```
+config.json 不是 SQLite 数据库（看起来还是旧版的 JSON 配置文件）。
+    配置源已经换成 SQLite，请二选一：
+      1. 保留 -c 指向它，另外执行一次导入：goproxy -config-import config.json -c goproxy.db
+      2. 直接把 -c 改成 goproxy.db，启动时会自动导入同目录下的 config.json（只导一次）
+```
+
+升级的完整步骤见文末[升级](#升级四版都是破坏性变更)。
 
 ---
 
@@ -118,7 +191,7 @@ open http://127.0.0.1:9080/          # 等价于 /_goproxy/ui/；admin_addr 默�
 
 > 名单为什么单独占一个页签：三层名单共用同一条判定链，集中在一页维护、路由只勾引用，
 > 「路由」页那一列则回答「这条路由到底受哪些名单管」—— 恰好是排查时要看的两个方向。
-> 两边写的是同一个 `config.json`，跨页保存会撞上 revision 校验（见[并发安全](#并发安全etag--if-match)），控制台会重读最新配置。
+> 两边写的是同一份配置（同一个库），跨页保存会撞上 revision 校验（见[并发安全](#并发安全etag--if-match)），控制台会重读最新配置。
 
 > 在 v0.6.0 及更早版本上经代理访问会**卡在「正在检查管理接口…」**（CSRF 比错了 host），v0.6.1 已修。
 > 临时绕过：把 `admin_addr` 改成 `0.0.0.0:9080` 直接开控制台端口。
@@ -282,16 +355,18 @@ curl -s -H "$T" -X POST $A/_goproxy/routes -H "If-Match: $ETAG" \
 # 若期间已有别人改过配置 → 409 revision_mismatch
 ```
 
-不传 `If-Match` 就退化成「后写覆盖」（单向覆盖，仍是原子的，不会写出半个文件）。
+不传 `If-Match` 就退化成「后写覆盖」（单向覆盖，仍是原子的，不会写进半份配置）。
 
 ### 写接口的几个行为约定
 
-- **磁盘上的 `config.json` 是唯一真源**：每次写都是「读文件 → 改 → 校验 → 原子写回 → 热重载」，
-  手工编辑过的配置不会被界面的一次保存悄悄覆盖。
-- **校验不过就不落盘**（非法 `target`、端口冲突这类一律 400，文件一个字节都不会动），**热重载失败会自动回滚**。
-- **写回是原子的**：先写 `<path>.tmp` 并 `fsync`，再 `rename` 覆盖，旧内容备份到 `<path>.bak`。
+- **库里的当前配置是唯一真源**：每次写都是「读当前配置 → 改 → 校验 → 在一个事务里整份替换 → 热重载」，
+  要么整份新配置落库、要么一个字段都不变，不存在「写了一半」的中间态。
+- **校验不过就不落库**（非法 `target`、端口冲突这类一律 400，数据库一个字节都不会动），**热重载失败会自动回滚**。
+- **每次写入前留一版**：上一版配置进 `config_history` 表（保留最近 20 版，按 revision 去重），
+  比原来只留一份 `config.json.bak` 多一层余量 —— 改错了能往前翻好几步。
 - **不写「默认值」**：配置里没写 `admin_addr` 时，写回也不会替你填上 —— 否则一次保存就会把原本关闭的管理端口打开。
-- **`admin_addr` 不能通过接口改**（启动期就绑定了套接字），显式返回 400 而不是假装成功；改它请编辑文件后重启。
+- **`admin_addr` 不能通过接口改**（启动期就绑定了套接字），显式返回 400 而不是假装成功；
+  改它请走 `-config-export` / `-config-import` 那条路再重启进程。
   写 `off` / `none` / `disabled` 可彻底关闭管理端口；留空表示用默认值。
 - **`admin_users` 读得到、写也写得进，但回显里没有密码材料**：只返回用户名列表，`password_hash` 从不回传。
   PATCH 提交它是**整表替换**，记得把哈希一起带上。
@@ -467,7 +542,7 @@ for i in $(seq 1 6); do curl -s --noproxy '*' -o /dev/null -w "%{http_code} " ht
   ②③ 是路由级的，只在那条路由上生效；① 是不分路由的。
 - **同一层多份列表取并集**：「只允许办公网 + 只允许内网跳板」就是引用两份 allow 列表，各自维护、互不干扰。
 
-#### 配置文件里长什么样
+#### 配置里长什么样
 
 ```json
 {
@@ -503,7 +578,7 @@ for i in $(seq 1 6); do curl -s --noproxy '*' -o /dev/null -w "%{http_code} " ht
 
 单个 IP 不写 CIDR 会自动按 /32 处理（IPv6 按 /128）。`note` 只用于展示与排查：它会出现在访问日志的拦截原因和
 **命中测试**结果里，回答「这个地址当初到底是为什么被封的」。没有备注的条目**会回写成字符串简写** ——
-否则一次控制台保存就会把 `config.json` 里每条规则都撑成 `{"cidr": …}`，配置文件不再是给人读的。
+否则一次控制台保存就会把每条规则都撑成 `{"cidr": …}`，导出来的配置就不再是给人读的。
 
 空白名单里有一条要小心：
 
@@ -569,7 +644,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:9080/_goproxy/acl/test?
 **「整层没命中」时 `list` 也为空**（那一层可能有好几份名单，点其中一份的名会冤枉它）——
 这时候该看 `detail`，它会列出这一层引用了哪几份名单、共几条规则。
 
-它读的是**磁盘上的 `config.json`**，也就是「保存之后会怎样」—— 改完配置先存，再来这里验证。
+它读的是**库里的当前配置**，也就是「保存之后会怎样」—— 改完先保存，再来这里验证。
 控制台的「IP 名单」页有同一个工具。
 
 #### 全局黑名单也管管理端口（以及自锁护栏）
@@ -580,16 +655,20 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:9080/_goproxy/acl/test?
 ```
 HTTP/1.1 409 Conflict
 {"error":"self_lockout","message":"这条规则会把你关在门外，已拒绝保存：新的 global_ip_deny 命中 10.0.0.5
-（来自规则 10.0.0.0/8（办公网）），而它同样作用于管理端口 …… 如果确实要封这个网段：改配置文件后重启进程即可。"}
+（来自规则 10.0.0.0/8（办公网）），而它同样作用于管理端口 —— 保存生效之后，你现在用的这个控制台就打不开了。
+
+如果确实要这么配：用 goproxy -config-export 导出一份 JSON、改完之后再用 goproxy -config-import
+导回并重启进程 —— 那条路不受此检查限制。"}
 ```
 
-拒绝时**磁盘上的配置不会被改动**，控制台也**不会**把页面重载回磁盘状态 —— 否则你刚敲进去的那条规则会被擦掉，
+拒绝时**库里的配置不会被改动**，控制台也**不会**把页面重载回当前状态 —— 否则你刚敲进去的那条规则会被擦掉，
 而那正是最需要它的时候。它只是把错误提示挂在旁边，编辑内容原样留着。
 
 > 只有**全局黑名单**有这个护栏，路由级名单没有：路由名单的锁定范围限于那条路由所挂的端口，界面上端口和目标就在同一屏，
 > 属于「看得见」的风险；全局名单会静默作用于所有入口，那才是容易误判的。
 
-万一真的需要封自己的网段，走配置文件那条路（改完靠热重载或重启生效，不受此检查限制）—— 动手之前先想好怎么进去。
+万一真的需要封自己的网段，走 `-config-export` / `-config-import` 那条路（不受此检查限制，导回后重启进程生效）
+—— 动手之前先想好怎么进去。
 `/healthz`、`/metrics` 这些探针也在这份名单的管辖范围内，别指望它们还能当后门。
 
 #### 拦截原因拆成了三个
@@ -657,7 +736,7 @@ TLS 由顶层 `tls.enabled` 控制，每条路由用 `tls_mode` 决定自己的�
   "tls": {
     "enabled": true,          // 全局开关，关掉则所有路由都退回明文
     "https_port": 443,        // HTTPS 监听端口（HTTP 用下面 acme 的 http_port）
-    "cert_dir": "data/certs", // 相对路径 → 相对配置文件所在目录
+    "cert_dir": "data/certs", // 相对路径 → 相对配置库所在目录
     "acme": { "email": "you@example.com",
               "staging": false,    // true = 用 Let's Encrypt 测试环境，不占正式额度
               "directory_url": "" } // 留空按 staging 自动选；也可指向自建 ACME（如 step-ca）
@@ -732,8 +811,11 @@ curl -s -H "$T" http://127.0.0.1:9080/_goproxy/certs | jq .
 
 `install.sh` 会：给 systemd 单元加 `AmbientCapabilities=CAP_NET_BIND_SERVICE`（**非 root 也能绑 80/443**）；
 把配置目录加进 `ReadWritePaths` **并且** `chown` 给服务账号（两件都得做 —— `ReadWritePaths` 只改挂载属性、
-不改 Unix 权限，否则管理接口原子写 `config.json.tmp` 时会报 `read-only file system`）；
+不改 Unix 权限，否则管理接口写配置库时会报 `attempt to write a readonly database`）；
 把 `$CONFIG_DIR/data` 软链到 `/var/lib/goproxy/certs`（证书是状态不是配置，混在配置目录里，备份配置会连私钥一起带走）。
+
+> 换成 SQLite 之后这一条**更要留意**：写入时要在库文件旁边建 `goproxy.db-wal` / `goproxy.db-shm`，
+> 所以需要可写的是**目录本身**（不只是库文件），`chown` 也要覆盖这两个临时文件 —— `install.sh` 已经把它们一起纳进去了。
 
 ---
 
@@ -744,13 +826,12 @@ curl -s -H "$T" http://127.0.0.1:9080/_goproxy/certs | jq .
 | 泛域名（`*.example.com`）自动证书 | 需要 DNS-01 验证。要泛域名就用 `manual` 挂通配证书 |
 | 客户端证书（mTLS） | 没做。需要双向认证的话建议在上一层网关终结 |
 | 访问日志落盘 | 只往标准输出写，没有内置文件轮转。需要留存就接 journal 或外部 logrotate |
-| SQLite | M1 正式版。现在用 JSON 文件，`loadConfig` 换掉即可，下游不动 |
-| 路由变更审计 | 写接口目前不记录「谁在什么时候改了哪条路由」。多人共用管理端时会需要 |
+| 路由变更审计 | 写接口目前不记录「谁在什么时候改了哪条路由」。多人共用管理端时会需要。`config_history` 只留内容、不留操作者 |
 | 多实例共享状态 | 限流和熔断都是进程内内存，多副本各算各的；**写配置也是单机行为**，两个实例各写各的会互相覆盖。多副本需换成共享存储 + 一致性协议 |
 | 会话持久化 | 会话存在进程内存里，**重启即全部失效**。单机自托管可接受（换来的是不引入存储依赖） |
 | 权限分级 | 有多个账号了，但**账号之间没有权限差别** —— 任一账号登录后都是全权 |
-| 改密码要手工 | 没有「修改密码」界面。靠 `goproxy -hash-password` 生成哈希再改 `config.json`（保存即生效） |
-| 账号数量无上限但也没约束 | `admin_users` 是配置文件里的明文结构，适合 1~5 个运维账号，不是给终端用户用的用户体系 |
+| 改密码要手工 | 没有「修改密码」界面。靠 `goproxy -hash-password` 生成哈希，再用 `-config-export` / `-config-import` 换掉 `admin_users` 里的哈希（导回后重启生效） |
+| 账号数量无上限但也没约束 | `admin_users` 是配置库里的明文结构，适合 1~5 个运维账号，不是给终端用户用的用户体系 |
 | CSP 的 `style-src` 内联 | 保留 `'unsafe-inline'`，因为 React 的 `style={{...}}` 产出内联样式属性。去掉需要把动态样式全改成 CSS 变量，收益不抵成本 |
 
 ---
@@ -823,7 +904,8 @@ sudo systemctl enable --now goproxy && sudo journalctl -u goproxy -f
 > 用 jsdelivr 取脚本而不是 `raw.githubusercontent.com`，因为后者在国内经常连不上。
 
 脚本做的事：自动识别 amd64/arm64 → 校验 sha256（对不上直接中止）→ 装到 `/usr/local/bin` →
-**已存在的 `config.json` 不会被覆盖** → 创建 `goproxy` 系统用户并以非 root 运行 → **交互式引导你设置一个管理员账号**。
+**已存在的配置库不会被覆盖**（`config.json` 只在库为空时作为种子被导入一次）→ 创建 `goproxy` 系统用户并以非 root 运行 →
+**交互式引导你设置一个管理员账号**。
 
 设置账号那一步：**密码不回显、要输两次**；**哈希由二进制自己算**（调 `goproxy -hash-password`，
 不在脚本里重新实现一遍 bcrypt —— 服务端用什么校验这里就生成什么，不可能出现「算出来的哈希验不过」这种极难排查的故障）；
@@ -833,11 +915,16 @@ sudo systemctl enable --now goproxy && sudo journalctl -u goproxy -f
 
 ```
   二进制    /usr/local/bin/goproxy
-  配置文件  /etc/goproxy/config.json
+  配置库    /etc/goproxy/goproxy.db
   控制台    http://127.0.0.1:9080/_goproxy/ui/
 
 控制台登录：用刚才设置的用户名 + 密码。
 ```
+
+> 库为空时脚本会把 `$CONFIG_DIR/config.json`（老部署沿用旧的、全新安装铺一份示例）**导入一次**，
+> 导入交给 `goproxy -config-import` 走完整校验 —— 失败就中止，**库不会被改坏**。
+> 导入完成后那份 `config.json` 只是种子，**以后不再被读取**，可以留作备份或自行删掉。
+> 全新安装另外会放一份 `config.json.example` 方便对照新增字段。
 
 起来之后浏览器打开 **`http://<服务器IP>:9080/`** 就是控制台（要先登录）。默认 `admin_addr` 是 `127.0.0.1:9080`
 只有本机能连；要开放到局域网 / 公网就改它，并**建议同时配一个 `admin_token`** 给探针用 —— 探针不方便走账号登录。
@@ -893,9 +980,13 @@ curl -fsSL .../install.sh | sudo MIRROR=https://gh-proxy.com/ bash   # 指定镜
 |---|---|
 | `$BIN_DIR/goproxy` | **就地替换**：先写成 `goproxy.new` 再 `mv` 覆盖（rename 原子），不会出现「路径短暂不存在」的窗口；服务正在运行也没问题 —— 运行中的进程继续持有旧 inode，不会 `Text file busy` |
 | `$BIN_DIR/goproxy.old` | 升级前的二进制自动留一份，出问题能一键回滚 |
-| `config.json` | **不动**。新版本的示例另存为 `config.json.example`，方便对照新增字段 |
+| `goproxy.db`（配置库） | **已存在就完全不动** —— 库才是配置的真源，升级绝不覆盖它 |
+| `config.json` | **只在库为空时**（首次从旧版本升上来）被导入一次，之后不再被读取。新版本的示例另存为 `config.json.example`，方便对照新增字段 |
 | systemd 单元 | **先备份再重写**（`.bak`），因为 `ExecStart` 里带着本次的 `BIN_DIR` / `CONFIG_DIR`；你手动加过的 `Environment=` 之类会从 `.bak` 里找回来 |
 | 服务 | **原来在跑就自动重启**，并轮询确认真的起来了；原来没跑就保持不启动 |
+
+> 从 **v0.8.x 及更早版本**升上来时，脚本会先导一次 `config.json` 再起服务，导入失败就中止（库不动、错在哪一行直接打在终端上）。
+> 升级路径与破坏性变更见文末[升级](#升级四版都是破坏性变更)。
 
 > 最容易踩的一条：**光替换文件不重启，进程还在跑旧代码**，看着升级成功了其实没生效。不想让它动服务就加 `--no-restart`。
 
@@ -923,16 +1014,22 @@ tag 之后又有提交是 `v0.4.0-9-gef38364`（距该 tag 9 个提交）；有�
 ## 命令行
 
 ```bash
-goproxy [-c 配置文件] [-log-level 级别] [-text-log] [-version] [-hash-password 密码]
+goproxy [-c 配置库] [-log-level 级别] [-text-log] [-version] [-hash-password 密码]
+        [-config-import JSON] [-config-export JSON]
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `-c <路径>` | `config.json` | 配置文件路径（**是 `-c`，不是 `-config`**） |
+| `-c <路径>` | `goproxy.db` | **配置数据库**（SQLite）路径（**是 `-c`，不是 `-config`**） |
 | `-log-level <级别>` | `info` | `debug` / `info` / `warn` / `error` |
 | `-text-log` | 关 | 输出人类可读的文本日志。默认是 JSON，方便接日志系统 |
 | `-version` | — | 打印版本与 commit 后退出 |
-| `-hash-password <密码>` | — | 把密码算成 bcrypt 哈希后退出，用于填进 `config.json` |
+| `-hash-password <密码>` | — | 把密码算成 bcrypt 哈希后退出，用于填进 `admin_users[].password_hash` |
+| `-config-import <JSON>` | — | 把一份 JSON 配置导入数据库后退出（走完整校验，失败不动原库） |
+| `-config-export <JSON>` | — | 把数据库里的配置导出成 JSON 后退出（人可读，适合 diff / 备份） |
+
+> 后两个子命令**都需要同时给 `-c`**，例如 `goproxy -c goproxy.db -config-export config.json`。
+> 它们的作用和用法见[配置存在哪儿](#配置存在哪儿sqlitev090-起)。
 
 **`goproxy -hash-password` 是设置 / 修改管理密码的唯一入口**（stdout 只有哈希本身，提示语走 stderr，
 所以可以直接 `$(...)` 取用）：
@@ -942,7 +1039,7 @@ goproxy -hash-password '你的新密码'      # → $2a$10$...
 ```
 
 ```jsonc
-// 把输出填进这里，保存后自动热重载（不用重启）
+// 把输出填进 admin_users，再 -config-import 导回并重启
 { "admin_users": [{ "username": "admin", "password_hash": "$2a$10$..." }] }
 ```
 
@@ -950,8 +1047,8 @@ goproxy -hash-password '你的新密码'      # → $2a$10$...
 > 症状都是「登录永远失败」而没有任何报错。用这个命令拿到的哈希，和服务端校验用的是同一个库、同一份实现。
 > `install.sh` 走的也是这条路。
 
-也可以直接在 `config.json` 里写明文 `"password": "..."`（和路由的 Basic 认证一致），
-启动时会打一条 WARN 并把算好的哈希打印出来。
+也可以直接写明文 `"password": "..."`（和路由的 Basic 认证一致），
+启动时会打一条 WARN 并把算好的哈希打印出来 —— 明文会留在配置里，生产环境别这么干。
 
 ---
 
@@ -982,7 +1079,7 @@ After=network.target
 [Service]
 User=goproxy                 # 降权运行，得给服务账号配置目录的写权限（见下面 ReadWritePaths）
 Group=goproxy
-ExecStart=/opt/goproxy/goproxy -c /opt/goproxy/config.json
+ExecStart=/opt/goproxy/goproxy -c /opt/goproxy/goproxy.db
 WorkingDirectory=/opt/goproxy
 Restart=always
 RestartSec=3
@@ -992,26 +1089,33 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 
-# 这个目录必须同时可读**可写**：管理接口改配置走原子写（写 config.json.tmp 再 rename 覆盖）。
-# 只读的话「删除路由」会报 read-only file system，而且只在真正操作时才暴露。
+# 这个目录必须同时可读**可写**：管理接口写配置库时会在库文件旁边建 -wal / -shm
+# （回滚时还有 -journal），写不进去就报 "attempt to write a readonly database"。
+# 只读的话「删除路由」这类操作会失败，而且只在真正操作时才暴露。
 # 把配置放 /etc/goproxy 时同理 —— 要一起放行，并且把属主给服务账号：
-# ReadWritePaths 只解除只读挂载，不改 Unix 权限，目录还是 root:root 0755 的话服务照样建不出 .tmp。
+# ReadWritePaths 只解除只读挂载，不改 Unix 权限，目录还是 root:root 0755 的话服务照样写不进。
 ReadWritePaths=/opt/goproxy
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-> **管理接口报 `read-only file system` 或 `permission denied`？** 都是上面这条没配对，跟接口本身无关。
+> **管理接口报 `attempt to write a readonly database` 或 `permission denied`？** 都是上面这条没配对，跟接口本身无关
+> （`read-only file system` 也可能是同一处，只是内核对只读挂载和权限不足的措辞不同）。
 > `install.sh` 装的话重跑一次即可；手写单元的补两件事：`ReadWritePaths` 加上配置目录，并 `chown <服务账号> <配置目录>`。
 
 Docker：
 
 ```bash
-# 配置要挂「目录」不能挂单个文件：单文件在容器里是个挂载点，而原子写的最后一步是 rename 覆盖它 ——
-# 内核禁止 rename 到挂载点（EBUSY），改成 :rw 也没用，只会把 read-only file system 换成 device or resource busy。
+# 配置要挂「目录」不能挂单个文件，两个理由都是硬故障：
+#   · 写配置库时要在库文件**旁边**建 -wal / -shm，单文件挂载会把它们丢在容器临时层里，
+#     容器一重建库就可能不完整；挂目录才能让它们跟库待在一起。
+#   · 单文件挂载会让它在容器里变成挂载点。v0.8.x 的写回最后一步是 rename 覆盖它，
+#     而内核禁止 rename 到挂载点（EBUSY），改成 :rw 也没用，
+#     只会把 read-only file system 换成 device or resource busy。
 # 宿主目录的属主要给容器里的 uid 10001，否则同样写不进去。
 mkdir -p config data && cp config.json config/ && sudo chown -R 10001:10001 config data
+# config.json 只是种子：容器第一次启动、库还是空的时候被导入一次，之后不再被读取。
 
 docker compose up -d --build
 # 或
@@ -1025,7 +1129,8 @@ docker build -t goproxy:demo . && docker run --network host \
 
 | 文件 | 职责 |
 |---|---|
-| `main.go` / `config.go` | 组装、请求入口、管理端点注册、热重载、优雅停机；配置结构与校验、原子写入与 revision |
+| `main.go` / `config.go` | 组装、请求入口、管理端点注册、热重载、优雅停机；配置结构与校验、`revision` 计算、route 级默认值 |
+| `configstore.go` | **配置持久化层（SQLite）**：建表与 schema 版本、整份配置在一个事务里读写、`config_history` 归档、`config.json` 首次导入、`-config-import` / `-config-export` 的落地实现 |
 | `admin_api.go` | 管理接口：认证闸门、路由 CRUD、全局配置读写、命名列表库写入（改名连带改写引用、删除前查引用）、登录与会话端点 |
 | `admin_users.go` / `session.go` / `secheaders.go` | 账号表（bcrypt、会话指纹、未知用户名恒定耗时）；登录会话（句柄哈希、过期、限流、CSRF）；安全响应头与 CSP |
 | `router.go` / `proxy.go` / `listener.go` | 三级匹配表（端口 → host → path，不可变快照）；ReverseProxy 封装（连接池、超时、XFF）；多端口监听管理 |
@@ -1035,7 +1140,7 @@ docker build -t goproxy:demo . && docker run --network host \
 | `auth.go` / `jwt.go` | Basic（bcrypt + 校验缓存）与 JWT 认证（带算法白名单） |
 | `metrics.go` / `accesslog.go` / `stats.go` | Prometheus 指标 + 每秒采样曲线；访问记录环形缓冲（兼 SSE 广播源）；三个监控接口 |
 | `webui.go` / `web/` | 内嵌并托管控制台（`go:embed`、缓存策略、SPA 回落、根路径分流）；前端工程（React 19 + Vite + TypeScript），产物 `web/dist` 提交进仓库 |
-| `*_test.go` | 单测：路由匹配、熔断/ACL/JWT/Basic（`governance_test`）、管理接口 CRUD 与并发冲突、环形缓冲与 SSE、控制台托管、TLS，另有两个守卫测试（示例配置必须能加载、部署文件必须暴露 443 且 `ReadWritePaths`/`chown` 到位） |
+| `*_test.go` | 单测：路由匹配、熔断/ACL/JWT/Basic（`governance_test`）、管理接口 CRUD 与并发冲突、环形缓冲与 SSE、控制台托管、TLS，**配置存储层（`configstore_test`：字节级往返稳定、事务回滚、外键 RESTRICT / CASCADE、历史封顶、导入校验）**，另有两个守卫测试（示例配置必须能加载、部署文件必须暴露 443 且 `ReadWritePaths`/`chown` 到位） |
 | `scripts/e2e_console.py` | 端到端自检（见下） |
 | `scripts/check_release_notes.py` | 发布后核对：Release 正文是否来自 annotated tag 说明 |
 
@@ -1044,8 +1149,8 @@ go test ./...   # 跑测试
 go vet ./...    # 静态检查
 
 # 端到端自检：真实二进制 + 真实反代 + 4 个测试后端，覆盖控制台依赖的全部接口（含认证、SSE、
-# 路由 CRUD + ETag 并发、三层 IP 名单 + 命名列表库 + 命中测试）。需要 PATH 里有 go 和 python3，
-# 产物落在临时目录；最后一节会刻意把管理端口封掉再恢复，所以它跑在最后。
+# 路由 CRUD + ETag 并发、三层 IP 名单 + 命名列表库 + 命中测试、配置库的 export/import 逃生通道）。
+# 需要 PATH 里有 go 和 python3，产物落在临时目录；最后一节会刻意把管理端口封掉再恢复，所以它跑在最后。
 python scripts/e2e_console.py
 ```
 
@@ -1059,10 +1164,34 @@ TLS 另有两个实机端到端脚本（仓库外的开发目录，自签证书 
 
 ---
 
-## 升级（三版都是破坏性变更）
+## 升级（四版都是破坏性变更）
 
 配置里的旧字段**任何取值都会让进程拒绝启动**，日志里直接给出映射表 —— 静默忽略的话，防护会在升级的一瞬间全部消失。
-从更早的版本升上来要**按顺序连做多步迁移**（v0.5.x → v0.6.0 → v0.7.0 → v0.8.0），每步都是硬错误、都有明确报错。
+从更早的版本升上来要**按顺序连做多步迁移**（v0.5.x → v0.6.0 → v0.7.0 → v0.8.0 → v0.9.0），每步都是硬错误、都有明确报错。
+
+### v0.8.x → v0.9.0：配置源从 JSON 文件换成 SQLite
+
+**配置文件不再被读取**，配置的真源是 `goproxy.db`。迁移不用手工搬字段（还是同一个 `Config` 结构，字段一个没变），
+要做的是「把旧文件里的配置弄进库里」，而这一步**默认自动完成**：
+
+```bash
+sudo systemctl stop goproxy
+sudo systemctl edit goproxy        # ExecStart 里的 -c .../config.json 改成 -c .../goproxy.db
+sudo systemctl start goproxy
+journalctl -u goproxy | grep 导入  # 看到「已把旧的 config.json 导入配置数据库（只导入这一次）」就成了
+```
+
+一键脚本装的话连单元都不用改：**重跑一遍 `install.sh`** —— 它会自己判断库在不在、该不该导。
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| 启动报 `…… 不是 SQLite 数据库（看起来还是旧版的 JSON 配置文件）` | `-c` 还指着 `config.json` | 报错里直接给了两条出路：把 `-c` 改成 `goproxy.db`，或显式 `-config-import` 一次 |
+| 升级后「配置全没了」 | 上面那条被忽略，进程在旁边建了个**空库** | 别慌，`config.json` 还在：`goproxy -c goproxy.db -config-import config.json` 导进去再重启 |
+| 改 `config.json` 没反应 | **预期行为** —— 导入只做一次，之后文件不再被读取 | 改配置走控制台，或 `-config-export` → 改 → `-config-import` → 重启 / `POST /_goproxy/reload` |
+| `-wal` / `-shm` 写不进去 | 目录不可写（不只是库文件） | `chown` 整个配置目录给服务账号，并加进 `ReadWritePaths`；`install.sh` 已经处理 |
+
+> 为什么不做「发现库为空就导入」：那样你哪天删光所有路由、重启，旧文件里的内容会**突然复活**，
+> 比不导入更难排查（现象是「删掉的路由自己又回来了」）。
 
 ### v0.7.x → v0.8.0：IP 名单从「内联」改成「引用」
 
@@ -1102,7 +1231,7 @@ TLS 另有两个实机端到端脚本（仓库外的开发目录，自签证书 
 「字符串或 `{cidr, note}` 对象」，两种可混写，老的纯字符串数组照抄即可。
 
 > **启用全局黑名单前先想清楚**：它作用于管理端口，配错了会把自己关在门外。控制台保存前有自锁检查会拦住，
-> 但直接改配置文件是不受检查的 —— 动手前确认你还有别的进路（SSH 等）。
+> 走 `-config-export` / `-config-import` 那条路则完全不受检查 —— 动手前确认你还有别的进路（SSH 等）。
 
 ### v0.5.x → v0.6.0：强制登录
 
@@ -1115,7 +1244,7 @@ TLS 另有两个实机端到端脚本（仓库外的开发目录，自签证书 
 错误码也从 `admin_token_not_set` 改名为 **`admin_credentials_not_set`**，有脚本 / 告警在匹配它要一起改。
 
 ```jsonc
-// config.json，保存即热重载
+// 加进 admin_users，再 -config-import 导回并重启生效
 { "admin_users": [{ "username": "admin", "password_hash": "$2a$10$..." }] }
 ```
 
@@ -1125,21 +1254,28 @@ TLS 另有两个实机端到端脚本（仓库外的开发目录，自签证书 
 ### 升级二进制
 
 ```bash
-grep -n '"mode"\|"allow"\|"deny"' /etc/goproxy/config.json   # 先看有没有老写法
+# 还在 v0.8.x 及更早（配置是 JSON 文件）：先看里面有没有老写法
+grep -n '"mode"\|"allow"\|"deny"' /etc/goproxy/config.json
 # 懒得手工搬就把 acl 整段删掉（等于不限制），升级后在控制台「IP 名单」页重建列表、勾引用
+
+# 已经在 v0.9.0 上：配置在库里，先导出来再检查
+goproxy -c /etc/goproxy/goproxy.db -config-export /tmp/cfg.json
+
 curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh | sudo bash
 ```
 
-重跑安装脚本就是升级，**已存在的 `config.json` 不会被覆盖**。
+重跑安装脚本就是升级：**已存在的配置库不会被覆盖**，`config.json` 只在库为空时被导入一次。
 
 ---
 
 ## 下一步
 
-已完成 M1–M4（含 TLS / ACME 自动证书）、管理写接口、监控数据源、控制台前端、登录 / 会话 / 安全加固、
-多用户账号体系与强制登录、三层 IP 名单的统一管理，以及**命名地址列表库**（集中定义 + 路由引用）。
+已完成 M1–M5（含 TLS / ACME 自动证书）、管理写接口、监控数据源、控制台前端、登录 / 会话 / 安全加固、
+多用户账号体系与强制登录、三层 IP 名单的统一管理、**命名地址列表库**（集中定义 + 路由引用），
+以及 **M5 正式版：配置源换成 SQLite**（关系表 + 外键引用完整性 + 配置历史）。
 
-- **配置源换成 SQLite（M5 正式版）** —— `loadConfig` 换掉即可，HTTP 层与前端不动
+- **把控制台里的「改 config.json」文案收尾** —— 界面和提示里还有若干处按旧存储模式写的字样
+  （改的是文件、改完靠轮询生效），要跟着 SQLite 一起改掉；`SettingsPage` 的「配置来源」一处已经改了
 - **审计日志**：记录「谁在什么时候改了哪条路由」（有了账号表之后，写接口已经知道是谁在操作，缺的只是记下来）
 - **权限分级**：账号之间现在没有区别，任一账号都是全权
 

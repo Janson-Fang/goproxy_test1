@@ -5,7 +5,7 @@
 #   curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh | sudo bash
 #
 # 升级：重跑同一条命令即可 —— 二进制就地替换（服务正在跑也安全），
-#       config.json 保持不动，systemd 单元先备份再重写，
+#       配置数据库保持不动，systemd 单元先备份再重写，
 #       原本在运行的服务会自动重启，并确认真的起来了。
 #
 # 指定版本：
@@ -27,8 +27,10 @@
 #
 # 首次安装会引导你设置一个管理账号（用户名 + 密码）。控制台需要登录才能用，
 # 从 v0.6.0 起连本机访问也不例外。密码不会明文落地，只保存 bcrypt 哈希。
-# 之后想改密码：goproxy -hash-password '新密码'，把输出填进 config.json
-# 的 admin_users[].password_hash，保存后会自动热重载。
+# 之后想改密码：控制台没有改密码的界面（那会让明文经过一个本该只读的接口），走命令行：
+#   goproxy -c 配置库 -config-export cfg.json   # 导出
+#   用 goproxy -hash-password '新密码' 算出哈希，填进 cfg.json 的 admin_users
+#   改完再 -config-import cfg.json 导回并重启。
 
 set -euo pipefail
 
@@ -36,6 +38,12 @@ REPO="${REPO:-Janson-Fang/goproxy_test1}"
 VERSION="${VERSION:-latest}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/goproxy}"
+# 配置数据库。v0.9.0 起**它**才是配置的真源，config.json 不再是。
+#
+# config.json 只剩一个用途：库里还没有配置时作为「种子」被导入一次。
+# 导入之后它就不再被读取了 —— 所以升级时绝对不能用它去覆盖库里那份
+# 已经被控制台改过的配置，这一步下面有判断。
+CONFIG_DB="${CONFIG_DB:-$CONFIG_DIR/goproxy.db}"
 # 单元文件目录做成可覆盖的：一来某些发行版不放在这里，
 # 二来 CI 里要能指到临时目录去验证「先备份再重写」这条路径。
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
@@ -297,7 +305,7 @@ fi
 printf '%s\n' "$VER_OUT"
 NEW_VER=$(printf '%s\n' "$VER_OUT" | sed -n 's/^goproxy \([^ ]*\).*/\1/p' | head -1)
 
-# ---------- 8. 配置文件 ----------
+# ---------- 8. 配置数据库 ----------
 $SUDO install -d "$CONFIG_DIR"
 
 # gen_admin_hash <密码> —— 调 goproxy 自己的 -hash-password 算 bcrypt。
@@ -402,38 +410,66 @@ prompt_admin_credentials() { # prompt_admin_credentials <文件>
     return 0
 }
 
-if [ -f "$CONFIG_DIR/config.json" ]; then
-    warn "$CONFIG_DIR/config.json 已存在，保持不动（新版本示例放在 config.json.example）"
+# 数据库已经在 → 升级场景，一律不碰。
+#
+# 判据从「config.json 存不存在」换成了「数据库存不存在」，这一点很关键：
+# config.json 导入之后就不再被读取，它可能早就过时了（控制台里改过的路由都在库里）。
+# 按老判据走，一次重跑安装就会拿那份陈旧的文件把库里真实的配置覆盖掉。
+if [ -e "$CONFIG_DB" ]; then
+    ok "$CONFIG_DB 已存在，保持不动"
     $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_DIR/config.json.example"
-
-    # 老配置升级上来的情况：以前 admin_token 是唯一凭据，现在用户也可能
-    # 想改用账号登录。这里只在**确实一个凭据都没有**时才提示 ——
-    # 已经有 admin_token 的环境照样能用（Bearer 仍然有效），不该被打扰。
-    if ! grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CONFIG_DIR/config.json" 2>/dev/null &&
-       ! grep -q '"admin_token"[[:space:]]*:[[:space:]]*"[^"]' "$CONFIG_DIR/config.json" 2>/dev/null; then
-        warn "检测到这份配置里没有任何管理员凭据 —— 管理接口会拒绝所有请求。"
-        if ! prompt_admin_credentials "$CONFIG_DIR/config.json"; then
-            warn "没有设置账号。请手动在 $CONFIG_DIR/config.json 里加 admin_users，例如："
-            warn "  \"admin_users\": [{\"username\": \"admin\", \"password_hash\": \"\$(goproxy -hash-password '你的密码')\"}]"
-        fi
-    fi
 else
-    $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_DIR/config.json"
-    ok "已生成配置 $CONFIG_DIR/config.json"
+    # 库里还没有配置。这一步决定「装完之后控制台能不能进去」，
+    # 所以先把种子文件备好（老配置就沿用，全新安装就铺一份示例），再导入。
+    if [ -f "$CONFIG_DIR/config.json" ]; then
+        warn "检测到旧版配置文件 $CONFIG_DIR/config.json，将导入配置数据库（只导这一次）"
 
-    # 这是「默认安装」路径 —— 也是最容易出问题的一条。
-    # 示例配置里没有 admin_token，历史版本因此让人从浏览器打开时
-    # 只看到一张「已拒绝所有外部请求」的说明页（用户反馈过「没见到登录界面」）。
-    # 现在一律要登录，所以这一步要么在这里问出账号，要么明确告诉人怎么补。
-    if ! prompt_admin_credentials "$CONFIG_DIR/config.json"; then
-        warn "尚未设置管理账号 —— 控制台现在需要用户名 + 密码才能登录。"
-        warn "两种补法（任选其一，改完会自动热重载，不用重启）："
-        warn "  1. 重新运行本脚本，在交互提示里设置；"
-        warn "  2. 手动编辑 $CONFIG_DIR/config.json，加上管理员账号："
-        warn "       goproxy -hash-password '你的密码'"
-        warn "     把输出填进 admin_users[].password_hash，字段格式见 config.json.example。"
+        # 老配置升级上来的情况：以前 admin_token 是唯一凭据，现在用户也可能
+        # 想改用账号登录。这里只在**确实一个凭据都没有**时才提示 ——
+        # 已经有 admin_token 的环境照样能用（Bearer 仍然有效），不该被打扰。
+        if ! grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CONFIG_DIR/config.json" 2>/dev/null &&
+           ! grep -q '"admin_token"[[:space:]]*:[[:space:]]*"[^"]' "$CONFIG_DIR/config.json" 2>/dev/null; then
+            warn "检测到这份配置里没有任何管理员凭据 —— 管理接口会拒绝所有请求。"
+            if ! prompt_admin_credentials "$CONFIG_DIR/config.json"; then
+                warn "没有设置账号。请手动在 $CONFIG_DIR/config.json 里加 admin_users，例如："
+                warn "  \"admin_users\": [{\"username\": \"admin\", \"password_hash\": \"\$(goproxy -hash-password '你的密码')\"}]"
+            fi
+        fi
+    else
+        $SUDO install -m 0644 "$TMP/config.example.json" "$CONFIG_DIR/config.json"
+        ok "已生成配置 $CONFIG_DIR/config.json"
+
+        # 这是「默认安装」路径 —— 也是最容易出问题的一条。
+        # 示例配置里没有 admin_token，历史版本因此让人从浏览器打开时
+        # 只看到一张「已拒绝所有外部请求」的说明页（用户反馈过「没见到登录界面」）。
+        # 现在一律要登录，所以这一步要么在这里问出账号，要么明确告诉人怎么补。
+        if ! prompt_admin_credentials "$CONFIG_DIR/config.json"; then
+            warn "尚未设置管理账号 —— 控制台现在需要用户名 + 密码才能登录。"
+            warn "补法（任选其一）："
+            warn "  1. 重新运行本脚本，在交互提示里设置；"
+            warn "  2. 手动编辑 $CONFIG_DIR/config.json 加上账号，再执行一次导入："
+            warn "       goproxy -hash-password '你的密码'"
+            warn "       sudo $BIN_DIR/goproxy -c $CONFIG_DB -config-import $CONFIG_DIR/config.json"
+            warn "     字段格式见 config.json.example。"
+        fi
+        warn "这是示例配置，后端指向 127.0.0.1:9001 等本机端口，先改成你自己的后端"
     fi
-    warn "这是示例配置，后端指向 127.0.0.1:9001 等本机端口，先改成你自己的后端"
+
+    # 导入交给二进制自己走 -config-import：它做的是完整校验（含旧写法拦截），
+    # 而且失败时**不动原配置** —— 所以这里可以放心 die，不会留下半坏的库。
+    #
+    # 用这个通道而不是「启动时自动导入」是有意的：启动时那一步只在库为空时
+    # 触发一次，而安装脚本需要的是「现在就知道导没导成功」，还要能把报错
+    # 直接摊在终端上给人看。
+    info "正在把 $CONFIG_DIR/config.json 导入配置数据库…"
+    if ! $SUDO "$BIN_DIR/goproxy" -c "$CONFIG_DB" -config-import "$CONFIG_DIR/config.json"; then
+        die "导入失败（原因见上面那条报错）。库没有被改动，修好 $CONFIG_DIR/config.json 后重跑本脚本即可。
+     最常见的原因是旧版的 acl 写法：v0.8.0 起路由只能**引用**顶层的命名名单，
+     报错信息里带迁移映射，照它改，或看 README 的「IP 名单」一节。"
+    fi
+    ok "已导入到 $CONFIG_DB"
+    info "config.json 只是种子，以后不再被读取 —— 改配置请用控制台，"
+    info "  或 $BIN_DIR/goproxy -c $CONFIG_DB -config-export / -config-import"
 fi
 
 # ---------- 9. systemd 服务 ----------
@@ -478,24 +514,27 @@ if [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
     fi
 
     # 配置目录要对服务账号可写。管理接口的增删改路由、POST /reload、
-    # PATCH /_goproxy/config 全都是原子写 config.json（.tmp + rename），
-    # 写不进去这些操作直接失败。
+    # PATCH /_goproxy/config 全都要写配置数据库 —— 写不进去这些操作直接失败。
+    #
+    # 换成 SQLite 之后要求没变松：数据库写入时要在库文件**旁边**建
+    # -wal / -shm，所以「整个目录可写」才是硬要求，光让库文件本身可写不够。
     #
     # 这里踩过一次：ProtectSystem=strict 会把整个文件系统挂成只读，而单元里
     # ReadWritePaths 只放行了 $STATE_DIR，于是「删除路由」报
-    #   open /etc/goproxy/config.json.tmp: read-only file system
+    #   attempt to write a readonly database
     #
     # 关键是 systemd 的 ReadWritePaths 只改挂载属性、**不改 Unix 权限**：
-    # $CONFIG_DIR 是 root:root 0755 时，以 goproxy 身份跑的服务照样建不出 .tmp。
+    # $CONFIG_DIR 是 root:root 0755 时，以 goproxy 身份跑的服务照样写不进去。
     # 所以下面改属主和单元里的 ReadWritePaths 缺一不可，两个都得有。
     if ! $SUDO chown goproxy:goproxy "$CONFIG_DIR" 2>/dev/null; then
         warn "改不了 $CONFIG_DIR 的属主，管理接口改配置会失败。请手动执行："
         warn "  sudo chown goproxy:goproxy $CONFIG_DIR"
     fi
 
-    # 已有的配置文件也要过一遍属主：config.json.bak 万一是 root:root 0644，
-    # 服务每次写备份都会 permission denied（不致命，但备份会一直停在旧内容）。
-    for f in config.json config.json.bak config.json.tmp; do
+    # 目录里的文件也要过一遍属主。数据库那几个尤其重要：-wal / -shm 是 SQLite
+    # 在写入过程中现建的，如果库文件是 root:root 0644，服务连 -wal 都建不出来，
+    # 报的还是一句看不出跟权限有关的错。
+    for f in goproxy.db goproxy.db-wal goproxy.db-shm config.json; do
         if [ -e "$CONFIG_DIR/$f" ]; then
             $SUDO chown goproxy:goproxy "$CONFIG_DIR/$f" 2>/dev/null || true
         fi
@@ -522,7 +561,7 @@ After=network.target
 [Service]
 Type=simple
 User=goproxy
-ExecStart=$BIN_DIR/goproxy -c $CONFIG_DIR/config.json
+ExecStart=$BIN_DIR/goproxy -c $CONFIG_DB
 WorkingDirectory=$STATE_DIR
 Restart=always
 RestartSec=3
@@ -536,8 +575,9 @@ ProtectHome=true
 # ProtectSystem=strict 会把整个文件系统挂成只读（/etc 也在内），
 # 所以凡是运行期要写的地方都必须显式放行：
 #   $STATE_DIR  —— 证书、ACME 缓存、运行态文件（$CONFIG_DIR/data 软链到这里）
-#   $CONFIG_DIR —— 管理接口要原子写 config.json（.tmp + rename）。
-#                  漏掉它，「删除路由」会报 config.json.tmp: read-only file system。
+#   $CONFIG_DIR —— 管理接口要写配置数据库。SQLite 还要在库文件旁边建
+#                  -wal / -shm，所以放行的是整个目录而不是那一个文件。
+#                  漏掉它，「删除路由」会报 attempt to write a readonly database。
 ReadWritePaths=$STATE_DIR $CONFIG_DIR
 
 [Install]
@@ -592,7 +632,7 @@ else
     echo "安装完成。"
 fi
 echo "  二进制    $BIN_DIR/goproxy"
-echo "  配置文件  $CONFIG_DIR/config.json"
+echo "  配置库    $CONFIG_DB"
 if [ -n "$OLD_VER" ]; then
     echo "  旧二进制  $BIN_DIR/goproxy.old（回滚用）"
 fi
@@ -602,24 +642,34 @@ fi
 # 这段是有意加的：以前装完只说了配置文件和二进制路径，用户从浏览器打开
 # 管理端口时看到的是「已拒绝所有外部请求」，完全不知道下一步该干什么，
 # 反馈过「没见到登录界面」。把这两条直接写出来能省掉一整轮排查。
-ADMIN_ADDR=$(sed -n 's/.*"admin_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_DIR/config.json" 2>/dev/null | head -n1)
-if grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CONFIG_DIR/config.json" 2>/dev/null; then
-    HAS_CRED="yes"
-else
-    HAS_CRED="no"
+#
+# 配置的真源是数据库，所以这里用 -config-export 导出一份临时 JSON 再读 ——
+# 导出的就是那套规范化 JSON，字段名和以前完全一样。导出文件里带着
+# admin_token 与密码哈希（所以 goproxy 自己按 0600 写），读完立刻删掉。
+ADMIN_ADDR=""
+HAS_CRED="no"
+CRED_TMP="$(mktemp)"
+if $SUDO "$BIN_DIR/goproxy" -c "$CONFIG_DB" -config-export "$CRED_TMP" >/dev/null 2>&1; then
+    ADMIN_ADDR=$(sed -n 's/.*"admin_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CRED_TMP" | head -n1)
+    if grep -q '"admin_users"[[:space:]]*:[[:space:]]*\[[^]]' "$CRED_TMP" 2>/dev/null; then
+        HAS_CRED="yes"
+    fi
 fi
+rm -f "$CRED_TMP"
 
-if [ -n "$ADMIN_ADDR" ]; then
-    echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/"
-fi
+# admin_addr 留空的意思是「用默认值」（127.0.0.1:8080），那种情况下导出的 JSON
+# 里根本没有这个键。以前直接 grep config.json，留空就什么都不打印 ——
+# 而这恰恰是最常见的默认安装。这里补上默认值。
+[ -n "$ADMIN_ADDR" ] || ADMIN_ADDR="127.0.0.1:8080"
+echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/"
 echo
 if [ "$HAS_CRED" = "yes" ]; then
     echo "控制台登录：用刚才设置的用户名 + 密码。"
 elif [ "$NO_ADMIN_PROMPT" = "1" ]; then
     echo "注意：没有设置管理员账号，控制台暂时登录不进去。补一个："
     echo "  $BIN_DIR/goproxy -hash-password '你的密码'"
-    echo "  把输出填进 $CONFIG_DIR/config.json 的 admin_users[].password_hash"
-    echo "  保存后自动热重载，不用重启。"
+    echo "  然后 $BIN_DIR/goproxy -c $CONFIG_DB -config-export cfg.json，"
+    echo "  把哈希填进 cfg.json 的 admin_users[].password_hash，再 -config-import 导回并重启。"
 else
     echo "注意：没有设置管理员账号，控制台暂时登录不进去。"
     echo "  重新运行本安装脚本即可在交互提示里设置，或按上面的命令手动补。"
@@ -630,15 +680,23 @@ if [ "$SVC_RESTARTED" = "1" ]; then
     echo "看版本：$BIN_DIR/goproxy -version"
 elif [ "$WITH_SERVICE" = "1" ] && command -v systemctl >/dev/null 2>&1; then
     echo "下一步："
-    echo "  1. 改配置：把每条路由的 target 指向你自己的后端"
-    echo "  2. 前台试跑：$BIN_DIR/goproxy -c $CONFIG_DIR/config.json（看有没有报错）"
+    echo "  1. 改配置：打开控制台，把每条路由的 target 指向你自己的后端"
+    echo "  2. 前台试跑：$BIN_DIR/goproxy -c $CONFIG_DB（看有没有报错）"
     echo "  3. 正式启动：sudo systemctl enable --now goproxy"
     echo "     看日志：sudo journalctl -u goproxy -f"
 else
     echo "下一步："
-    echo "  1. 改配置：把每条路由的 target 指向你自己的后端"
-    echo "  2. 后台运行：nohup $BIN_DIR/goproxy -c $CONFIG_DIR/config.json &"
+    echo "  1. 改配置：打开控制台，把每条路由的 target 指向你自己的后端"
+    echo "  2. 后台运行：nohup $BIN_DIR/goproxy -c $CONFIG_DB &"
 fi
+echo
+echo "改配置的两条路（config.json 已经不再被读取了）："
+echo "  控制台    http://${ADMIN_ADDR}/_goproxy/ui/  —— 保存即生效"
+echo "  命令行    导出、改完再导回（适合批量改或界面进不去时救急）："
+echo "              $BIN_DIR/goproxy -c $CONFIG_DB -config-export cfg.json"
+echo "              ……改 cfg.json……"
+echo "              $BIN_DIR/goproxy -c $CONFIG_DB -config-import cfg.json   # 需重启或调 reload 生效"
+echo "  改错了    每次写入前会自动留一版历史（最近 20 版），就在 $CONFIG_DB 里"
 echo
 echo "卸载："
 echo "  sudo systemctl disable --now goproxy 2>/dev/null"

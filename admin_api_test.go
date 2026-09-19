@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -82,10 +81,10 @@ func newTestEnv(t *testing.T, adminToken string, extraRoute string) *testEnv {
   "routes": [%s]
 }`, p[0], p[2], tokenField, routes)
 
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
-		t.Fatalf("写测试配置失败: %v", err)
-	}
+	// 先把配置库建好再起 App：NewApp 会检查这个路径是不是数据库，库为空还会
+	// 尝试用旁边的 config.json 做一次性导入 —— 这里两条都不适用。
+	path := filepath.Join(t.TempDir(), "goproxy.db")
+	seedRawConfig(t, path, []byte(cfg))
 	a, err := NewApp(path)
 	if err != nil {
 		t.Fatalf("NewApp 失败: %v", err)
@@ -173,17 +172,19 @@ func dialOK(port int) error {
 	return c.Close()
 }
 
+// readConfigFromDisk 读回落盘的配置（规范化 JSON + 未补默认值的结构）。
+//
+// 配置源换成 SQLite 之后，「落盘」= 已提交进库，所以这里走存储层读而不是读文件。
+// 用 parseConfigFile 而不是 readConfigFile：后者会补默认值，而「兜底值到底
+// 有没有真的写进库里」正是本文件好几条用例要验的事 —— 走补默认值的那条路，
+// 即使什么都没存下来也照样能读到 "/"，用例就白写了。
 func readConfigFromDisk(t *testing.T, path string) ([]byte, Config) {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, c, err := parseConfigFile(path)
 	if err != nil {
-		t.Fatalf("读配置文件失败: %v", err)
+		t.Fatalf("读回配置失败: %v", err)
 	}
-	var c Config
-	if err := json.Unmarshal(raw, &c); err != nil {
-		t.Fatalf("配置文件已不是合法 JSON: %v\n%s", err, raw)
-	}
-	return raw, c
+	return raw, *c
 }
 
 func TestAdminRouteCRUD(t *testing.T) {
@@ -235,17 +236,25 @@ func TestAdminRouteCRUD(t *testing.T) {
 		t.Fatalf("PATCH 后 enabled 应为 false: %+v", got)
 	}
 
-	// 配置文件的唯一真源是磁盘，落盘了才算数
+	// 配置的唯一真源是数据库，落库了才算数
 	raw, onDisk := readConfigFromDisk(t, e.path)
 	idx := indexRoute(onDisk.Routes, "api")
 	if idx < 0 {
-		t.Fatalf("配置文件里没有 api 路由:\n%s", raw)
+		t.Fatalf("库里没有 api 路由:\n%s", raw)
 	}
 	if onDisk.Routes[idx].Enabled == nil || *onDisk.Routes[idx].Enabled {
-		t.Fatal("配置文件里 enabled 应为 false")
+		t.Fatal("库里 enabled 应为 false")
 	}
-	if _, err := os.Stat(e.path + ".bak"); err != nil {
-		t.Fatalf("写回时应生成 .bak 备份: %v", err)
+	// 每次写入前留一版历史（替代了原来的 config.json.bak）。
+	// 没了这条，改错两次就再也回不去了。
+	st, err := storeFor(e.path)
+	if err != nil {
+		t.Fatalf("打开配置库失败: %v", err)
+	}
+	if n, err := st.historyCount(); err != nil {
+		t.Fatalf("读配置历史失败: %v", err)
+	} else if n == 0 {
+		t.Fatal("写回时应留下配置历史")
 	}
 
 	// --- 全量替换 ---
@@ -356,12 +365,9 @@ func TestIfMatchPreventsLostUpdate(t *testing.T) {
 	}
 }
 
-func TestInvalidRouteRejectedWithoutTouchingFile(t *testing.T) {
+func TestInvalidRouteRejectedWithoutTouchingConfig(t *testing.T) {
 	e := newTestEnv(t, testToken, "")
-	before, err := os.ReadFile(e.path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	before, _ := readConfigFromDisk(t, e.path)
 
 	cases := []struct{ name, body string }{
 		{"target 协议不支持", fmt.Sprintf(`{"id":"x1","listen_port":%d,"target":"ftp://127.0.0.1:9000"}`, e.p[3])},
@@ -380,12 +386,10 @@ func TestInvalidRouteRejectedWithoutTouchingFile(t *testing.T) {
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("应 400，实际 %d: %s", rr.Code, rr.Body)
 			}
-			after, err := os.ReadFile(e.path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			// 校验没过就绝不能落库：库里的内容必须和请求前逐字节一致。
+			after, _ := readConfigFromDisk(t, e.path)
 			if string(after) != string(before) {
-				t.Fatalf("校验没过却动了配置文件:\n改动前 %s\n改动后 %s", before, after)
+				t.Fatalf("校验没过却动了配置:\n改动前 %s\n改动后 %s", before, after)
 			}
 		})
 	}
@@ -681,13 +685,11 @@ func TestAdminConfigEndpoint(t *testing.T) {
 // 否则一次界面保存就会把原本关闭的管理端口悄悄打开。
 func TestMutationPreservesOmittedTopLevelFields(t *testing.T) {
 	p := nextPorts(2)
-	path := filepath.Join(t.TempDir(), "config.json")
+	path := filepath.Join(t.TempDir(), "goproxy.db")
 	orig := fmt.Sprintf(
 		`{"default_ports":[%d],"routes":[{"id":"seed","listen_port":%d,"target":"http://127.0.0.1:9000"}]}`,
 		p[0], p[1])
-	if err := os.WriteFile(path, []byte(orig), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	seedRawConfig(t, path, []byte(orig))
 
 	a, err := NewApp(path)
 	if err != nil {
@@ -719,13 +721,18 @@ func TestMutationPreservesOmittedTopLevelFields(t *testing.T) {
 		t.Fatalf("mutate 失败: %v", err)
 	}
 
-	raw, _ := os.ReadFile(path)
+	// 读回的是「库里真正存下的内容」，不是内存里的路由表 ——
+	// 这条用例验的正是落库那一刻有没有把留空字段固化。
+	raw, _, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("读回配置失败: %v", err)
+	}
 	if strings.Contains(string(raw), defaultAdminAddr) {
 		t.Fatalf("写回不该把留空的 admin_addr 固化成默认值:\n%s", raw)
 	}
 	var back Config
 	if err := json.Unmarshal(raw, &back); err != nil {
-		t.Fatalf("写回的文件不是合法 JSON: %v", err)
+		t.Fatalf("写回的配置不是合法 JSON: %v", err)
 	}
 	if back.AdminAddr != "" {
 		t.Fatalf("admin_addr 应保持「未指定」，实际 %q", back.AdminAddr)
@@ -786,15 +793,16 @@ func TestSelfLockoutGuard(t *testing.T) {
 	if bad["error"] != "self_lockout" {
 		t.Errorf("错误码应当是 self_lockout，实际 %q", bad["error"])
 	}
-	// 提示里必须给出退路，否则用户只会觉得「工具不让我干活」
-	if !strings.Contains(bad["message"], "配置文件") {
-		t.Errorf("提示里应当给出「改配置文件后重启」的退路，实际：%s", bad["message"])
+	// 提示里必须给出退路，否则用户只会觉得「工具不让我干活」。
+	// 退路是命令行的导出 / 导入 —— 配置的真源是数据库，没有可手改的文本文件了。
+	if !strings.Contains(bad["message"], "-config-import") {
+		t.Errorf("提示里应当给出「导出改完再导入」的退路，实际：%s", bad["message"])
 	}
 
-	// 关键：护栏必须在落盘之前生效。落盘了再报错等于已经写坏了。
-	raw, _ := os.ReadFile(e.path)
+	// 关键：护栏必须在落库之前生效。落了库再报错等于已经写坏了。
+	raw, _ := readConfigFromDisk(t, e.path)
 	if strings.Contains(string(raw), "127.0.0.0/8") {
-		t.Error("被拒绝的配置不应落盘")
+		t.Error("被拒绝的配置不应落库")
 	}
 
 	// 封一个跟客户端无关的地址是合法操作，不能被护栏误伤
@@ -990,10 +998,11 @@ func TestACLTestEndpoint(t *testing.T) {
 	}
 }
 
-// TestLegacyACLBlocksStartup 从「读文件」这一层确认旧写法会被拦下。
+// TestLegacyACLBlocksStartup 从「启动」这一层确认旧写法会被拦下。
 //
-// 上面 TestLegacyACLRejected 直接调了 rejectLegacyACL，这里走完整链路
-// （写一个旧格式的配置文件 → 启动），确保它在真实启动路径上确实生效。
+// 上面 TestLegacyACLRejected 直接调了 rejectLegacyACL，这里走完整链路：
+// 把旧格式留在 config.json 里，让 NewApp 的一次性导入去读它。
+// 这条路径值得单独守住 —— 它是老部署升级时唯一会碰到旧配置的地方。
 func TestLegacyACLBlocksStartup(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1006,7 +1015,10 @@ func TestLegacyACLBlocksStartup(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.json")
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "goproxy.db")
+			t.Cleanup(func() { _ = closeStore(dbPath) })
+
 			legacy := `{
   "admin_addr": "127.0.0.1:19099",
   "routes": [{
@@ -1014,10 +1026,9 @@ func TestLegacyACLBlocksStartup(t *testing.T) {
     ` + c.body + `
   }]
 }`
-			if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			_, err := loadConfig(path)
+			seedLegacyConfigFile(t, dir, []byte(legacy))
+
+			_, err := NewApp(dbPath)
 			if err == nil {
 				t.Fatal("旧写法必须让加载失败，否则那份名单会静默失效")
 			}
@@ -1028,9 +1039,9 @@ func TestLegacyACLBlocksStartup(t *testing.T) {
 	}
 }
 
-// readCfg 直接从磁盘读回配置。
+// readCfg 直接从配置库里读回配置。
 //
-// 断言写路径时读文件而不是看接口返回值：接口返回的 revision 只能证明
+// 断言写路径时读库而不是看接口返回值：接口返回的 revision 只能证明
 // 「有东西被写下去了」，证明不了写下去的内容是什么。
 func readCfg(t *testing.T, e *testEnv) *Config {
 	t.Helper()

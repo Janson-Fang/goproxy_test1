@@ -6,18 +6,18 @@ package main
 // 是很典型的失误，而后果要到线上真正操作时才暴露 —— 最典型的就是「删除路由」
 // 直接报错：
 //
-//	open /etc/goproxy/config.json.tmp: read-only file system
+//	attempt to write a readonly database
 //
-// 根因是管理接口改配置走的是原子写（写 config.json.tmp 再 rename 覆盖），
-// 而三个部署路径各自都可能把配置目录变成不可写：
+// 根因是管理接口要写配置数据库（SQLite），而三个部署路径各自都可能让配置目录
+// 变成不可写：
 //
 //	· systemd  ProtectSystem=strict 把 /etc 挂成只读，ReadWritePaths 没放行配置目录
 //	· systemd  放行了，但目录还是 root:root 0755 —— ReadWritePaths 只改挂载属性，
-//	           不改 Unix 权限，以 goproxy 身份跑的服务照样建不出 .tmp
+//	           不改 Unix 权限，以 goproxy 身份跑的服务照样写不进去
 //	· Docker   容器以 uid 10001 跑，镜像里的 /etc/goproxy 是 root:root
-//	· Docker   把配置挂成了**单个文件** —— 那个文件成了挂载点，而原子写的最后
-//	           一步是 rename 覆盖它，内核在 vfs_rename 里禁止 rename 到挂载点，
-//	           直接返回 EBUSY。注意这种情况下改成 :rw 也没用，只是换个错误信息。
+//	· Docker   把配置挂成了**单个文件** —— SQLite 要在库文件旁边建 -wal / -shm，
+//	           单文件挂载会让这些兄弟文件落在容器临时层里；而旧版（v0.8.x）的
+//	           配置写回还会撞上 rename 挂载点的 EBUSY
 //
 // 一条纪律：**注释不算数**。install.sh 的注释里到处都在提 $CONFIG_DIR，
 // compose 里也有注释掉的 ports 示例 —— 拿 strings.Contains 扫全文会被注释命中，
@@ -104,7 +104,8 @@ func TestInstallUnitAllowsConfigDirWrite(t *testing.T) {
 	for _, want := range []string{"$STATE_DIR", "$CONFIG_DIR"} {
 		if !strings.Contains(rw, want) {
 			t.Errorf("ReadWritePaths 里缺 %s：%q\n"+
-				"  漏掉 $CONFIG_DIR 的后果就是「删除路由」报 config.json.tmp: read-only file system", want, rw)
+				"  漏掉 $CONFIG_DIR 的后果就是「删除路由」报 attempt to write a readonly database"+
+				"（SQLite 要在库文件旁边建 -wal / -shm，放行的必须是整个目录）", want, rw)
 		}
 	}
 }
@@ -120,7 +121,45 @@ func TestInstallChownsConfigDirToServiceUser(t *testing.T) {
 	}
 	t.Error("install.sh 没有把 $CONFIG_DIR 的属主交给 goproxy。\n" +
 		"  ReadWritePaths 只解除只读挂载，不改权限：目录还是 root:root 0755 的话，\n" +
-		"  以 goproxy 身份跑的服务建不出 config.json.tmp，报 permission denied")
+		"  以 goproxy 身份跑的服务写不进配置库，报 permission denied")
+}
+
+// 数据库那几个文件也要过属主。
+//
+// 目录可写不等于文件可写：goproxy.db 如果是 root:root 0644（比如安装脚本以
+// root 身份导入时生成的），服务正在写入时要建 goproxy.db-wal，
+// 报出来的错还看不出跟权限有关。
+func TestInstallChownsConfigDBFiles(t *testing.T) {
+	lines := effectiveLines(t, "install.sh")
+
+	// 1) 得有一个把库文件列进去的循环
+	var loop string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "for ") && strings.Contains(line, "goproxy.db") {
+			loop = line
+			break
+		}
+	}
+	if loop == "" {
+		t.Fatal("install.sh 没有对配置数据库文件过属主。\n" +
+			"  目录属主改了、目录里那个 root:root 0644 的库文件没改的话，\n" +
+			"  服务读得到、写不进去")
+	}
+	// -wal / -shm 必须一起：它们正是「写入时现建」的那两个文件，
+	// 漏掉的话库文件本身可写也没用 —— 建兄弟文件照样 permission denied。
+	for _, want := range []string{"goproxy.db-wal", "goproxy.db-shm"} {
+		if !strings.Contains(loop, want) {
+			t.Errorf("%s 没有一起过属主。SQLite 写入时要现建它，漏了照样写不进去：%q", want, loop)
+		}
+	}
+
+	// 2) 循环体里要真的 chown，不能只是把文件名列出来
+	for _, line := range lines {
+		if strings.Contains(line, "chown") && strings.Contains(line, `"$CONFIG_DIR/$f"`) {
+			return
+		}
+	}
+	t.Error(`那个 for 循环里没有 chown "$CONFIG_DIR/$f" —— 列了文件名却没改属主`)
 }
 
 // Docker 那条路之一：镜像里配置目录得归非 root 用户。
@@ -151,9 +190,9 @@ func TestComposeMountsConfigDirNotFile(t *testing.T) {
 
 		if strings.HasSuffix(src, ".json") {
 			t.Errorf("docker-compose.yml 把单个文件挂到了 %s：%q\n"+
-				"  那个文件会成为容器里的挂载点，而原子写的最后一步是 rename 覆盖它，\n"+
-				"  内核在 vfs_rename 里禁止 rename 到挂载点（EBUSY）—— 改成 :rw 也没用，\n"+
-				"  只会把 read-only file system 换成 device or resource busy。要挂目录。", dst, line)
+				"  SQLite 要在库文件旁边建 -wal / -shm，单文件挂载会让那些兄弟文件落在\n"+
+				"  容器临时层里（容器一重建就丢，库可能不完整）；旧版配置写回还会撞上\n"+
+				"  rename 挂载点的 EBUSY —— 改成 :rw 也没用。要挂目录。", dst, line)
 		}
 		if dst == "/etc/goproxy" {
 			sawConfigDir = true
@@ -161,7 +200,41 @@ func TestComposeMountsConfigDirNotFile(t *testing.T) {
 	}
 	if !sawConfigDir {
 		t.Error("docker-compose.yml 没有把配置目录挂到 /etc/goproxy —— " +
-			"管理接口需要在整个目录里原子写配置（.tmp + rename）")
+			"管理接口要往配置库里写字，而数据库还需要在它旁边建 -wal / -shm")
+	}
+}
+
+// 容器的 ENTRYPOINT 必须指向配置数据库，而不是那份示例 config.json。
+//
+// 指错也不会当场报错 —— 会在容器里安静地建一个同名的**新库**，
+// 而外面挂进来的配置全都没人读，现象是「改了配置重启，一点没变」。
+// 真实意图是让 config.json 只当第一次启动的种子（见 Dockerfile 的说明）。
+func TestDockerEntrypointPointsAtConfigDB(t *testing.T) {
+	var entry string
+	for _, line := range effectiveLines(t, "Dockerfile") {
+		if strings.HasPrefix(line, "ENTRYPOINT") {
+			entry = line
+		}
+	}
+	if entry == "" {
+		t.Fatal("Dockerfile 里没有 ENTRYPOINT")
+	}
+	if !strings.Contains(entry, "/etc/goproxy/goproxy.db") {
+		t.Errorf("ENTRYPOINT 应当指向配置数据库：%q\n"+
+			"  指向 config.json 的话，容器里会另建一个新库，挂进来的配置没人读", entry)
+	}
+	// 而 config.json 仍然要留在镜像里：库为空时启动会自动把它导入一次，
+	// 这正是不需要在构建期预先编译出一个二进制数据库的原因。
+	var seeds bool
+	for _, line := range effectiveLines(t, "Dockerfile") {
+		if strings.HasPrefix(line, "COPY") && strings.Contains(line, "config.example.json") &&
+			strings.Contains(line, "/etc/goproxy/config.json") {
+			seeds = true
+		}
+	}
+	if !seeds {
+		t.Error("Dockerfile 没有把 config.example.json 放进 /etc/goproxy/config.json —— " +
+			"那样首次启动的库里什么都没有，控制台连一条路由都看不到")
 	}
 }
 
@@ -173,6 +246,7 @@ func renderUnit(t *testing.T) string {
 	for _, kv := range [][2]string{
 		{"$BIN_DIR", "/usr/local/bin"},
 		{"$CONFIG_DIR", "/etc/goproxy"},
+		{"$CONFIG_DB", "/etc/goproxy/goproxy.db"},
 		{"$STATE_DIR", "/var/lib/goproxy"},
 	} {
 		s = strings.ReplaceAll(s, kv[0], kv[1])
@@ -225,10 +299,58 @@ func TestInstallRendersWellFormedUnit(t *testing.T) {
 			execStart = line
 		}
 	}
-	if want := "ExecStart=/usr/local/bin/goproxy -c /etc/goproxy/config.json"; execStart != want {
-		t.Errorf("ExecStart 不对：\n  实际 %q\n  期望 %q", execStart, want)
+	if want := "ExecStart=/usr/local/bin/goproxy -c /etc/goproxy/goproxy.db"; execStart != want {
+		t.Errorf("ExecStart 不对：\n  实际 %q\n  期望 %q\n"+
+			"  指向 config.json 的话，服务起来看到的是一个空库（或另建的新库），"+
+			"而配置文件里那些路由一条都不会生效", execStart, want)
 	}
 	if !strings.Contains(unit, "User=goproxy") {
 		t.Error("单元里没有 User=goproxy —— 服务会以 root 跑，降权就白做了")
+	}
+}
+
+// install.sh 必须真的把种子配置**导入**数据库，而不是只把它摆在那儿。
+//
+// 只摆着不动的话，服务起来会看到空库 —— 只要同目录里那份文件还在，启动时的
+// 自动导入其实也会兜住，但那一步只在「库为空」时执行一次，而安装脚本需要的是
+// 现场就能看到导入结果、失败能停在安装阶段。所以这里要求走显式的
+// -config-import，而不是指望运行时兜底。
+func TestInstallImportsSeedConfigIntoDB(t *testing.T) {
+	for _, line := range effectiveLines(t, "install.sh") {
+		if strings.Contains(line, "-config-import") && strings.Contains(line, "$CONFIG_DB") {
+			return
+		}
+	}
+	t.Error("install.sh 没有用 -config-import 把种子配置导入 $CONFIG_DB。\n" +
+		"  少了这一步，安装完启动服务会看到空库，装完就有路由可用的预期落空")
+}
+
+// 重跑安装脚本不能拿那份已经过时的 config.json 覆盖库里的真实配置。
+//
+// config.json 只在第一次导入时被读过，之后控制台里的所有修改都只落在库里。
+// 少了这道判断，升级一次就把用户改过的路由全部回退成安装时那份示例配置 ——
+// 而且现场看不出任何异常（库是新导入的，导入还成功了）。
+func TestInstallDoesNotReimportOverExistingDB(t *testing.T) {
+	lines := effectiveLines(t, "install.sh")
+
+	guard := -1
+	importAt := -1
+	for i, line := range lines {
+		if guard < 0 && strings.Contains(line, `-e "$CONFIG_DB"`) && strings.HasPrefix(line, "if ") {
+			guard = i
+		}
+		if importAt < 0 && strings.Contains(line, "-config-import") && strings.Contains(line, "$CONFIG_DB") {
+			importAt = i
+		}
+	}
+	if guard < 0 {
+		t.Fatal("install.sh 里没有 `if [ -e \"$CONFIG_DB\" ]` 这道判断 —— " +
+			"重跑安装会无条件导入，把库里的配置覆盖掉")
+	}
+	if importAt < 0 {
+		t.Fatal("install.sh 里没有找到 -config-import（见上一条用例）")
+	}
+	if importAt < guard {
+		t.Error("导入发生在「库已存在」判断之前 —— 判断形同虚设，重跑安装仍会覆盖")
 	}
 }
