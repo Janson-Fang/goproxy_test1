@@ -361,6 +361,10 @@ func (a *App) httpsRedirectURL(r *http.Request) string {
 }
 
 // handler 是所有监听端口共用的入口。端口从 context 里取。
+//
+// 请求处理拆成一条顺序管线：每一关是一个独立方法，返回 true 表示「已在
+// 这一关拦截并写好了响应」，主函数随即 return。顺序即语义（全局黑名单必须在
+// 路由匹配之前，明文端口上的 ACME 挑战绝不能先跳转），不可随意调整。
 func (a *App) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -381,7 +385,8 @@ func (a *App) handler() http.Handler {
 		ip := clientIP(r, trusted)
 
 		// 每次请求只记一条访问日志，所以收口在 defer 里，
-		// 而不是在下面 5 个 return 分支各写一遍（漏一处就少一类日志）。
+		// 而不是在下面每个拦截分支各写一遍（漏一处就少一类日志）。
+		// rt / blocked 是跨关共享的可变状态：defer 读的是它们的最新值。
 		var (
 			rt      *Route
 			blocked string
@@ -395,61 +400,17 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
-		// 0) 全局黑名单 —— 必须排在路由匹配**之前**。
-		//
-		// 位置是这份名单的语义决定的：它管的是「所有入口」，其中恰恰包括
-		// **匹配不到任何路由**的那些请求。如果放在路由匹配之后，扫描器挨个端口
-		// 扫过来时压根不会命中任何路由，也就永远走不到这份名单 ——
-		// 而那正是最需要拦下的流量。
-		//
-		// 放在这里还有一个附带好处：被全局封禁的地址连 ACME 挑战和
-		// HTTP→HTTPS 跳转都不会触发，是最彻底的拒绝。
-		if gdec := decideIP(tbl.globalDeny, nil, ip, false); !gdec.Allowed {
-			blocked = gdec.Reason
-			// 路由标签留空：全局封禁不属于任何一条路由，硬填一个 ID 是假信息。
-			// 404 分支也是这么处理的。
-			a.metrics.IncRejected("", gdec.Reason)
-			a.metrics.IncRequest("", http.StatusForbidden)
-			// 响应体刻意不带命中的具体规则：那等于告诉扫描器「你踩到哪条线了」。
-			// 具体规则进访问日志（blocked 标签 + 命中测试工具），运维看得到，
-			// 对面学不到。
-			writeJSON(rec, http.StatusForbidden, map[string]any{
-				"error":  "forbidden",
-				"reason": gdec.Reason,
-			})
+		// 0) 全局黑名单（在路由匹配之前，见 checkGlobalDeny）
+		if a.checkGlobalDeny(rec, tbl, ip, &blocked) {
 			return
 		}
 
-		// 明文端口上的三件事，顺序不能乱：
-		//   1) ACME 的 HTTP-01 挑战 —— 它必须能到达，绝不能跳转，
-		//      一跳转 Let's Encrypt 的验证就失败（而且是静默失败，很难查）。
-		//   2) HTTP→HTTPS 重定向
-		//   3) 明文代理（tls_mode=off 的路由）
-		if !requestIsTLS(r) {
-			if m := a.tlsmgr.Load(); m != nil && m.acme != nil {
-				// autocert 的 HTTPHandler 认识 /.well-known/acme-challenge/ 前缀
-				// 并直接响应，其余请求交给 fallback。
-				// 传 nil fallback 之前先判前缀，避免它为每个普通请求都掺一脚。
-				if strings.HasPrefix(r.URL.Path, acmeChallengePrefix) {
-					m.acme.HTTPHandler(nil).ServeHTTP(rec, r)
-					return
-				}
-			}
-
-			// 该路由开了 TLS 且要求跳转 → 301 到 HTTPS
-			if rt := tbl.Match(port, r.Host, r.URL.Path); rt != nil && rt.wantsHTTPSRedirect() {
-				target := a.httpsRedirectURL(r)
-				rec.Header().Set("Location", target)
-				// 301 是永久重定向，浏览器会缓存。这里用 301
-				// 是因为「明文→HTTPS」的策略确实不会来回变，
-				// 让客户端把跳转记下来能省掉一次明文往返。
-				rec.WriteHeader(http.StatusMovedPermanently)
-				blocked = "redirected_to_https"
-				a.metrics.IncRequest(rt.ID, http.StatusMovedPermanently)
-				return
-			}
+		// 明文端口：ACME 挑战、HTTP→HTTPS 跳转
+		if a.handlePlaintext(rec, r, tbl, port, &blocked) {
+			return
 		}
 
+		// 路由匹配
 		rt = tbl.Match(port, r.Host, r.URL.Path)
 		if rt == nil {
 			a.metrics.IncRequest("", http.StatusNotFound)
@@ -463,69 +424,18 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
-		// 1) 路由级 IP 名单（白名单 + 黑名单）
-		//
-		// 全局黑名单上面已经判过了，这里传 nil 跳过它，避免同一次请求算两遍。
-		if adec := decideIP(nil, rt.acl, ip, false); !adec.Allowed {
-			blocked = adec.Reason
-			a.metrics.IncRejected(rt.ID, adec.Reason)
-			a.metrics.IncRequest(rt.ID, http.StatusForbidden)
-			writeJSON(rec, http.StatusForbidden, map[string]any{
-				"error":  "forbidden",
-				"route":  rt.ID,
-				"reason": adec.Reason,
-				"layer":  adec.Layer,
-			})
+		// 1) 路由级 IP 名单 → 2) 限流 → 3) 熔断 → 4) 认证
+		if a.checkRouteACL(rec, rt, ip, &blocked) {
 			return
 		}
-
-		// 2) 限流
-		if rt.limiter != nil && !rt.limiter.Allow(ip) {
-			blocked = "rate_limited"
-			a.metrics.IncRateLimited(rt.ID)
-			a.metrics.IncRequest(rt.ID, http.StatusTooManyRequests)
-			rec.Header().Set("Retry-After", "1")
-			writeJSON(rec, http.StatusTooManyRequests, map[string]any{
-				"error": "rate_limited",
-				"route": rt.ID,
-			})
+		if a.checkRateLimit(rec, rt, ip, &blocked) {
 			return
 		}
-
-		// 3) 熔断：后端已经不行了就别再打了，直接快速失败
-		if rt.cb != nil && !rt.cb.Allow() {
-			blocked = "circuit_open"
-			a.metrics.IncRejected(rt.ID, "circuit_open")
-			a.metrics.IncRequest(rt.ID, http.StatusServiceUnavailable)
-			retryAfter := rt.cb.cfg.OpenSecs
-			if retryAfter < 1 {
-				retryAfter = 1
-			}
-			rec.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-			writeJSON(rec, http.StatusServiceUnavailable, map[string]any{
-				"error":       "circuit_open",
-				"route":       rt.ID,
-				"retry_after": retryAfter,
-			})
+		if a.checkCircuit(rec, rt, &blocked) {
 			return
 		}
-
-		// 4) 认证
-		if rt.auth != nil {
-			claims, ok, reason := rt.auth.Authenticate(r)
-			if !ok {
-				blocked = "auth_" + reason
-				rt.auth.WriteChallenge(rec)
-				a.metrics.IncRejected(rt.ID, "auth_"+reason)
-				a.metrics.IncRequest(rt.ID, http.StatusUnauthorized)
-				writeJSON(rec, http.StatusUnauthorized, map[string]any{
-					"error":  "unauthorized",
-					"route":  rt.ID,
-					"reason": reason,
-				})
-				return
-			}
-			rt.auth.OnSuccess(r, claims)
+		if a.checkAuth(rec, r, rt, &blocked) {
+			return
 		}
 
 		// 5) 转发
@@ -540,6 +450,144 @@ func (a *App) handler() http.Handler {
 		a.metrics.Observe(rt.ID, time.Since(start).Seconds())
 		a.metrics.IncRequest(rt.ID, rec.code)
 	})
+}
+
+// checkGlobalDeny 是请求管线的第 0 关：全局黑名单。
+//
+// 必须排在路由匹配**之前**：它管的是「所有入口」，其中恰恰包括
+// **匹配不到任何路由**的那些请求。如果放在路由匹配之后，扫描器挨个端口
+// 扫过来时压根不会命中任何路由，也就永远走不到这份名单 —— 而那正是最需要
+// 拦下的流量。放在这里还有附带好处：被全局封禁的地址连 ACME 挑战和
+// HTTP→HTTPS 跳转都不会触发，是最彻底的拒绝。
+func (a *App) checkGlobalDeny(rec *statusRecorder, tbl *RouteTable, ip string, blocked *string) bool {
+	gdec := decideIP(tbl.globalDeny, nil, ip, false)
+	if gdec.Allowed {
+		return false
+	}
+	*blocked = gdec.Reason
+	// 路由标签留空：全局封禁不属于任何一条路由，硬填一个 ID 是假信息。
+	// 404 分支也是这么处理的。
+	a.metrics.IncRejected("", gdec.Reason)
+	a.metrics.IncRequest("", http.StatusForbidden)
+	// 响应体刻意不带命中的具体规则：那等于告诉扫描器「你踩到哪条线了」。
+	// 具体规则进访问日志（blocked 标签 + 命中测试工具），运维看得到，对面学不到。
+	writeJSON(rec, http.StatusForbidden, map[string]any{
+		"error":  "forbidden",
+		"reason": gdec.Reason,
+	})
+	return true
+}
+
+// handlePlaintext 处理明文端口上的两件事，顺序不能乱：
+//  1. ACME 的 HTTP-01 挑战 —— 它必须能到达，绝不能跳转，一跳转
+//     Let's Encrypt 的验证就失败（而且是静默失败，很难查）。
+//  2. HTTP→HTTPS 重定向（该路由开了 TLS 且要求跳转）。
+//
+// 返回 true 表示这一关已经写好了响应（挑战已响应 / 已跳转）。
+func (a *App) handlePlaintext(rec *statusRecorder, r *http.Request, tbl *RouteTable, port int, blocked *string) bool {
+	if requestIsTLS(r) {
+		return false
+	}
+	if m := a.tlsmgr.Load(); m != nil && m.acme != nil {
+		// autocert 的 HTTPHandler 认识 /.well-known/acme-challenge/ 前缀
+		// 并直接响应，其余请求交给 fallback。传 nil fallback 之前先判前缀，
+		// 避免它为每个普通请求都掺一脚。
+		if strings.HasPrefix(r.URL.Path, acmeChallengePrefix) {
+			m.acme.HTTPHandler(nil).ServeHTTP(rec, r)
+			return true
+		}
+	}
+
+	// 该路由开了 TLS 且要求跳转 → 301 到 HTTPS
+	if rt := tbl.Match(port, r.Host, r.URL.Path); rt != nil && rt.wantsHTTPSRedirect() {
+		target := a.httpsRedirectURL(r)
+		rec.Header().Set("Location", target)
+		// 301 是永久重定向，浏览器会缓存。这里用 301 是因为「明文→HTTPS」
+		// 的策略确实不会来回变，让客户端把跳转记下来能省掉一次明文往返。
+		rec.WriteHeader(http.StatusMovedPermanently)
+		*blocked = "redirected_to_https"
+		a.metrics.IncRequest(rt.ID, http.StatusMovedPermanently)
+		return true
+	}
+	return false
+}
+
+// checkRouteACL 是第 1 关：路由级 IP 名单（白名单 + 黑名单）。
+// 全局黑名单已经在 checkGlobalDeny 判过，这里传 nil 跳过它，避免同一次请求算两遍。
+func (a *App) checkRouteACL(rec *statusRecorder, rt *Route, ip string, blocked *string) bool {
+	adec := decideIP(nil, rt.acl, ip, false)
+	if adec.Allowed {
+		return false
+	}
+	*blocked = adec.Reason
+	a.metrics.IncRejected(rt.ID, adec.Reason)
+	a.metrics.IncRequest(rt.ID, http.StatusForbidden)
+	writeJSON(rec, http.StatusForbidden, map[string]any{
+		"error":  "forbidden",
+		"route":  rt.ID,
+		"reason": adec.Reason,
+		"layer":  adec.Layer,
+	})
+	return true
+}
+
+// checkRateLimit 是第 2 关：限流。
+func (a *App) checkRateLimit(rec *statusRecorder, rt *Route, ip string, blocked *string) bool {
+	if rt.limiter == nil || rt.limiter.Allow(ip) {
+		return false
+	}
+	*blocked = "rate_limited"
+	a.metrics.IncRateLimited(rt.ID)
+	a.metrics.IncRequest(rt.ID, http.StatusTooManyRequests)
+	rec.Header().Set("Retry-After", "1")
+	writeJSON(rec, http.StatusTooManyRequests, map[string]any{
+		"error": "rate_limited",
+		"route": rt.ID,
+	})
+	return true
+}
+
+// checkCircuit 是第 3 关：熔断。后端已经不行了就别再打了，直接快速失败。
+func (a *App) checkCircuit(rec *statusRecorder, rt *Route, blocked *string) bool {
+	if rt.cb == nil || rt.cb.Allow() {
+		return false
+	}
+	*blocked = "circuit_open"
+	a.metrics.IncRejected(rt.ID, "circuit_open")
+	a.metrics.IncRequest(rt.ID, http.StatusServiceUnavailable)
+	retryAfter := rt.cb.cfg.OpenSecs
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	rec.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writeJSON(rec, http.StatusServiceUnavailable, map[string]any{
+		"error":       "circuit_open",
+		"route":       rt.ID,
+		"retry_after": retryAfter,
+	})
+	return true
+}
+
+// checkAuth 是第 4 关：认证。
+func (a *App) checkAuth(rec *statusRecorder, r *http.Request, rt *Route, blocked *string) bool {
+	if rt.auth == nil {
+		return false
+	}
+	claims, ok, reason := rt.auth.Authenticate(r)
+	if !ok {
+		*blocked = "auth_" + reason
+		rt.auth.WriteChallenge(rec)
+		a.metrics.IncRejected(rt.ID, "auth_"+reason)
+		a.metrics.IncRequest(rt.ID, http.StatusUnauthorized)
+		writeJSON(rec, http.StatusUnauthorized, map[string]any{
+			"error":  "unauthorized",
+			"route":  rt.ID,
+			"reason": reason,
+		})
+		return true
+	}
+	rt.auth.OnSuccess(r, claims)
+	return false
 }
 
 // logAccess 把一条访问记录同时送进内存环形缓冲和结构化日志。
