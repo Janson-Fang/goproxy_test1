@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import * as api from '../api'
 import { ApiError } from '../api'
-import type { IPListDef, Route } from '../types'
+import type { IPListDef, PortInfo, Route } from '../types'
 import { Badge, Card, ConfirmDialog, Empty, Note, Spinner, Switch, toast } from '../ui'
 import { usePolling } from '../hooks'
 import { ipListKindLabel, ms, normalizeIPRules, num } from '../format'
@@ -32,17 +32,22 @@ export function RoutesPage({
   // 两个接口一起读，避免出现「路由读到了新配置、名单表还是旧的」这种半新半旧的状态。
   const [lists, setLists] = useState<IPListDef[]>([])
   const [globalDenyN, setGlobalDenyN] = useState(0)
+  // 监听端口清单只用于「打开」入口拼地址：listen_port=0 的路由要从里面挑一个真实端口，
+  // 继承模式的协议（http/https）也按端口的实际 TLS 属性定。
+  const [ports, setPorts] = useState<PortInfo[]>([])
 
   const load = useCallback(async () => {
     try {
-      const [{ routes: list, revision }, { config }] = await Promise.all([
+      const [{ routes: list, revision }, { config }, portList] = await Promise.all([
         api.listRoutes(),
         api.getConfig(),
+        api.getPorts(),
       ])
       setRoutes(list)
       setRev(revision)
       setLists(config.ip_lists ?? [])
       setGlobalDenyN(normalizeIPRules(config.global_ip_deny).length)
+      setPorts(portList)
       // 管理端口只用于表单的前端校验（别把业务端口填成管理端口）
       const m = /:(\d+)$/.exec(config.admin_addr ?? '')
       setAdminPort(m ? Number(m[1]) : 0)
@@ -232,6 +237,7 @@ export function RoutesPage({
                     route={r}
                     lists={lists}
                     globalDenyN={globalDenyN}
+                    ports={ports}
                     busy={busy}
                     onToggle={(v) => void toggle(r, v)}
                     onEdit={() => setEditing({ route: r, isCreate: false })}
@@ -337,10 +343,136 @@ function AclCell({
   )
 }
 
+/**
+ * 「打开」入口的拼装结果。url 为空表示拼不出有意义的地址 —— 入口置灰，reason 写明原因。
+ *
+ * 拼的是**代理对外的地址**，不是 target：target 是内网后端，浏览器多半根本到不了。
+ * 管理台自己的 base 路径（/_goproxy/ui/）跟它没有任何关系，绝不能拼进去。
+ */
+export interface EntryTarget {
+  url: string | null
+  /** 置灰原因（url 为空时一定有） */
+  reason?: string
+  /** 拼地址时做过的假设。逐条进 tooltip —— 「能点但打开的不是想的那个」比不给更糟 */
+  assumed: string[]
+  /** 该路由带认证或 IP 限制，点了可能 401/403。提前告知，不算入口失败 */
+  guarded: boolean
+}
+
+export function buildEntryTarget(r: Route, ports: PortInfo[]): EntryTarget {
+  const guarded =
+    !!(r.auth && r.auth.mode && r.auth.mode !== 'none') || (r.acl?.lists ?? []).length > 0
+  const assumed: string[] = []
+
+  if (r.enabled === false) {
+    return { url: null, reason: '路由已停用', assumed, guarded }
+  }
+
+  // 域名。空 host 表示「任意域名」，按正在管理的这台机器拼是合理的猜测；
+  // 通配符猜不出具体子域，宁可不给也不要拿 www 之类去蒙。
+  let host = (r.host ?? '').trim()
+  if (host.includes('*')) {
+    return { url: null, reason: '通配域名没有可直接打开的地址，请改用具体子域访问', assumed, guarded }
+  }
+  if (!host) {
+    host = window.location.hostname
+    assumed.push(`路由不限定域名，按当前管理主机 ${host} 拼出`)
+  }
+  if (host.includes(':') && !host.startsWith('[')) host = `[${host}]` // IPv6 字面量
+
+  // 协议与端口。TLS 是按端口生效的：tls_mode 显式写死时以它为准；
+  // 留空（继承）时看那个端口实际是不是 TLS。listen_port=0 表示挂在所有端口上，
+  // 从 /ports 里挑一个性质匹配的真实端口。
+  const mode = (r.tls_mode ?? '').toLowerCase()
+  let scheme: string
+  let port = r.listen_port
+  if (mode === 'auto' || mode === 'manual') {
+    scheme = 'https'
+    if (port === 0) {
+      const p = ports.find((x) => x.tls)
+      if (!p) {
+        return { url: null, reason: '该路由走 HTTPS，但当前没有 TLS 监听端口', assumed, guarded }
+      }
+      port = p.port
+      assumed.push(`监听全部端口，按 TLS 端口 :${port} 拼出`)
+    }
+  } else if (mode === 'off') {
+    scheme = 'http'
+    if (port === 0) {
+      const p = ports.find((x) => !x.tls)
+      if (p) {
+        port = p.port
+        assumed.push(`监听全部端口，按明文端口 :${port} 拼出`)
+      }
+      // 没有明文端口时保持 0，走下面的默认端口兜底
+    }
+  } else if (port > 0) {
+    const info = ports.find((x) => x.port === port)
+    scheme = info?.tls ? 'https' : 'http'
+    if (!info) assumed.push(`端口 :${port} 当前未在监听，按明文拼出`)
+  } else {
+    const info = ports[0]
+    if (info) {
+      port = info.port
+      scheme = info.tls ? 'https' : 'http'
+      assumed.push(`监听全部端口，按 :${port}（${info.tls ? 'HTTPS' : '明文'}）拼出`)
+    } else {
+      scheme = 'http'
+      assumed.push('还没有任何监听端口，按默认端口拼出')
+    }
+  }
+
+  // new URL 负责 path 的转义；手动字符串拼接遇到空格、非 ASCII 会出静默坏地址
+  const u = new URL(`${scheme}://${host}`)
+  if (port > 0 && !((scheme === 'https' && port === 443) || (scheme === 'http' && port === 80))) {
+    u.port = String(port)
+  }
+  u.pathname = r.path_prefix || '/'
+  return { url: u.toString(), assumed, guarded }
+}
+
+/** 入口的 tooltip：完整地址（可复制）+ 假设 + 限制提示，或置灰原因。 */
+function entryTitle(t: EntryTarget): string {
+  const lines: string[] = []
+  if (t.url) lines.push(t.url)
+  if (t.reason) lines.push(t.reason)
+  lines.push(...t.assumed)
+  if (t.url && t.guarded) lines.push('该路由有认证或 IP 来源限制，打开可能返回 401/403')
+  return lines.join('\n')
+}
+
+/**
+ * 操作列里的「打开」入口。刻意用真实 <a> 而不是按钮 + window.open：
+ * 新标签、中键、右键复制链接地址、移动端长按菜单全是浏览器白送的；
+ * 置灰时去掉 href 加 aria-disabled，语义上它本来就不是一个「动作」。
+ */
+function EntryLink({ target }: { target: EntryTarget }) {
+  const label = `↗ 打开${target.guarded && target.url ? ' 🔒' : ''}`
+  if (!target.url) {
+    return (
+      <span className="btn ghost sm" aria-disabled="true" title={entryTitle(target)}>
+        {label}
+      </span>
+    )
+  }
+  return (
+    <a
+      className="btn ghost sm"
+      href={target.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={entryTitle(target)}
+    >
+      {label}
+    </a>
+  )
+}
+
 function RouteRow({
   route: r,
   lists,
   globalDenyN,
+  ports,
   busy,
   onToggle,
   onEdit,
@@ -351,6 +483,8 @@ function RouteRow({
   lists: IPListDef[]
   /** 全局黑名单条数。它对每条路由都生效，所以每一行都要标出来。 */
   globalDenyN: number
+  /** 当前监听端口，给「打开」入口拼地址用。 */
+  ports: PortInfo[]
   busy: boolean
   onToggle: (v: boolean) => void
   onEdit: () => void
@@ -360,6 +494,7 @@ function RouteRow({
   const tags = summarize(r)
   const cb = live?.circuit_breaker
   const disabled = r.enabled === false
+  const entry = buildEntryTarget(r, ports)
 
   return (
     <tr className={disabled ? 'disabled' : undefined}>
@@ -381,9 +516,22 @@ function RouteRow({
             {r.listen_port ? `:${r.listen_port}` : '全部端口'}
           </Badge>
           <Badge kind={r.host ? 'info' : 'muted'}>{r.host || '任意域名'}</Badge>
-          <span className="mono-sm" style={{ alignSelf: 'center' }}>
-            {r.path_prefix}
-          </span>
+          {entry.url ? (
+            <a
+              className="mono-sm entry-path"
+              style={{ alignSelf: 'center' }}
+              href={entry.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={entryTitle(entry)}
+            >
+              {r.path_prefix}
+            </a>
+          ) : (
+            <span className="mono-sm" style={{ alignSelf: 'center' }} title={entryTitle(entry)}>
+              {r.path_prefix}
+            </span>
+          )}
         </div>
       </td>
 
@@ -450,6 +598,7 @@ function RouteRow({
       </td>
 
       <td className="right nowrap">
+        <EntryLink target={entry} />
         <button className="btn ghost sm" onClick={onEdit} disabled={busy}>
           编辑
         </button>

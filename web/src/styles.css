@@ -361,7 +361,7 @@ code,
   white-space: nowrap;
   transition: background 0.12s, border-color 0.12s, opacity 0.12s;
 }
-.btn:hover:not(:disabled) {
+.btn:hover:not(:disabled):not([aria-disabled='true']) {
   background: color-mix(in srgb, var(--panel-2) 70%, var(--text) 8%);
   border-color: color-mix(in srgb, var(--border) 60%, var(--text));
 }
@@ -388,10 +388,16 @@ code,
   border-color: transparent;
   color: var(--text-dim);
 }
-.btn.ghost:hover:not(:disabled) {
+.btn.ghost:hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--panel-2);
   color: var(--text);
   border-color: var(--border-soft);
+}
+/* 置灰的「链接型按钮」（没有 href 的 <a>/<span>，:disabled 对它们不生效） */
+.btn[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+  text-decoration: none;
 }
 .btn.sm {
   padding: 3px 8px;
