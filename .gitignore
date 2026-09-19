@@ -16,3 +16,10 @@ __pycache__/
 goproxy.db
 goproxy.db-wal
 goproxy.db-shm
+
+# 升级模块在自己身边留下的中间文件与备份（见 upgrade.go）：
+# 跑一次升级就会出现，属于运行时状态，不该进仓库。
+goproxy.staged
+goproxy.staged.tar.gz
+goproxy.swap-old
+goproxy.old

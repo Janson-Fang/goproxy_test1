@@ -11,6 +11,7 @@ import { IPListPage } from './pages/IPListPage'
 import { CertsPage } from './pages/CertsPage'
 import { LogsPage } from './pages/LogsPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { UpgradePage } from './pages/UpgradePage'
 
 /**
  * 控制台的整体状态。
@@ -197,6 +198,11 @@ export default function App() {
         <button className="tab" aria-selected={tab === 'settings'} onClick={() => navigate('settings')}>
           配置
         </button>
+        {/* 升级排在最后：它是整套控制台里唯一会改动二进制文件本身的动作，
+            和「改一条路由」不是一个量级的操作，不该混在日常配置里。 */}
+        <button className="tab" aria-selected={tab === 'upgrade'} onClick={() => navigate('upgrade')}>
+          升级
+        </button>
       </nav>
 
       <main className="content">
@@ -227,6 +233,9 @@ export default function App() {
         </div>
         <div style={{ display: tab === 'settings' ? 'block' : 'none' }}>
           <SettingsPage onChanged={() => void refresh()} />
+        </div>
+        <div style={{ display: tab === 'upgrade' ? 'block' : 'none' }}>
+          <UpgradePage active={tab === 'upgrade'} />
         </div>
       </main>
 

@@ -46,7 +46,7 @@ export function usePolling(fn: () => void | Promise<void>, intervalMs: number, e
 
 // 顺序即左侧页签顺序。acl = 「IP 名单」页，紧挨 routes：
 // 名单决定的是「谁能进来」，和路由是同一条链路上的事。
-export const TAB_KEYS = ['dashboard', 'routes', 'acl', 'certs', 'logs', 'settings'] as const
+export const TAB_KEYS = ['dashboard', 'routes', 'acl', 'certs', 'logs', 'settings', 'upgrade'] as const
 export type TabKey = (typeof TAB_KEYS)[number]
 
 function readHash(): TabKey {

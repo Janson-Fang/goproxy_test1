@@ -475,3 +475,111 @@ export interface MutationResult {
   route?: Route
   deleted?: string
 }
+
+// ---------- 升级（upgrade.go / upgradefetch.go） ----------
+
+/**
+ * 运行时与升级能力。
+ *
+ * restart_strategy 是服务端告诉前端「换完二进制之后靠什么把新版本跑起来」：
+ *   reexec（Unix）：syscall.Exec 原地替换进程镜像，PID 不变，不依赖服务管理器
+ *   spawn   Windows：起一个新进程再退出旧进程（运行中的 exe 有独占锁，没法 exec）
+ *   unsupported 不能自升级，原因在 UpgradeState.reason 里
+ */
+export interface UpgradeRuntime {
+  version: string
+  commit: string
+  goos: string
+  goarch: string
+  exe: string
+  exe_dir: string
+  service: string
+  restart_strategy: 'reexec' | 'spawn' | 'unsupported' | string
+  /** 版本是不是 vX.Y.Z 形式：dev / 裸提交号无法与发布版本比大小 */
+  version_comparable: boolean
+}
+
+export interface UpgradeSource {
+  repo: string
+  mode: string
+  /** 已经排好优先级的下载通道，第一个是 direct */
+  channels: string[]
+  asset_name: string
+  sums_name: string
+}
+
+export interface UpgradeStaged {
+  present: boolean
+  path?: string
+  size?: number
+  sha256?: string
+  version?: string
+  commit?: string
+  mtime?: string
+  /** 服务端是否在本进程里验证过它（跑过 -version） */
+  verified: boolean
+  source?: string
+  channel?: string
+  sums_verified: boolean
+}
+
+export interface UpgradeBackup {
+  present: boolean
+  path?: string
+  size?: number
+  /** 备份自述的版本；文件不是能跑的 goproxy 时为空 */
+  version?: string
+  commit?: string
+  mtime?: string
+}
+
+export interface UpgradeAsset {
+  name: string
+  /** 0 表示拿不到大小（不是「文件是空的」） */
+  size: number
+  sha256?: string
+}
+
+export interface UpgradeCheck {
+  current: string
+  current_comparable: boolean
+  latest: string
+  latest_comparable: boolean
+  update_available: boolean
+  release_url: string
+  asset: UpgradeAsset
+  channel: string
+  /** 是否从发布方的 SHA256SUMS 拿到了校验和 */
+  sums_verified: boolean
+  checked_at: string
+  notes?: string
+}
+
+export interface UpgradeState {
+  runtime: UpgradeRuntime
+  supported: boolean
+  reason?: string
+  writable: boolean
+  source: UpgradeSource
+  staged: UpgradeStaged
+  backup: UpgradeBackup
+  busy: boolean
+  last_check?: UpgradeCheck
+}
+
+export interface UpgradeInstallResult {
+  ok: boolean
+  from: string
+  to: string
+  /** 最终装上去那个二进制的 sha256 */
+  sha256: string
+  /** 发布包（tar.gz）的 sha256，也就是校验和文件里那一个；上传源没有这个值 */
+  archive_sha256?: string
+  backup: string
+  restart: string
+  service: string
+  source: string
+  verified: boolean
+  channel?: string
+  sums_verified: boolean
+}

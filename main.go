@@ -68,6 +68,13 @@ type App struct {
 	writeMu sync.Mutex
 
 	accessLog atomic.Bool
+
+	// upgrade 是控制台「升级」页的后端状态：当前可执行文件、发布源、
+	// 以及一份等着被换上去的暂存二进制（实现见 upgrade.go）。
+	//
+	// 它是 App 上唯一会去改动「自己这个二进制文件」的东西，所以所有写动作
+	// 都串在它自己的 busy 标记里，并且只经管理接口触发。
+	upgrade *upgradeManager
 }
 
 func NewApp(configDB string) (*App, error) {
@@ -88,6 +95,7 @@ func NewApp(configDB string) (*App, error) {
 		logs:          newLogBuffer(logRingSize),
 		sessions:      newSessionStore(),
 		adminAccounts: empty,
+		upgrade:       newUpgradeManager(),
 	}, nil
 }
 
@@ -726,7 +734,12 @@ func serveAdminIndex(w http.ResponseWriter) {
 		"  /_goproxy/stats           聚合状态（指标 + 采样曲线 + 熔断计数）\n"+
 		"  /_goproxy/logs            最近访问记录  ?limit=N\n"+
 		"  /_goproxy/events          实时访问日志（SSE）\n"+
-		"  /_goproxy/reload          POST 手动重载配置\n")
+		"  /_goproxy/reload          POST 手动重载配置\n"+
+		"  /_goproxy/upgrade         GET 当前版本 / 升级能力 / 备份与暂存状态\n"+
+		"  /_goproxy/upgrade/check   POST 检查新版本（body 可省略，或 {\"version\":\"v0.9.1\"}）\n"+
+		"  /_goproxy/upgrade/upload  POST 上传二进制（multipart 的 file 字段，或直接把文件当请求体）\n"+
+		"  /_goproxy/upgrade/install POST {source:\"github\"|\"upload\", version?, sha256?, force?} 执行升级\n"+
+		"  /_goproxy/upgrade/rollback POST 回退到 <exe>.old（上一次升级前的版本）\n")
 }
 
 // handleCerts 返回所有证书的状态。
@@ -811,6 +824,16 @@ func (a *App) adminMux() *http.ServeMux {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ports": a.listeners.Ports()})
 	})
+	// ---------- 升级（实现见 upgrade.go / upgradefetch.go）----------
+	// 这是整套管理接口里唯一会改动**二进制文件本身**的一组，所以：
+	// 所有动作串行（upgradeManager.busy），每次动作写审计日志（谁触发的），
+	// 并且安装 / 回退在换文件之前一律先跑一次新二进制的 -version。
+	mux.HandleFunc("GET /_goproxy/upgrade", a.handleUpgradeState)
+	mux.HandleFunc("POST /_goproxy/upgrade/check", a.handleUpgradeCheck)
+	mux.HandleFunc("POST /_goproxy/upgrade/upload", a.handleUpgradeUpload)
+	mux.HandleFunc("POST /_goproxy/upgrade/install", a.handleUpgradeInstall)
+	mux.HandleFunc("POST /_goproxy/upgrade/rollback", a.handleUpgradeRollback)
+
 	// 这里刻意**不注册** "/" 兜底。兜底一旦放在 mux 里，它就会替所有拼错的
 	// 接口地址回 200，把 404 变成「看起来成功」。未知路径由 adminHandler 统一处置。
 	return mux

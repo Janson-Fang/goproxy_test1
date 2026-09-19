@@ -1004,6 +1004,57 @@ systemctl show -p ExecMainStartTimestamp goproxy                  # 重启时间
 服务重启后没起来，脚本会**以非 0 退出**并直接把回滚命令和 `journalctl` 查看方式打出来。
 可覆盖的环境变量还有 `SYSTEMD_DIR`（默认 `/etc/systemd/system`）和 `STATE_DIR`（默认 `/var/lib/goproxy`）。
 
+### 控制台里升级
+
+控制台的「升级」页把上面这套流程搬进了网页，**约定完全一致**：同一个仓库、同一份资源命名
+（`goproxy-<os>-<arch>.tar.gz` / `SHA256SUMS-<arch>.txt`）、同一批镜像通道、同一个回滚文件名
+（`goproxy.old`）。所以界面里装出来的东西和再跑一遍 `install.sh` 是同一个，排障时两种路子可以互换。
+
+两条更新源：
+
+| 来源 | 适合 |
+|---|---|
+| **GitHub Releases** | 常规升级。默认走 `Janson-Fang/goproxy_test1`，先直连、不通再依次试 `gh-proxy.com` / `ghfast.top` / `ghproxy.net` |
+| **上传文件** | 内网 / 离线。传 `goproxy` 二进制或发布用的 `.tar.gz` 都行（按文件头自动识别并解包） |
+
+```text
+GET  /_goproxy/upgrade           当前版本、升级能力、备份与暂存状态
+POST /_goproxy/upgrade/check     检查新版本（body 可省略，或 {"version":"v0.9.1"}）
+POST /_goproxy/upgrade/upload    上传二进制（multipart 的 file 字段，或直接把文件当请求体）
+POST /_goproxy/upgrade/install   {"source":"github"|"upload", "version":"", "sha256":"", "force":false}
+POST /_goproxy/upgrade/rollback  回退到 <exe>.old
+```
+
+几个刻意的行为：
+
+| 行为 | 为什么 |
+|---|---|
+| 换二进制之前先执行一次 `新文件 -version` | 校验和只能证明字节没坏，证明不了它能在这台机器上跑（下错架构的包哈希也是对的）。跑得起来才允许替换 |
+| 旧二进制先备份成 `<exe>.old` | 和 `install.sh` 同一个文件名，回滚命令可以直接照抄 |
+| 拿不到 `SHA256SUMS` 时**标出来**但继续 | 与 `install.sh` 保持一致；区别只在于界面和响应里会明说「未校验」，不是默默跳过 |
+| 下载到的二进制自述版本比发布 tag 还旧就拒绝 | 镜像缓存旧文件时的典型症状是「升级成功了但版本没变」，直接拦住比事后排查省事 |
+| 直连优先、镜像兜底，并且会放弃「连得上但龟速」的通道 | 和 `install.sh` 相同的取舍：镜像有缓存，刚发布的版本可能还拉不到 |
+| 响应写完再替换进程 | `syscall.Exec` 会把当前进程镜像整个换掉，先写响应才拿得到结果 |
+
+重启方式按平台自动选：Linux/macOS 用 `syscall.Exec` 原地替换（PID 不变，不依赖服务管理器）；
+Windows 起一个新进程再退出旧进程（这条路是**尽力而为**：新进程要等旧进程释放端口，万一没起来就手动重启一次（二进制已经换好了，界面上还有「回退上一版」）。
+
+> **能不能自升级由运行环境决定，界面上会直接说明原因。** 用 `go run` 起的实例、
+> 或二进制所在目录不可写（systemd 里最常见的是 `ReadWritePaths` 没带这个目录），
+> 升级页会显示为不可用并给出原因，而不是让人点一个注定失败的按钮。
+>
+> **容器里不建议开自升级**：容器内的文件系统是临时的，换掉容器里的二进制会被下次拉起镜像冲掉，
+> 正确做法是换镜像 tag。Docker 场景请继续用「上传文件」那条路临时救急，或直接改部署描述。
+
+可覆盖的环境变量（都只在服务端读）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `GOPROXY_UPGRADE_REPO` | `Janson-Fang/goproxy_test1` | 发布源仓库（`owner/name`） |
+| `GOPROXY_UPGRADE_MIRROR` | `auto` | `auto` / `direct` / 具体镜像前缀 |
+| `GOPROXY_UPGRADE_MIRRORS` | `https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/` | `auto` 模式下按顺序尝试的镜像 |
+| `GOPROXY_UPGRADE_GITHUB` | `https://github.com` | GitHub 基址（自建 / 企业版） |
+| `GOPROXY_UPGRADE_API` | `https://api.github.com` | 只用来兜底解析版本和取发布说明 |
 ### 版本号从哪来
 
 版本号不在源码里写死，编译时由 git 推导（`Makefile` 与 CI 用同一套规则）：正好打在 tag 上是 `v0.4.0`；

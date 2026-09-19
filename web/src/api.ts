@@ -28,6 +28,10 @@ import type {
   Route,
   SessionInfo,
   Stats,
+  UpgradeCheck,
+  UpgradeInstallResult,
+  UpgradeState,
+  UpgradeStaged,
 } from './types'
 
 const TOKEN_KEY = 'goproxy.admin_token'
@@ -468,4 +472,99 @@ export function openEventStream(handlers: EventStreamHandlers): () => void {
     stopped = true
     ctrl.abort()
   }
+}
+
+// ---------- 升级 ----------
+
+export async function getUpgradeState(): Promise<UpgradeState> {
+  const { data } = await raw<UpgradeState>('GET', '/_goproxy/upgrade')
+  return data
+}
+
+/**
+ * 检查新版本。version 留空表示「最新」。
+ *
+ * 服务端会顺带把发布方的 SHA256SUMS-<arch>.txt 拿下来当通道探针
+ * （几十字节，秒级判断哪条下载通道通），所以这次请求可能比别的接口慢一点。
+ */
+export async function checkUpgrade(version = ''): Promise<UpgradeCheck> {
+  const { data } = await raw<UpgradeCheck>('POST', '/_goproxy/upgrade/check', {
+    body: version ? { version } : {},
+  })
+  return data
+}
+
+/**
+ * 执行升级。服务端在响应之后会替换掉自己的进程，所以这个请求
+ * **成功返回不代表新版本已经在跑**：调用方应当接着轮询 getUpgradeState()
+ * 直到版本变化或服务恢复。
+ */
+export async function installUpgrade(req: {
+  source: 'github' | 'upload'
+  version?: string
+  sha256?: string
+  force?: boolean
+}): Promise<UpgradeInstallResult> {
+  const { data } = await raw<UpgradeInstallResult>('POST', '/_goproxy/upgrade/install', { body: req })
+  return data
+}
+
+/** 回退到上一次升级前的二进制（<exe>.old）。同样会触发进程替换。 */
+export async function rollbackUpgrade(): Promise<UpgradeInstallResult> {
+  const { data } = await raw<UpgradeInstallResult>('POST', '/_goproxy/upgrade/rollback', { body: {} })
+  return data
+}
+
+/**
+ * 上传一个二进制（或发布用的 tar.gz，服务端按文件头识别）。
+ *
+ * 刻意用 XHR 而不是 fetch：fetch 没有上传进度事件，而升级包有十几 MB
+ *  慢链路上「点了没反应」和「传到 60%」是完全不同的体验。
+ * XHR 的错误形态和 fetch 不一样（没有 res.ok），所以下面手工翻译成
+ * ApiError，让调用方看到的错误结构和其他接口一致。
+ */
+export function uploadUpgradeBinary(
+  file: File,
+  onProgress?: (loaded: number, total: number) => void,
+): Promise<UpgradeStaged> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData()
+    form.append('file', file, file.name)
+
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/_goproxy/upgrade/upload')
+    // 会话 Cookie 要显式带上：不带就是一个 401
+    xhr.withCredentials = true
+    const token = getToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total)
+      }
+    }
+    xhr.onerror = () =>
+      reject(new ApiError({ status: 0, code: 'network_error', message: '上传失败：连接中断' }))
+    xhr.onabort = () => reject(new ApiError({ status: 0, code: 'aborted', message: '上传已取消' }))
+    xhr.onload = () => {
+      let payload: { error?: string; message?: string } | null = null
+      try {
+        payload = xhr.responseText ? JSON.parse(xhr.responseText) : null
+      } catch {
+        payload = null
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(payload as unknown as UpgradeStaged)
+        return
+      }
+      reject(
+        new ApiError({
+          status: xhr.status,
+          code: payload?.error || `http_${xhr.status}`,
+          message: payload?.message || `上传失败：HTTP ${xhr.status}`,
+        }),
+      )
+    }
+    xhr.send(form)
+  })
 }
