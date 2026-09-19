@@ -66,35 +66,52 @@ export interface IPRule {
 export type RawIPRule = string | { cidr?: string; note?: string }
 
 /**
- * 一条路由上的 IP 名单。两份名单**可以并存**，这是 v0.7.0 与之前最大的不同
- * （以前是 mode 二选一，表达不出「只允许办公网、但把其中一台机器剔掉」）。
+ * 一条路由上的 IP 名单 —— 从 v0.8.0 起只是**引用**，规则本身在顶层的 ip_lists 里。
  *
- *   - allow 是白名单。**一旦配置就只有一个含义：只允许名单内的地址。**
- *     它是在收紧范围，不是在额外放行 —— 所以不存在「和黑名单谁优先」的问题。
- *   - deny 是黑名单。在白名单划定的范围内再剔掉若干地址；
- *     没配白名单时，就是从全部来源里剔掉这些地址。
+ * 为什么不再内联：同一段「办公网」以前要在每条路由里各写一遍，改一次要改 N 处，
+ * 漏一处就是某条路由的防护没跟上，而且肉眼看不出来。现在建一次、按名字引用。
  *
- * 完整判定顺序：全局黑名单 → 白名单已启用但未命中 → 本路由黑名单 → 放行。
+ * 引用到的多份名单按各自的 kind 落到两层，同层取并集：
+ *   ① 全局黑名单命中                 → 拒绝（顶层 global_ip_deny，不可豁免）
+ *   ② 引用了白名单，但一份都没命中   → 拒绝
+ *   ③ 引用的黑名单里任意一份命中     → 拒绝
+ *   ④ 放行
+ *
  * 后端实现见 acl.go 的 decideIP，前端只是照抄这个顺序做提示。
  */
 export interface RouteACLConfig {
   /**
-   * 类型是 RawIPRule 而不是 IPRule：写出去的条目要走字符串简写，
-   * 后端 IPRule.UnmarshalJSON 两种形态都收（同 ConfigPatch.global_ip_deny）。
+   * 引用到的名单名（就是 IPListDef.name）。一份都不引用 = 这条路由不做 IP 限制。
    *
-   * 显式的 null 表示「把这一侧清掉」。
+   * 显式的 null 表示「取消所有引用」。
    *
    * 这不是可有可无的讲究：PATCH 路由是「反序列化到现有路由上」的合并语义，
-   * 字段不出现就保持原值。控制台清空一份名单时必须显式写 null ——
-   * 否则界面上看着删干净了，磁盘上那份名单还在拦人。
+   * 字段不出现就保持原值。控制台取消全部引用时必须显式写 null ——
+   * 否则界面上看着清干净了，磁盘上那些引用还在拦人。
    */
-  allow?: RawIPRule[] | null
-  deny?: RawIPRule[] | null
+  lists?: string[] | null
+}
+
+/** 名单的角色。角色定义在名单上，不在引用点 —— 同一份名单在所有路由里角色一致。 */
+export type IPListKind = 'allow' | 'deny'
+
+/**
+ * 一份可复用的命名地址列表。
+ *
+ * name 既是对外的展示名，也是路由引用它的键，所以不能重名、不能带 / 和换行。
+ * rules 是原始形态（条目可能是字符串简写），读进来统一走 normalizeIPRules。
+ */
+export interface IPListDef {
+  name: string
+  kind: IPListKind | ''
+  rules?: RawIPRule[] | null
 }
 
 /** 命中测试里单层的判定结果。 */
 export interface ACLStep {
   layer: string
+  /** 这一层里具体命中的那份命名名单；全局黑名单命中、「整层没命中」时为空。 */
+  list?: string
   configured: boolean
   matched: boolean
   rule?: string
@@ -108,6 +125,8 @@ export interface ACLDecision {
   allowed: boolean
   /** 拦下它的那一层；放行时为空。 */
   layer?: string
+  /** 命中的那份命名名单。全局黑名单命中和「整层没命中」时为空。 */
+  list?: string
   /** 命中的具体规则与备注。 */
   rule?: string
   note?: string
@@ -321,6 +340,13 @@ export interface ConfigView {
    * （guardSelfLockout），会直接拒绝这类保存。
    */
   global_ip_deny: RawIPRule[] | null
+  /**
+   * 可复用的命名地址列表库。路由的白名单 / 黑名单都从这里引用。
+   *
+   * 「IP 名单」页签编辑它，路由表单读它来列出「可以勾选哪些名单」——
+   * 所以这个字段必须下发，不能只在名单页用。
+   */
+  ip_lists: IPListDef[] | null
 }
 
 export interface ConfigPatch {
@@ -336,6 +362,21 @@ export interface ConfigPatch {
    * 后端 IPRule.UnmarshalJSON 两种形态都收。
    */
   global_ip_deny?: RawIPRule[]
+  /**
+   * 名单库的**全量替换**。控制台总是把当前所有名单一起提交。
+   *
+   * 之所以是全量而不是按名字增量：增量要回答「改名的名单算新的还是旧的」，
+   * 那个问题从数据本身判断不出来，只能靠猜。
+   */
+  ip_lists?: IPListDef[]
+  /**
+   * 声明「哪份名单改了名」：{"旧名": "新名"}。
+   *
+   * 只在改名时需要。有了它，改名才能和引用改写合成一次原子写 ——
+   * 没有它的话「先删旧名再加新名」会让所有引用在中间态里悬空，
+   * 而悬空引用是硬错误，保存根本提交不下去。
+   */
+  ip_list_renames?: Record<string, string>
 }
 
 // ---------- 状态 ----------

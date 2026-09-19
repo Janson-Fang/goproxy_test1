@@ -4,6 +4,14 @@
   "access_log": true,
   "trusted_proxies": [],
 
+  "ip_lists": [
+    {
+      "name": "本机演示黑名单",
+      "kind": "deny",
+      "rules": [{ "cidr": "127.0.0.1", "note": "演示：把本机拉黑，用来观察拦截日志" }]
+    }
+  ],
+
   "routes": [
     {
       "id": "fallback",
@@ -81,12 +89,12 @@
     },
     {
       "id": "svc-acl",
-      "name": "服务G —— 8088 拒绝黑名单 IP（演示用，把 127.0.0.1 拉黑了）",
+      "name": "服务G —— 8088 引用黑名单（演示用，名单里把 127.0.0.1 拉黑了）",
       "listen_port": 8088,
       "host": "",
       "path_prefix": "/",
       "target": "http://127.0.0.1:9001",
-      "acl": { "deny": [{ "cidr": "127.0.0.1", "note": "演示：把本机拉黑，用来观察拦截日志" }] }
+      "acl": { "lists": ["本机演示黑名单"] }
     },
     {
       "id": "svc-cb",

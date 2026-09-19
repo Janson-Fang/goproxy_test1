@@ -547,6 +547,64 @@ func (a *App) guardSelfLockout(r *http.Request, next *Config) error {
 	return nil
 }
 
+// renameListRefs 把路由里的名单引用按 old→new 改写一遍。
+//
+// 为什么改名要由服务端改写引用、而不是让控制台自己两步走完：
+// 先删旧名再加新名会让所有引用在中间态里悬空，而悬空引用是硬错误
+// （validate 会拦），保存根本提交不下去 —— 用户会看到一个无法完成的操作。
+// 一次请求里「改名单名 + 改引用」才是原子的。
+//
+// 只做一次映射、不跟随链：{"A":"B","B":"C"} 会把引用 A 变成 B（而不是 C）。
+// 控制台一次改名只产生一个键值对，链式改名是手工编辑配置文件才可能出现的情况，
+// 与其猜用户想要哪一种，不如保持「一次映射」这个可预测的语义。
+func renameListRefs(routes []RouteConfig, renames map[string]string) {
+	for i := range routes {
+		acl := routes[i].ACL
+		if acl == nil {
+			continue
+		}
+		for j, ref := range acl.Lists {
+			name := strings.TrimSpace(ref)
+			to := strings.TrimSpace(renames[name])
+			if to == "" {
+				continue
+			}
+			acl.Lists[j] = to
+		}
+	}
+}
+
+// guardListInUse 拦住「删掉一份还被路由引用的名单」。
+//
+// 不这么做的话，删除会一路走到 validate 才被拦下，报的是「某条路由引用了
+// 不存在的名单」—— 用户看到的是「引用写错了」，而真正发生的是一次删除动作，
+// 两者的下一步操作完全不同（一个去改引用，一个去解除引用）。所以在这里
+// 用 409 list_in_use 明确说清是删除被挡了，并把在用的路由列出来。
+func guardListInUse(routes []RouteConfig, old, next []IPListDef) error {
+	keep := make(map[string]bool, len(next))
+	for _, d := range next {
+		keep[strings.TrimSpace(d.Name)] = true
+	}
+	usage := listUsage(routes)
+
+	// 按 old 的顺序检查，报错结果才稳定（map 遍历顺序是随机的，
+	// 一次删两份被引用的名单时，报哪一份不该每次都变）。
+	for _, d := range old {
+		name := strings.TrimSpace(d.Name)
+		if name == "" || keep[name] {
+			continue
+		}
+		if ids := usage[name]; len(ids) > 0 {
+			return &apiError{http.StatusConflict, "list_in_use", fmt.Sprintf(
+				"名单 %q 还被这些路由引用着，不能删除：%s。\n\n"+
+					"要删它，先去那些路由里取消勾选；如果只是想改个名字，直接用「改名」——"+
+					"改名会把所有引用一起改写，是安全的。",
+				name, strings.Join(ids, "、"))}
+		}
+	}
+	return nil
+}
+
 func isLoopbackAddr(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -912,6 +970,14 @@ func (a *App) handleACLTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 名单库先建起来。路由的引用要拿它来展开，构建失败说明配置本身坏了，
+	// 这时候报「名单库有问题」比报「某条路由有问题」更贴近事实。
+	listSet, err := NewIPListSet(cfg.IPLists)
+	if err != nil {
+		writeErr(w, badRequest("invalid_config", "ip_lists 配置有问题：%v", err))
+		return
+	}
+
 	var routeACL *ACL
 	routeName := ""
 	if id := strings.TrimSpace(in.RouteID); id != "" {
@@ -920,8 +986,8 @@ func (a *App) handleACLTest(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, notFound(id))
 			return
 		}
-		if routeACL, err = NewACL(cfg.Routes[i].ACL); err != nil {
-			writeErr(w, badRequest("invalid_config", "路由 %s 的名单配置有问题：%v", id, err))
+		if routeACL, err = resolveRouteACL(listSet, cfg.Routes[i]); err != nil {
+			writeErr(w, badRequest("invalid_config", "路由 %s 的名单引用有问题：%v", id, err))
 			return
 		}
 		routeName = cfg.Routes[i].Name
@@ -963,6 +1029,12 @@ type configView struct {
 	// 它不含任何秘密（就是把配置文件里那一栏原样回显），所以直接给出去。
 	GlobalIPDeny []IPRule `json:"global_ip_deny"`
 
+	// IPLists 是可复用的命名地址列表库，供「IP 名单」页签编辑。
+	// 路由表单也要用它来列出「可以勾选哪些名单」，所以这个字段必须下发。
+	//
+	// 这是**原始**形态（条目可能是字符串简写），前端统一走 normalizeIPRules 收口。
+	IPLists []IPListDef `json:"ip_lists"`
+
 	// AdminUsers 只给用户名，供界面展示「当前有哪些管理员」。
 	// 密码哈希绝不出现。
 	AdminUsers []string `json:"admin_users"`
@@ -998,6 +1070,7 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		AdminUsers:            names,
 		CredentialsConfigured: cfg.hasAdminCredentials(),
 		GlobalIPDeny:          cfg.GlobalIPDeny,
+		IPLists:               cfg.IPLists,
 	})
 }
 
@@ -1009,6 +1082,21 @@ type configPatch struct {
 	// GlobalIPDeny 用指针是为了区分「没提交这个字段」和「提交了一个空数组」：
 	// 前者保持原样，后者表示清空全局黑名单。
 	GlobalIPDeny *[]IPRule `json:"global_ip_deny"`
+
+	// IPLists 同理用指针：提交空数组表示「一份名单都不要了」。
+	//
+	// 这份是全量替换（不是逐个合并）。控制台总是把当前所有名单一起提交，
+	// 所以不需要按名字做增量 —— 那样反而要处理「改名的名单算新的还是旧的」这种
+	// 无法从数据本身判断的问题。
+	IPLists *[]IPListDef `json:"ip_lists"`
+
+	// IPListRenames 声明「哪份名单改了名」：{"旧名": "新名"}。
+	//
+	// 有了它，改名才能和引用改写合成一次原子写。没有它的话，「先删旧名再加新名」
+	// 这一步会让所有引用在中间态里悬空，而悬空引用是硬错误，保存根本提交不下去。
+	//
+	// 只在**改名**时需要；新增和删除都不用它。
+	IPListRenames map[string]string `json:"ip_list_renames"`
 }
 
 func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -1057,6 +1145,17 @@ func (a *App) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.GlobalIPDeny != nil {
 			cfg.GlobalIPDeny = *p.GlobalIPDeny
+		}
+		// 改名先只作用于**路由引用**；名单本身的名字由下面 IPLists 的全量替换决定。
+		// 顺序不能反：先把引用搬到新名字上，再换掉名单表，中间态才是自洽的。
+		if len(p.IPListRenames) > 0 {
+			renameListRefs(cfg.Routes, p.IPListRenames)
+		}
+		if p.IPLists != nil {
+			if err := guardListInUse(cfg.Routes, cfg.IPLists, *p.IPLists); err != nil {
+				return err
+			}
+			cfg.IPLists = *p.IPLists
 		}
 		return nil
 	})

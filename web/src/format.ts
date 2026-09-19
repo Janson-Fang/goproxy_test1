@@ -114,6 +114,20 @@ export function looksLikeCIDR(s: string): boolean {
 }
 
 /**
+ * 名单角色的中文名。
+ *
+ * 集中一处是因为它会同时出现在列表页、路由页、路由表单和提示语里 ——
+ * 各写一套的下场是同一个概念在不同页面上叫不同的名字。
+ */
+export function ipListKindLabel(kind: string | undefined | null): string {
+  if (kind === 'allow') return '白名单'
+  if (kind === 'deny') return '黑名单'
+  // 走到这里说明配置里的 kind 是别的值（后端校验会拦，前端只做兜底展示）——
+  // 与其显示成「黑名单」误导人，不如直说没认出来。
+  return '未指定角色'
+}
+
+/**
  * 拦截原因 → 中文说明。
  *
  * 后端把「IP 名单」这一层拆成了三个独立的标签（v0.7.0）。拆开是有必要的：

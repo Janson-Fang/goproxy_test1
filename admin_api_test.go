@@ -75,6 +75,10 @@ func newTestEnv(t *testing.T, adminToken string, extraRoute string) *testEnv {
   "default_ports": [%d],
   "admin_addr": "127.0.0.1:%d",
   %s
+  "ip_lists": [
+    {"name": "允许来源", "kind": "allow", "rules": ["10.0.0.0/8", "203.0.113.66"]},
+    {"name": "内网例外", "kind": "deny",  "rules": ["10.0.0.66"]}
+  ],
   "routes": [%s]
 }`, p[0], p[2], tokenField, routes)
 
@@ -871,7 +875,7 @@ func TestGlobalDenyBeatsAllRoutes(t *testing.T) {
 func TestACLTestEndpoint(t *testing.T) {
 	e := newTestEnv(t, testToken,
 		`{"id":"guarded","listen_port":0,"path_prefix":"/g","target":"http://127.0.0.1:1",
-		  "acl":{"allow":["10.0.0.0/8","203.0.113.66"],"deny":["10.0.0.66"]}}`)
+		  "acl":{"lists":["允许来源","内网例外"]}}`)
 
 	// 先配一条全局黑名单（封的地址与客户端无关，不会被自锁护栏挡下）
 	rr := patchGlobalDeny(t, e,
@@ -991,23 +995,159 @@ func TestACLTestEndpoint(t *testing.T) {
 // 上面 TestLegacyACLRejected 直接调了 rejectLegacyACL，这里走完整链路
 // （写一个旧格式的配置文件 → 启动），确保它在真实启动路径上确实生效。
 func TestLegacyACLBlocksStartup(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	legacy := `{
-	  "admin_addr": "127.0.0.1:19099",
-	  "routes": [{
-	    "id": "old", "path_prefix": "/", "target": "http://127.0.0.1:9000",
-	    "acl": {"mode": "allow", "cidrs": ["10.0.0.0/8"]}
-	  }]
-	}`
-	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+	cases := []struct {
+		name string
+		body string
+		want string // 报错里必须出现的迁移线索
+	}{
+		{"v0.6.x 的 mode+cidrs", `"acl": {"mode": "allow", "cidrs": ["10.0.0.0/8"]}`, "acl.lists"},
+		{"v0.7.x 的内联 allow", `"acl": {"allow": ["10.0.0.0/8"]}`, "ip_lists"},
+		{"v0.7.x 的内联 deny", `"acl": {"deny": ["10.0.0.0/8"]}`, "ip_lists"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			legacy := `{
+  "admin_addr": "127.0.0.1:19099",
+  "routes": [{
+    "id": "old", "path_prefix": "/", "target": "http://127.0.0.1:9000",
+    ` + c.body + `
+  }]
+}`
+			if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := loadConfig(path)
+			if err == nil {
+				t.Fatal("旧写法必须让加载失败，否则那份名单会静默失效")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("报错应当给出迁移映射（含 %q），实际：%v", c.want, err)
+			}
+		})
+	}
+}
+
+// readCfg 直接从磁盘读回配置。
+//
+// 断言写路径时读文件而不是看接口返回值：接口返回的 revision 只能证明
+// 「有东西被写下去了」，证明不了写下去的内容是什么。
+func readCfg(t *testing.T, e *testEnv) *Config {
+	t.Helper()
+	_, cfg, err := readConfigFile(e.path)
+	if err != nil {
+		t.Fatalf("读回配置失败: %v", err)
+	}
+	return cfg
+}
+
+// TestIPListLibraryWritePath 覆盖名单库的完整写路径：
+// 新建 → 被路由引用 → 改名（引用要跟着走）→ 删除被引用（必须被拒）→ 解除引用后删除。
+//
+// 改名那一段是重点。名单名就是引用键，改名如果不同时改写引用，所有引用会在
+// 中间态里悬空，而悬空引用过不了 validate —— 保存根本提交不下去，
+// 用户看到的是一个「怎么都做不完」的操作。
+func TestIPListLibraryWritePath(t *testing.T) {
+	e := newTestEnv(t, testToken, "")
+
+	rr := e.do(t, "PATCH", "/_goproxy/config",
+		`{"ip_lists":[{"name":"办公网","kind":"allow","rules":["10.0.0.0/8"]},
+		              {"name":"扫描源","kind":"deny","rules":["10.0.0.66"]}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("保存名单库失败: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// 列表要能被读回来 —— 路由表单正是靠它列出「可以勾选哪些名单」
+	rr = e.do(t, "GET", "/_goproxy/config", "")
+	var view struct {
+		IPLists []IPListDef `json:"ip_lists"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
 		t.Fatal(err)
 	}
-	_, err := loadConfig(path)
-	if err == nil {
-		t.Fatal("旧格式 acl.mode 必须让加载失败，否则白名单会静默失效")
+	if len(view.IPLists) != 2 || view.IPLists[0].Name != "办公网" || view.IPLists[0].Kind != IPListKindAllow {
+		t.Fatalf("GET /_goproxy/config 应当回传名单库，实际 %+v", view.IPLists)
 	}
-	if !strings.Contains(err.Error(), "acl.allow") {
-		t.Errorf("报错应当给出迁移映射，实际：%v", err)
+
+	rr = e.do(t, "PATCH", "/_goproxy/routes/seed", `{"acl":{"lists":["办公网","扫描源"]}}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("给路由挂名单失败: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// 被引用的名单不能删。这里必须是 409 list_in_use 并点名路由，
+	// 而不是让它一路走到 validate 报「引用了不存在的名单」——
+	// 后者会让用户以为是引用写错了，而真正发生的是一个删除动作，
+	// 两者的下一步操作完全不同。
+	rr = e.do(t, "PATCH", "/_goproxy/config",
+		`{"ip_lists":[{"name":"办公网","kind":"allow","rules":["10.0.0.0/8"]}]}`)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("删除被引用的名单应当 409，实际 %d %s", rr.Code, rr.Body.String())
+	}
+	var conflict struct{ Error, Message string }
+	json.Unmarshal(rr.Body.Bytes(), &conflict)
+	if conflict.Error != "list_in_use" {
+		t.Errorf("错误码应当是 list_in_use，实际 %q", conflict.Error)
+	}
+	if !strings.Contains(conflict.Message, "扫描源") || !strings.Contains(conflict.Message, "seed") {
+		t.Errorf("报错应当点名是哪份名单、被哪条路由用着，实际：%s", conflict.Message)
+	}
+	// 被拒之后磁盘上一个字都不能动
+	if cfg := readCfg(t, e); len(cfg.IPLists) != 2 {
+		t.Errorf("保存被拒后磁盘不应变化，实际 ip_lists=%+v", cfg.IPLists)
+	}
+
+	// 改名：提交新的名字表 + 声明 rename，服务端要把路由的引用一起改写
+	rr = e.do(t, "PATCH", "/_goproxy/config",
+		`{"ip_lists":[{"name":"办公网","kind":"allow","rules":["10.0.0.0/8"]},
+		              {"name":"爬虫","kind":"deny","rules":["10.0.0.66"]}],
+		  "ip_list_renames":{"扫描源":"爬虫"}}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("改名失败: %d %s", rr.Code, rr.Body.String())
+	}
+
+	cfg := readCfg(t, e)
+	if got := cfg.Routes[0].ACL.Lists; len(got) != 2 || got[1] != "爬虫" {
+		t.Fatalf("改名应当同步改写路由引用，实际 %v", got)
+	}
+	// 光看引用还不够：判定必须照旧生效，而且报出来的是新名字
+	rr = e.do(t, "GET", "/_goproxy/acl/test?ip=10.0.0.66&route_id=seed", "")
+	var hit struct {
+		Decision ACLDecision `json:"decision"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &hit)
+	if hit.Decision.Allowed || hit.Decision.List != "爬虫" {
+		t.Errorf("改名后黑名单仍应生效、并报出新名单名，实际 %+v", hit.Decision)
+	}
+
+	// 解除引用之后就能删了
+	rr = e.do(t, "PATCH", "/_goproxy/routes/seed", `{"acl":{"lists":["办公网"]}}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("改引用失败: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = e.do(t, "PATCH", "/_goproxy/config",
+		`{"ip_lists":[{"name":"办公网","kind":"allow","rules":["10.0.0.0/8"]}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("解除引用后应当能删除，实际 %d %s", rr.Code, rr.Body.String())
+	}
+	if cfg := readCfg(t, e); len(cfg.IPLists) != 1 {
+		t.Errorf("删除后应当只剩一份名单，实际 %+v", cfg.IPLists)
+	}
+}
+
+// TestIPListDeleteWithoutReferenceIsAllowed 单独钉住「没被引用就能删」。
+//
+// 与上一条相反的方向：如果删除被一律拒绝，用户就再也没法清理名单库了。
+// 拒绝的依据必须**只是**「还在被引用」，不能是「你提交的比原来少」。
+func TestIPListDeleteWithoutReferenceIsAllowed(t *testing.T) {
+	e := newTestEnv(t, testToken, "")
+	if rr := e.do(t, "PATCH", "/_goproxy/config",
+		`{"ip_lists":[{"name":"没人用的","kind":"deny","rules":["203.0.113.66"]}]}`); rr.Code != http.StatusOK {
+		t.Fatalf("新建失败: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := e.do(t, "PATCH", "/_goproxy/config", `{"ip_lists":[]}`); rr.Code != http.StatusOK {
+		t.Fatalf("删除没被引用的名单应当允许，实际 %d %s", rr.Code, rr.Body.String())
+	}
+	if cfg := readCfg(t, e); len(cfg.IPLists) != 0 {
+		t.Errorf("名单应当已清空，实际 %+v", cfg.IPLists)
 	}
 }

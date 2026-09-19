@@ -138,13 +138,20 @@ export function Note({
 export function Badge({
   kind = 'muted',
   dot,
+  title,
   children,
 }: {
   kind?: 'ok' | 'warn' | 'err' | 'info' | 'muted'
   dot?: boolean
+  /** 悬停提示。徽标位置太窄，放不下的解释走这里。 */
+  title?: string
   children: ReactNode
 }) {
-  return <span className={`badge ${kind}${dot ? ' dot' : ''}`}>{children}</span>
+  return (
+    <span className={`badge ${kind}${dot ? ' dot' : ''}`} title={title}>
+      {children}
+    </span>
+  )
 }
 
 export function Empty({ icon = '∅', text }: { icon?: string; text: ReactNode }) {

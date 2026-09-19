@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import * as api from '../api'
 import { ApiError } from '../api'
-import type { Route } from '../types'
+import type { IPListDef, Route } from '../types'
 import { Badge, Card, ConfirmDialog, Empty, Note, Spinner, Switch, toast } from '../ui'
 import { usePolling } from '../hooks'
-import { ms, num } from '../format'
+import { ipListKindLabel, ms, normalizeIPRules, num } from '../format'
 import { RouteForm, summarize } from './RouteForm'
 
 export function RoutesPage({
@@ -26,11 +26,26 @@ export function RoutesPage({
   const [onlyDisabled, setOnlyDisabled] = useState(false)
   const [adminPort, setAdminPort] = useState(0)
 
+  // 地址列表库与全局黑名单的条数。这一页要用它们做两件事：
+  //   ① 把每条路由引用的名单名翻译成「白名单 / 黑名单」显示出来；
+  //   ② 新建 / 编辑表单里列出「可以勾选哪些名单」。
+  // 两个接口一起读，避免出现「路由读到了新配置、名单表还是旧的」这种半新半旧的状态。
+  const [lists, setLists] = useState<IPListDef[]>([])
+  const [globalDenyN, setGlobalDenyN] = useState(0)
+
   const load = useCallback(async () => {
     try {
-      const { routes: list, revision } = await api.listRoutes()
+      const [{ routes: list, revision }, { config }] = await Promise.all([
+        api.listRoutes(),
+        api.getConfig(),
+      ])
       setRoutes(list)
       setRev(revision)
+      setLists(config.ip_lists ?? [])
+      setGlobalDenyN(normalizeIPRules(config.global_ip_deny).length)
+      // 管理端口只用于表单的前端校验（别把业务端口填成管理端口）
+      const m = /:(\d+)$/.exec(config.admin_addr ?? '')
+      setAdminPort(m ? Number(m[1]) : 0)
       setErr(null)
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
@@ -42,18 +57,6 @@ export function RoutesPage({
   useEffect(() => {
     void load()
   }, [load])
-
-  useEffect(() => {
-    api
-      .getConfig()
-      .then(({ config }) => {
-        const m = /:(\d+)$/.exec(config.admin_addr ?? '')
-        setAdminPort(m ? Number(m[1]) : 0)
-      })
-      .catch(() => {
-        /* 拿不到管理端口只是少一层前端校验，后端仍会拦 */
-      })
-  }, [])
 
   // 实时观测值由服务端每 5 秒同步一次，跟着它的节奏刷就够了。
   // 弹窗打开或正在提交时停掉：避免把用户正在编辑的那条路由的旧数据糊到界面上。
@@ -69,7 +72,16 @@ export function RoutesPage({
     return routes.filter((r) => {
       if (onlyDisabled && r.enabled !== false) return false
       if (!q) return true
-      return [r.id, r.name, r.host, r.path_prefix, r.target, String(r.listen_port)]
+      return [
+        r.id,
+        r.name,
+        r.host,
+        r.path_prefix,
+        r.target,
+        String(r.listen_port),
+        // 引用的名单名也算关键词：想找「哪几条路由用了办公网」时直接搜它
+        ...(r.acl?.lists ?? []),
+      ]
         .filter(Boolean)
         .some((v) => String(v).toLowerCase().includes(q))
     })
@@ -204,6 +216,7 @@ export function RoutesPage({
                   <th className="nowrap">匹配规则</th>
                   <th>后端</th>
                   <th className="nowrap">能力</th>
+                  <th className="nowrap">IP 名单</th>
                   <th className="right nowrap">请求</th>
                   <th className="right nowrap">拦截</th>
                   <th className="right nowrap">在途</th>
@@ -217,6 +230,8 @@ export function RoutesPage({
                   <RouteRow
                     key={r.id}
                     route={r}
+                    lists={lists}
+                    globalDenyN={globalDenyN}
                     busy={busy}
                     onToggle={(v) => void toggle(r, v)}
                     onEdit={() => setEditing({ route: r, isCreate: false })}
@@ -234,6 +249,7 @@ export function RoutesPage({
           initial={editing.route}
           isCreate={editing.isCreate}
           adminPort={adminPort}
+          lists={lists}
           busy={busy}
           onSubmit={(r) => void submit(r)}
           onCancel={() => setEditing(null)}
@@ -264,14 +280,77 @@ export function RoutesPage({
   )
 }
 
+/**
+ * 一条路由实际用着哪些名单。
+ *
+ * 单独做一列，是因为「这条路由到底受什么样的 IP 限制」在改造后不能只看一个
+ * 布尔值了：它取决于引用了哪几份名单，而每份名单的角色写在名单自己身上。
+ * 不把名字摆出来的话，改完名单还得回「IP 名单」页逐份核对谁引用了它。
+ *
+ * 全局黑名单也一起标出来 —— 它对**每条**路由都生效，是最容易被忘掉的一层：
+ * 有人查「为什么这条路由拒绝我」时，很可能压根没往全局名单上想。
+ */
+function AclCell({
+  route: r,
+  lists,
+  globalDenyN,
+}: {
+  route: Route
+  lists: IPListDef[]
+  globalDenyN: number
+}) {
+  const refs = (r.acl?.lists ?? []).filter(Boolean)
+  const byName = new Map(lists.map((d) => [d.name, d]))
+
+  return (
+    <div className="stack" style={{ gap: 4 }}>
+      {refs.length === 0 ? (
+        <span className="faint small">不限制来源</span>
+      ) : (
+        <div className="tag-list">
+          {refs.map((name) => {
+            const def = byName.get(name)
+            // 认不出角色通常意味着名单刚被删掉（配置里还有悬空引用）。
+            // 标成「名单缺失」而不是猜一个角色 —— 猜错会让人按错误的层去排查。
+            if (!def) {
+              return (
+                <Badge key={name} kind="err" title="配置里引用了这份名单，但它已经不存在了">
+                  缺失 {name}
+                </Badge>
+              )
+            }
+            const n = normalizeIPRules(def.rules).length
+            return (
+              <Badge key={name} kind={def.kind === 'allow' ? 'info' : 'warn'}>
+                {ipListKindLabel(def.kind)} {name} · {n}
+              </Badge>
+            )
+          })}
+        </div>
+      )}
+      <div className="faint small">
+        {globalDenyN > 0
+          ? `＋全局黑名单 ${globalDenyN} 条（始终生效）`
+          : '全局黑名单：未启用'}
+      </div>
+    </div>
+  )
+}
+
 function RouteRow({
   route: r,
+  lists,
+  globalDenyN,
   busy,
   onToggle,
   onEdit,
   onDelete,
 }: {
   route: Route
+  /** 地址列表库，用来把引用翻译成「白名单 / 黑名单」。 */
+  lists: IPListDef[]
+  /** 全局黑名单条数。它对每条路由都生效，所以每一行都要标出来。 */
+  globalDenyN: number
   busy: boolean
   onToggle: (v: boolean) => void
   onEdit: () => void
@@ -333,6 +412,10 @@ function RouteRow({
             ))}
           </div>
         )}
+      </td>
+
+      <td className="nowrap">
+        <AclCell route={r} lists={lists} globalDenyN={globalDenyN} />
       </td>
 
       <td className="right mono-sm">{num(live?.requests_total ?? 0)}</td>

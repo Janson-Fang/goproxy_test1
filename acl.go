@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 )
 
@@ -141,58 +142,223 @@ func (l *IPList) Len() int {
 	return len(l.entries)
 }
 
+/* ==================== 命名名单库 ==================== */
+
+// NamedList 是一份解析好的命名名单。
+type NamedList struct {
+	// Name 是名单名，也是路由引用它时用的键。
+	Name string
+	// Kind 是 IPListKindAllow / IPListKindDeny。
+	Kind string
+	// List 是解析好的规则集。Rules 为空时这里是 nil（Len() 算 0 条）。
+	List *IPList
+}
+
+// IPListSet 是解析好的名单库，供路由按名字引用。
+//
+// 为什么要有这一层、而不是让每条路由各自去 cfg.IPLists 里现查现解析：
+//   - 解析 CIDR 不便宜（每条规则一次 net.ParseCIDR），而一份名单通常被好几条
+//     路由引用，每条路由各解析一遍是纯重复劳动；
+//   - 更要紧的是「同一份名单在不同路由里得到不同的解析结果」这种事根本不该
+//     有可能发生。构建一次再分发，这个可能性从结构上就不存在了。
+type IPListSet struct {
+	byName map[string]NamedList
+}
+
+// NewIPListSet 解析配置里的名单库。defs 为空时返回一个空集合（不是 nil）——
+// 调用方不必为了「没有名单」多写一个分支。
+func NewIPListSet(defs []IPListDef) (*IPListSet, error) {
+	s := &IPListSet{byName: make(map[string]NamedList, len(defs))}
+	for i, d := range defs {
+		name := strings.TrimSpace(d.Name)
+		if name == "" {
+			return nil, fmt.Errorf("ip_lists[%d]: name 不能为空 —— 路由靠名字引用名单", i)
+		}
+		kind := strings.ToLower(strings.TrimSpace(d.Kind))
+		if kind != IPListKindAllow && kind != IPListKindDeny {
+			return nil, fmt.Errorf("ip_lists[%d] (%s): kind 必须是 %s|%s，当前 %q",
+				i, name, IPListKindAllow, IPListKindDeny, d.Kind)
+		}
+		l, err := NewIPList(d.Rules)
+		if err != nil {
+			return nil, fmt.Errorf("ip_lists[%d] (%s): %w", i, name, err)
+		}
+		s.byName[name] = NamedList{Name: name, Kind: kind, List: l}
+	}
+	return s, nil
+}
+
+// Len 返回名单份数。
+func (s *IPListSet) Len() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.byName)
+}
+
+// Names 返回全部名单名（未排序，调用方要稳定顺序请自行排序）。
+func (s *IPListSet) Names() []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, 0, len(s.byName))
+	for n := range s.byName {
+		out = append(out, n)
+	}
+	return out
+}
+
+// Resolve 把一条路由的引用展开成判定用的 ACL。
+//
+// refs 为空（或全是空白）时返回 (nil, nil)，表示这条路由不做 IP 限制。
+// 注意这与「引用了名单但它没拦住」是两件完全不同的事：nil 是「不设防」，
+// 而只要引用了任意一份白名单，就必须命中其中之一才放行。
+//
+// 重复引用同一个名字会被静默去重：一份名单引用两次和一次的结果完全一样，
+// 为此报错只会让用户去删一个无意义的重复项。
+func (s *IPListSet) Resolve(refs []string) (*ACL, error) {
+	// 允许 nil 接收者：写路径上有「配置里压根没有 ip_lists」这条分支，
+	// 那里 set 就是 nil。让它在这里退化成一个空集合，比要求每个调用点
+	// 都先判一次空要少一个漏判的机会（而漏判的表现是 panic）。
+	var byName map[string]NamedList
+	if s != nil {
+		byName = s.byName
+	}
+
+	acl := &ACL{}
+	seen := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		name := strings.TrimSpace(ref)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		nl, ok := byName[name]
+		if !ok {
+			// 走到这里说明配置文件绕过了 validate（比如手工改坏）。
+			// 报「不存在」而不是当成空名单：一条 allow 引用写错名字如果被当成
+			// 「空名单」，结果会是拒绝所有人（fail-closed，安全但满屏 403 且看不出原因）；
+			// 如果被当成「没配」，那就是静默放行所有人。两种都不能猜，只能报错。
+			return nil, fmt.Errorf("引用了不存在的名单 %q（%s）", name, s.describe())
+		}
+		if nl.Kind == IPListKindAllow {
+			if nl.List.Len() == 0 {
+				return nil, fmt.Errorf("白名单 %q 是空的：它一旦被引用就只有「只允许名单内的地址」"+
+					"一个含义，空名单会让这条路由拒绝所有请求", name)
+			}
+			acl.allow = append(acl.allow, nl)
+		} else {
+			acl.deny = append(acl.deny, nl)
+		}
+	}
+	if len(acl.allow) == 0 && len(acl.deny) == 0 {
+		return nil, nil
+	}
+	return acl, nil
+}
+
+// describe 生成「已定义的名单有：A、B」这样的说明，附在「引用了不存在的名单」后面。
+func (s *IPListSet) describe() string {
+	if s.Len() == 0 {
+		return "当前一份地址列表都没定义"
+	}
+	names := s.Names()
+	sort.Strings(names)
+	return "已定义的名单：" + strings.Join(names, "、")
+}
+
 /* ==================== 路由级名单 ==================== */
 
-// ACL 是一条路由上的 IP 名单：白名单与黑名单**并存**。
+// resolveRouteACL 把一条路由的 acl 引用展开成判定用的 ACL。
 //
-// 这是 v0.7.0 与之前最大的不同。v0.6.x 的 acl 只有 mode 二选一，
-// 想「只允许办公网、但把办公网里的一台机器剔掉」就表达不出来；
-// 现在 allow 负责收紧范围，deny 负责在范围内开例外。
+// 单独抽一层是因为「没引用任何名单」这个最常见的情况要返回 nil，
+// 而 nil 与「引用了、但一份都没拦住」在判定里是两件必须区分的事：
+// 前者不设防，后者在引用白名单时会直接拒绝所有人。
+func resolveRouteACL(set *IPListSet, rc RouteConfig) (*ACL, error) {
+	if rc.ACL == nil || len(rc.ACL.Lists) == 0 {
+		return nil, nil
+	}
+	return set.Resolve(rc.ACL.Lists)
+}
+
+// ACL 是一条路由**展开后**的名单：按角色分成两组，每组可以有多份命名名单。
+//
+// 组的语义（顺序即约定，见 decideIP）：
+//
+//	allow 组  白名单，负责划范围：至少命中组内某一份才继续往下走。
+//	          它是在收紧来源，不是在额外放行 —— 所以不存在「和黑名单谁优先」的问题。
+//	deny  组  黑名单，负责开例外：命中组内任意一份就拒绝。
+//
+// 一组可以有多份名单，取并集。这正是命名列表的价值所在：
+// 「只允许办公网 + 只允许内网跳板」是两条独立的名单，各自维护，
+// 一条路由同时引用它们，不必把两个网段抄进同一个地方。
 type ACL struct {
-	allow *IPList
-	deny  *IPList
+	allow []NamedList
+	deny  []NamedList
 }
 
-// NewACL 解析路由级名单。两边都没配时返回 nil，表示这条路由不做 IP 限制。
-func NewACL(c *RouteACLConfig) (*ACL, error) {
-	if c == nil {
-		return nil, nil
-	}
-	a, err := NewIPList(c.Allow)
-	if err != nil {
-		return nil, fmt.Errorf("acl.allow: %w", err)
-	}
-	d, err := NewIPList(c.Deny)
-	if err != nil {
-		return nil, fmt.Errorf("acl.deny: %w", err)
-	}
-	if a == nil && d == nil {
-		return nil, nil
-	}
-	return &ACL{allow: a, deny: d}, nil
-}
-
-// allowList / denyList 是 nil 安全的访问器。
+// allowLists / denyLists 是 nil 安全的访问器。
 //
-// 直接写 route.deny 在 route 为 nil 时会 panic —— 而 nil 恰好是最常见的
-// 情况（这条路由根本没配名单）。字段本身是 *IPList、方法也都处理了 nil 接收者，
+// 直接写 route.allow 在 route 为 nil 时会 panic —— 而 nil 恰好是最常见的
+// 情况（这条路由根本没引用任何名单）。切片本身就处理了 nil 接收者，
 // 但「从一个 nil 的 *ACL 上读字段」这一步就已经炸了。
-func (a *ACL) allowList() *IPList {
+func (a *ACL) allowLists() []NamedList {
 	if a == nil {
 		return nil
 	}
 	return a.allow
 }
 
-func (a *ACL) denyList() *IPList {
+func (a *ACL) denyLists() []NamedList {
 	if a == nil {
 		return nil
 	}
 	return a.deny
 }
 
-// hasAllow 报告是否配置了白名单（用于判定「要不要做未命中即拒绝」）。
-func (a *ACL) hasAllow() bool { return a.allowList() != nil }
+// hasAllow 报告是否引用了白名单（用于判定「要不要做未命中即拒绝」）。
+func (a *ACL) hasAllow() bool { return len(a.allowLists()) > 0 }
+
+// matchAny 在若干份名单里找第一条命中的，并带上是哪一份命中的。
+//
+// 返回值里的 NamedList 不能省：命中之后要在日志和命中测试里说清
+// 「是哪份名单拦的」。只说规则（10.0.0.0/8）在有多份名单时回答不了
+// 「我该去哪份名单里删掉它」。
+func matchAny(lists []NamedList, ip net.IP) (NamedList, IPMatch, bool) {
+	for _, nl := range lists {
+		if m, ok := nl.List.Match(ip); ok {
+			return nl, m, true
+		}
+	}
+	return NamedList{}, IPMatch{}, false
+}
+
+// describeLists 把「办公网」「公司内网」拼成一段可读文本。
+func describeLists(lists []NamedList) string {
+	parts := make([]string, 0, len(lists))
+	for _, nl := range lists {
+		parts = append(parts, "「"+nl.Name+"」")
+	}
+	return strings.Join(parts, "、")
+}
+
+// totalRules 是这几份名单一共多少条规则。
+func totalRules(lists []NamedList) int {
+	n := 0
+	for _, nl := range lists {
+		n += nl.List.Len()
+	}
+	return n
+}
+
+// groupDetail 生成名单组那一层的说明，比如「「办公网」共 12 条规则，未命中」。
+func groupDetail(lists []NamedList, miss string) string {
+	if len(lists) == 0 {
+		return "未引用"
+	}
+	return fmt.Sprintf("%s共 %d 条规则，%s", describeLists(lists), totalRules(lists), miss)
+}
 
 /* ==================== 判定 ==================== */
 
@@ -213,7 +379,11 @@ const (
 
 // ACLStep 是判定过程中一层的结果，只有命中测试会带上。
 type ACLStep struct {
-	Layer      string `json:"layer"`
+	Layer string `json:"layer"`
+	// List 是这一层里具体命中的那份命名名单；全局黑名单命中时为空。
+	// 「白名单没命中」这种整层性的结论也留空 —— 那一层可能有多份名单，
+	// 说成其中某一份会冤枉它。
+	List       string `json:"list,omitempty"`
 	Configured bool   `json:"configured"`
 	Matched    bool   `json:"matched"`
 	Rule       string `json:"rule,omitempty"`
@@ -232,6 +402,9 @@ type ACLDecision struct {
 
 	// 命中拦下的那一层；放行时为空。
 	Layer string `json:"layer,omitempty"`
+	// List 是命中的那份**命名名单**（v0.8.0 起名单有名字了）。
+	// 全局黑名单命中和「整层没配/没命中」时为空。
+	List string `json:"list,omitempty"`
 	// 命中的具体规则与它的备注。
 	Rule string `json:"rule,omitempty"`
 	Note string `json:"note,omitempty"`
@@ -248,9 +421,9 @@ type ACLDecision struct {
 
 // decideIP 是三层名单的唯一判定入口。顺序即约定，不可随意调整：
 //
-//	① 全局黑名单命中           → 拒绝，任何白名单都不能豁免
-//	② 白名单已配置且未命中     → 拒绝
-//	③ 路由黑名单命中           → 拒绝
+//	① 全局黑名单命中                        → 拒绝，任何白名单都不能豁免
+//	② 引用了白名单，但一份都没命中          → 拒绝
+//	③ 引用的黑名单里任意一份命中            → 拒绝
 //	④ 放行
 //
 // 为什么全局黑名单要放在最前面且不可豁免：它的典型用途是「发现攻击源，
@@ -260,6 +433,10 @@ type ACLDecision struct {
 // 为什么白名单在前、黑名单在后而不是二选一：两者的语义不冲突。
 // 白名单回答「范围有多大」，黑名单回答「范围内哪些要剔掉」。
 // 先判范围、再判例外，就不存在「谁优先」的歧义。
+//
+// ②③ 两层的名单是**取并集**的：多处引用同一层的多份名单，命中任意一份即算命中。
+// 所以「只允许办公网 + 只允许内网跳板」就是引用两份 allow 名单，
+// 各自维护、互不干扰，而不是把两个网段抄进同一个地方。
 //
 // trace 为 true 时填充 Steps，供命中测试展示；热路径传 false 以免
 // 每个请求都白建一个切片。
@@ -291,38 +468,40 @@ func decideIP(global *IPList, route *ACL, ipStr string, trace bool) ACLDecision 
 	addStep(ACLStep{Layer: layerGlobalDeny, Configured: global != nil, Matched: false,
 		Detail: listDetail(global, "未命中")})
 
-	// ② 白名单：只在配置了的时候才判。
-	// 没配白名单 = 不限制，绝不能理解成「空白名单放行谁都不行」。
-	if allow := route.allowList(); allow != nil {
-		if m, ok := allow.Match(ip); ok {
-			addStep(ACLStep{Layer: layerAllow, Configured: true, Matched: true,
-				Rule: m.Rule, Note: m.Note, Detail: "在白名单内，继续判黑名单"})
+	// ② 白名单：只在真的引用了的时候才判。
+	// 一份都没引用 = 不限制，绝不能理解成「空白名单放行谁都不行」。
+	if allow := route.allowLists(); len(allow) > 0 {
+		if nl, m, ok := matchAny(allow, ip); ok {
+			addStep(ACLStep{Layer: layerAllow, List: nl.Name, Configured: true, Matched: true,
+				Rule: m.Rule, Note: m.Note,
+				Detail: fmt.Sprintf("落在名单「%s」内，继续判黑名单", nl.Name)})
 		} else {
 			d.Allowed, d.Layer, d.Reason = false, layerAllow, reasonACLAllowMiss
-			d.Message = fmt.Sprintf("白名单已启用（%d 条规则），这个地址不在名单内。", allow.Len())
+			d.Message = fmt.Sprintf("白名单已启用（%s，共 %d 条规则），这个地址不在名单内。",
+				describeLists(allow), totalRules(allow))
 			addStep(ACLStep{Layer: layerAllow, Configured: true, Matched: false,
-				Detail: listDetail(allow, "未命中")})
+				Detail: groupDetail(allow, "未命中")})
 			d.Steps = steps
 			return d
 		}
 	} else {
 		addStep(ACLStep{Layer: layerAllow, Configured: false, Matched: false,
-			Detail: "未配置白名单，不限制来源"})
+			Detail: "未引用白名单，不限制来源"})
 	}
 
 	// ③ 路由黑名单
-	deny := route.denyList()
-	if m, ok := deny.Match(ip); ok {
-		d.Allowed, d.Layer, d.Rule, d.Note = false, layerDeny, m.Rule, m.Note
+	deny := route.denyLists()
+	if nl, m, ok := matchAny(deny, ip); ok {
+		d.Allowed, d.Layer, d.Rule, d.Note, d.List = false, layerDeny, m.Rule, m.Note, nl.Name
 		d.Reason = reasonACLRouteDeny
-		d.Message = fmt.Sprintf("命中本路由黑名单 %s%s。", m.Rule, noteSuffix(m.Note))
-		addStep(ACLStep{Layer: layerDeny, Configured: true, Matched: true,
+		d.Message = fmt.Sprintf("命中黑名单「%s」中的 %s%s。", nl.Name, m.Rule, noteSuffix(m.Note))
+		addStep(ACLStep{Layer: layerDeny, List: nl.Name, Configured: true, Matched: true,
 			Rule: m.Rule, Note: m.Note, Detail: "命中，判定结束"})
 		d.Steps = steps
 		return d
 	}
-	addStep(ACLStep{Layer: layerDeny, Configured: deny != nil, Matched: false,
-		Detail: listDetail(deny, "未命中")})
+	addStep(ACLStep{Layer: layerDeny, Configured: len(deny) > 0, Matched: false,
+		Detail: groupDetail(deny, "未命中")})
 
 	d.Allowed = true
 	d.Message = "三层名单都没有拦下这个地址。"

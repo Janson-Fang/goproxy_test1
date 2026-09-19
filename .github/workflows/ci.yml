@@ -153,56 +153,67 @@ jobs:
             SHA256SUMS-*.txt
           if-no-files-found: error
 
-  docker:
-    name: 构建镜像
-    needs: console
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 计算版本号
-        id: ver
-        run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - name: 登录 ghcr.io
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=sha,format=short
-
-      # 镜像里的前端资源来自提交好的 web/dist（.dockerignore 特意保留了它），
-      # 所以 Docker 构建不需要 Node，上面那个 console 任务已经保证产物是最新的。
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.ver.outputs.version }}
-            COMMIT=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  # ============================================================
+  # Docker 镜像任务：**暂时停用**（按需求停掉镜像构建，不再推 ghcr.io）。
+  #
+  # 整段注释掉而不是删除，恢复时把下面每一行开头的 "# " 去掉即可。
+  # 也可以改成「保留 job + 加 if 开关」（需要时改仓库变量就能恢复），
+  # 但注释更省事，且注释状态下这段不会被 Actions 解析、不会占额度。
+  #
+  # 停用不影响发布：release job 只 needs: build（见下面），
+  # 从来没有依赖过 docker。Dockerfile / docker-compose.yml 原样保留，
+  # 想自己构建镜像的话照着它们来就行。
+  # ------------------------------------------------------------
+  # docker:
+  #   name: 构建镜像
+  #   needs: console
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #
+  #     - name: 计算版本号
+  #       id: ver
+  #       run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+  #
+  #     - uses: docker/setup-qemu-action@v3
+  #     - uses: docker/setup-buildx-action@v3
+  #
+  #     - name: 登录 ghcr.io
+  #       if: github.event_name != 'pull_request'
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #
+  #     - uses: docker/metadata-action@v5
+  #       id: meta
+  #       with:
+  #         images: ghcr.io/${{ github.repository }}
+  #         tags: |
+  #           type=ref,event=branch
+  #           type=semver,pattern={{version}}
+  #           type=sha,format=short
+  #
+  #     # 镜像里的前端资源来自提交好的 web/dist（.dockerignore 特意保留了它），
+  #     # 所以 Docker 构建不需要 Node，上面那个 console 任务已经保证产物是最新的。
+  #     - uses: docker/build-push-action@v6
+  #       with:
+  #         context: .
+  #         platforms: linux/amd64,linux/arm64
+  #         push: ${{ github.event_name != 'pull_request' }}
+  #         tags: ${{ steps.meta.outputs.tags }}
+  #         labels: ${{ steps.meta.outputs.labels }}
+  #         build-args: |
+  #           VERSION=${{ steps.ver.outputs.version }}
+  #           COMMIT=${{ github.sha }}
+  #         cache-from: type=gha
+  #         cache-to: type=gha,mode=max
 
   release:
     name: 发布 Release

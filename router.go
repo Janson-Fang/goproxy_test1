@@ -192,6 +192,14 @@ func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable
 	}
 	t.globalDeny = globalDeny
 
+	// 名单库也只解析一次，之后每条路由按名字引用它。
+	// 顺序同样讲究：名单库建不起来（名字重复、kind 写错、CIDR 非法）就该在
+	// 这里直接失败，而不是让每条引用了它的路由各自报一次不同措辞的错。
+	listSet, err := NewIPListSet(cfg.IPLists)
+	if err != nil {
+		return nil, fmt.Errorf("ip_lists: %w", err)
+	}
+
 	for _, rc := range cfg.Routes {
 		if !rc.enabled() {
 			continue
@@ -246,7 +254,7 @@ func buildTable(cfg *Config, old *RouteTable, base *http.Transport) (*RouteTable
 			r.cbFP = fp
 		}
 
-		acl, err := NewACL(rc.ACL)
+		acl, err := resolveRouteACL(listSet, rc)
 		if err != nil {
 			return nil, fmt.Errorf("路由 %s: %w", r.ID, err)
 		}

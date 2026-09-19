@@ -3,6 +3,7 @@ import type {
   AuthMode,
   BasicAuthEntry,
   CBConfig,
+  IPListDef,
   JWTConfig,
   RateLimitScope,
   Route,
@@ -11,6 +12,7 @@ import type {
 } from '../types'
 import { Checkbox, Field, Modal, Note, Switch, toast } from '../ui'
 import {
+  ipListKindLabel,
   normalizeIPRules,
   pairList,
   parsePairs,
@@ -66,6 +68,14 @@ interface FormState {
   jwtAudience: string
   jwtLeeway: string
   jwtForward: string
+
+  /**
+   * 这条路由引用到的地址列表名（就是 IPListDef.name）。
+   *
+   * 规则本身不在这张表单里 —— 表单一律只放「引用哪几份」，
+   * 名单的内容在「IP 名单」页签维护。这样同一段网段只需要维护一处。
+   */
+  aclLists: string[]
 }
 
 function emptyForm(): FormState {
@@ -104,6 +114,7 @@ function emptyForm(): FormState {
     jwtAudience: '',
     jwtLeeway: '',
     jwtForward: '',
+    aclLists: [],
   }
 }
 
@@ -164,8 +175,9 @@ function fromRoute(r: Route): FormState {
     }
   }
 
-  // 名单（acl.allow / acl.deny）不在这张表单里编辑 —— 它们统一在「IP 名单」页签维护。
-  // 表单只是原样把 r.acl 带过去，见下面 toRoute 的说明。
+  // 名单只取「引用」，规则本身在「IP 名单」页签维护。
+  // 这里必须把已有的引用读全 —— PUT 是整条替换，读漏了就等于把人家配好的名单抹掉。
+  f.aclLists = (r.acl?.lists ?? []).filter((n) => typeof n === 'string' && n.trim() !== '')
 
   return f
 }
@@ -243,10 +255,10 @@ function toRoute(f: FormState): Route {
     route.auth = auth
   }
 
-  // 这里**故意不碰 route.acl**：名单已搬到「IP 名单」页签，表单读不到也写不了它。
-  // 而本表单保存走的是 PUT（整条替换，后端 handleReplaceRoute 直接
-  // `cfg.Routes[idx] = rc`），所以"不写"等于"清空"——调用方必须把原有的 acl
-  // 原样带回去，见 submit 里那句 route.acl = initial.acl。
+  // 名单引用。一份都没选就写 null 而不是省略 —— PATCH 是合并语义，
+  // 「不出现」等于「保持原值」；在这里省略会让用户取消勾选之后引用还在。
+  // 保存走 PUT（整条替换）时写 null 也是对的：那条路由就是不做 IP 限制了。
+  route.acl = f.aclLists.length > 0 ? { lists: [...f.aclLists] } : null
 
   return route
 }
@@ -355,12 +367,13 @@ function validate(f: FormState, isCreate: boolean, adminPort: number): Record<st
 
 /* ============ 组件 ============ */
 
-type TabKey = 'basic' | 'forward' | 'tls' | 'limit' | 'breaker' | 'guard'
+type TabKey = 'basic' | 'forward' | 'tls' | 'limit' | 'breaker' | 'guard' | 'ip'
 
 export function RouteForm({
   initial,
   isCreate,
   adminPort,
+  lists,
   busy,
   onSubmit,
   onCancel,
@@ -368,6 +381,8 @@ export function RouteForm({
   initial: Route | null
   isCreate: boolean
   adminPort: number
+  /** 当前可引用的地址列表。来自 /_goproxy/config 的 ip_lists。 */
+  lists: IPListDef[]
   busy: boolean
   onSubmit: (route: Route) => void
   onCancel: () => void
@@ -387,8 +402,8 @@ export function RouteForm({
   const submit = () => {
     setTouched(true)
     if (hasError) {
-      // 把用户直接送到第一个出错的页签，而不是让他在 6 个页签里找
-      const order: TabKey[] = ['basic', 'forward', 'tls', 'limit', 'breaker', 'guard']
+      // 把用户直接送到第一个出错的页签，而不是让他在 7 个页签里找
+      const order: TabKey[] = ['basic', 'forward', 'tls', 'limit', 'breaker', 'guard', 'ip']
       const where: Record<TabKey, string[]> = {
         basic: ['id', 'listen_port', 'path_prefix', 'target', 'timeout_ms', 'host'],
         forward: [],
@@ -396,6 +411,7 @@ export function RouteForm({
         limit: ['rlRps', 'rlBurst'],
         breaker: ['cbErrorRate', 'cbMinCalls', 'cbOpenSecs', 'cbHalfOpenCalls', 'cbWindowSecs'],
         guard: ['accounts', 'jwtSecret', 'jwtPublicKey', 'jwtAlgs'],
+        ip: [],
       }
       for (const t of order) {
         const keys = where[t]
@@ -407,20 +423,30 @@ export function RouteForm({
       toast('err', '还有必填项没填对，已跳到对应分组')
       return
     }
-    const route = toRoute(form)
-    // 关键的一行。名单不在这张表单里改，但保存走 PUT（整条替换），
-    // 不带过去就等于把人家在「IP 名单」页签配好的规则一起抹掉 ——
-    // 用户只是改了个超时时间，回来发现黑名单没了。
-    // 新建时 initial 为 null，保持 undefined 即可（新路由本来就没有名单）。
-    if (!isCreate && initial) route.acl = initial.acl ?? null
-    onSubmit(route)
+
+    // 引用的名单可能刚被别处删掉（表单开着的时候）。后端会拒，但那时弹窗已经关了；
+    // 在这里先拦一道，用户还能就地把勾去掉。
+    const known = new Set(lists.map((d) => d.name))
+    const gone = form.aclLists.filter((n) => !known.has(n))
+    if (gone.length > 0) {
+      setTab('ip')
+      toast('err', `引用的名单已经不存在了：${gone.join('、')}。请重新勾选。`)
+      return
+    }
+
+    onSubmit(toRoute(form))
   }
 
   const err = (k: string) => (touched ? errors[k] : undefined)
 
-  // 只用于「认证与 ACL」页签里那段只读回显：名单本身在「IP 名单」页签改。
-  const aclAllowN = normalizeIPRules(initial?.acl?.allow).length
-  const aclDenyN = normalizeIPRules(initial?.acl?.deny).length
+  // 已勾选的名单，拆成两组，回显在顶部提示里（也让「有没有配」一眼可见）。
+  const pickedAllow = form.aclLists.filter(
+    (n) => lists.find((d) => d.name === n)?.kind === 'allow',
+  )
+  const pickedDeny = form.aclLists.filter((n) => lists.find((d) => d.name === n)?.kind === 'deny')
+  const pickedUnknown = form.aclLists.filter((n) => !lists.some((d) => d.name === n))
+  const allowOptions = lists.filter((d) => d.kind === 'allow')
+  const denyOptions = lists.filter((d) => d.kind === 'deny')
 
   return (
     <Modal
@@ -465,31 +491,37 @@ export function RouteForm({
           aria-selected={tab === 'guard'}
           onClick={() => setTab('guard')}
         >
-          {/* 这一页签以前叫「认证与 ACL」。名单搬走之后叫 ACL 会把人引到
-              一个改不了名单的地方，所以改回「认证」，名单的去处在下面那段 Note 里。 */}
+          {/* 这一页签以前叫「认证与 ACL」。名单独立成「IP 名单」页签之后
+              再叫什么 ACL 只会把人引到一个改不了名单的地方，所以就叫「认证」。 */}
           认证{flag(form.authMode !== 'none')}
+        </button>
+        <button className="subtab" aria-selected={tab === 'ip'} onClick={() => setTab('ip')}>
+          名单{flag(form.aclLists.length > 0)}
         </button>
       </div>
 
       {/*
-        名单的编辑入口整体搬到了「IP 名单」页签，这里只留一句指路。
-        放在子页签**外面** —— 每一屏都能看到。放在某个子页签里等于没有：
-        有人打开这张表单本来就是来找名单的，他不会想到要去「认证」里翻。
+        名单的**内容**在「IP 名单」页签维护，这张表单只负责「引用哪几份」。
+        这段指路放在子页签**外面** —— 每一屏都能看到：有人打开这张表单本来是
+        想改名单内容的，他不会想到要去某个子页签里翻。
       */}
       <Note kind="info">
-        <b>IP 名单不在这张表单里。</b>
+        <b>名单的规则不在这张表单里，这里只挑用哪几份。</b>
         {isCreate ? (
-          <>这条路由会按「不做 IP 限制」创建，之后到「IP 名单」页签按路由加白名单 / 黑名单。</>
+          <>不选就是不做 IP 限制。名单本身要先到「IP 名单」页签建。</>
         ) : (
           <>
-            请到「IP 名单」页签维护。这条路由当前：
-            {aclAllowN > 0 ? ` 白名单 ${aclAllowN} 条` : ' 不限来源'}
-            {aclDenyN > 0 ? `，黑名单 ${aclDenyN} 条` : ''}。
-            在<b>这里</b>保存不会改动名单（表单会把原值原样带回去）。
+            当前引用：
+            {pickedAllow.length > 0 ? ` 白名单 ${pickedAllow.join('、')}` : ' 不限来源'}
+            {pickedDeny.length > 0 ? `，黑名单 ${pickedDeny.join('、')}` : ''}
+            {pickedUnknown.length > 0 ? `，以及已不存在的 ${pickedUnknown.join('、')}` : ''}。
+            要改规则内容（加减 IP），去「IP 名单」页签 —— 那里改一次，
+            所有引用它的路由一起生效。
           </>
         )}
         <br />
-        判定顺序固定为：全局黑名单 → 白名单 → 黑名单 → 放行；那一页带<b>命中测试</b>，可以拿个地址先试一次。
+        判定顺序固定为：全局黑名单 → 引用的白名单 → 引用的黑名单 → 放行；
+        那一页带<b>命中测试</b>，可以拿个地址先试一次。
       </Note>
 
       {tab === 'basic' && (
@@ -969,11 +1001,95 @@ export function RouteForm({
           )}
 
           {/*
-            名单的编辑入口整体搬到了「IP 名单」页签，指路的那段 Note 在子页签外面
-            （每屏都看得到）。这里不再重复一遍 —— 同一句话写两处，改的时候必然漏一处。
-            原来在这里的 trusted_proxies 提醒也跟着名单一起搬过去了：它讲的是
-            「名单看到的到底是哪个地址」，属于名单那一页的事。
+            trusted_proxies 的提醒跟着名单一起搬到了「IP 名单」页签：
+            它讲的是「名单看到的到底是哪个地址」，属于名单那一页的事。
           */}
+        </div>
+      )}
+
+      {tab === 'ip' && (
+        <div className="stack">
+          {lists.length === 0 ? (
+            <Note kind="warn">
+              还没有任何地址列表。名单的<b>内容</b>要到「IP 名单」页签里建 ——
+              那里可以新建名单、写规则、看每份名单被哪些路由用着。
+              这张表单只负责「引用哪几份」。
+            </Note>
+          ) : (
+            <>
+              <div className="faint small">
+                勾几份就用几份。同一层的多份名单取<b>并集</b>：
+                白名单命中其中任意一份就继续，黑名单命中任意一份就拒绝。
+                所以「只允许办公网 + 只允许内网跳板」就是勾两份白名单，
+                各自维护、互不干扰。
+              </div>
+
+              {[
+                { kind: 'allow' as const, opts: allowOptions, legend: '白名单（勾了就只剩一个含义：只允许名单内的地址）' },
+                { kind: 'deny' as const, opts: denyOptions, legend: '黑名单（把名单内的地址剔掉）' },
+              ].map(({ kind, opts, legend }) => (
+                <fieldset className="group" key={kind}>
+                  <legend>{legend}</legend>
+                  {opts.length === 0 ? (
+                    <div className="faint small">还没有{ipListKindLabel(kind)}类型的名单。</div>
+                  ) : (
+                    <div className="stack" style={{ gap: 10 }}>
+                      {opts.map((d) => {
+                        const rules = normalizeIPRules(d.rules)
+                        const preview = rules
+                          .slice(0, 2)
+                          .map((x) => x.cidr)
+                          .join('、')
+                        return (
+                          <Checkbox
+                            key={d.name}
+                            checked={form.aclLists.includes(d.name)}
+                            onChange={(v) =>
+                              set(
+                                'aclLists',
+                                v
+                                  ? [...form.aclLists, d.name]
+                                  : form.aclLists.filter((n) => n !== d.name),
+                              )
+                            }
+                            label={
+                              <>
+                                <code>{d.name}</code>
+                                <span className="faint small"> · {rules.length} 条规则</span>
+                                {preview && (
+                                  <span className="faint small">
+                                    {' '}
+                                    · {preview}
+                                    {rules.length > 2 ? ' 等' : ''}
+                                  </span>
+                                )}
+                              </>
+                            }
+                          />
+                        )
+                      })}
+                    </div>
+                  )}
+                </fieldset>
+              ))}
+
+              {pickedUnknown.length > 0 && (
+                <Note kind="err">
+                  这条路由引用了<b>已经不存在的名单</b>：{pickedUnknown.join('、')}。
+                  它们大概是在「IP 名单」页签里被删掉了 —— 取消勾选（或重新建一份同名的）
+                  之后才能保存。
+                </Note>
+              )}
+
+              <Note kind="info">
+                不勾任何一份 = 这条路由<b>不做 IP 限制</b>（但全局黑名单仍然管着它）。
+                <br />
+                想改某份名单里到底封了哪些地址，去「IP 名单」页签 ——
+                在那里改一次，所有引用它的路由一起生效，
+                不用回来逐条路由重勾。
+              </Note>
+            </>
+          )}
         </div>
       )}
     </Modal>
@@ -986,13 +1102,9 @@ export function summarize(r: Route): string[] {
   if (r.rate_limit) tags.push(`限流 ${r.rate_limit.rps}/s`)
   if (r.circuit_breaker) tags.push(`熔断 ${Math.round((r.circuit_breaker.error_rate ?? 0) * 100)}%`)
   if (r.auth && r.auth.mode && r.auth.mode !== 'none') tags.push(`认证 ${r.auth.mode}`)
-  if (r.acl) {
-    const allow = normalizeIPRules(r.acl.allow).length
-    const deny = normalizeIPRules(r.acl.deny).length
-    if (allow > 0 && deny > 0) tags.push(`名单 白${allow}/黑${deny}`)
-    else if (allow > 0) tags.push(`白名单 ${allow}`)
-    else if (deny > 0) tags.push(`黑名单 ${deny}`)
-  }
+  // 名单不在这里列：路由表有**专门的「IP 名单」列**显示引用了哪几份
+  // （要带上白/黑角色和全局黑名单是否生效）。同一件事写两处，
+  // 改的时候必然漏一处，而且两处措辞会慢慢分叉。
   return tags
 }
 

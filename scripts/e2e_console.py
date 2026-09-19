@@ -603,19 +603,32 @@ def run_auth_section(tmp, bins):
 
 
 def run_acl_section(cfg_path):
-    """三层 IP 名单与命中测试的端到端验证。
+    """三层 IP 名单、命名地址列表库与命中测试的端到端验证。
 
     v0.7.0 把原来「mode 二选一」的路由级 ACL 换成了三份可以并存的名单：
     全局黑名单（对所有入口生效，含管理端口）→ 路由白名单 → 路由黑名单。
     光看配置列表推不出结果，所以配套做了个只读的命中测试接口。
 
+    v0.8.0 又把「每条路由各写一份名单」换成了「顶层 ip_lists 集中定义、
+    路由按名字引用」。引用关系带来了三件必须有断言兜住的新事：
+      · 改名必须连带改写所有引用，否则引用会悬空（悬空引用是硬错误）；
+      · 还被引用着的名单不许删，要报 409 list_in_use 并点名是哪条路由；
+      · 解除引用之后可以删。
+    判定结果现在还多带一个「命中的是哪份名单」（decision.list）——
+    多份名单并存时，只说规则（10.0.0.0/8）回答不了「我该去哪份名单里删掉它」。
+
     断言分两类，缺一不可：
-      · 判定类 —— 走 /_goproxy/acl/test，能精确到「被哪一层、哪条规则拦下」，
+      · 判定类 —— 走 /_goproxy/acl/test，能精确到「被哪一层、哪份名单、哪条规则拦下」，
         以及层级顺序（全局优先、白名单优先于黑名单）；
       · 落地类 —— 把名单配到真实配置里再从真实端口打过去，确认 403 真的发生。
     只做前者会漏掉「判定对了但请求管线没接上」；
     只做后者则只能看到 403，看不出是哪一层拦的。
     """
+    # 响应体是 bytes，而错误信息里是中文 —— Python 的 bytes 字面量只允许 ASCII，
+    # 所以想断言中文文案时得自己 encode 一次。
+    def inbody(text):
+        return text.encode("utf-8") in b
+
     print("\n== 11. 三层 IP 名单与命中测试 ==")
 
     # 命中测试要求填单个 IP（不是 CIDR）：它要回答「这个具体的来源会怎样」，
@@ -626,9 +639,15 @@ def run_acl_section(cfg_path):
     check("命中路由黑名单 -> 拒绝", dec["allowed"] is False, str(dec))
     check("  原因细分为 acl_route_deny", dec.get("reason") == "acl_route_deny", str(dec.get("reason")))
     check("  层名是「黑名单」", dec.get("layer") == "黑名单", str(dec.get("layer")))
+    check("  带出命中的是哪份名单", dec.get("list") == "本机演示黑名单", str(dec.get("list")))
     check("  带出命中的规则", dec.get("rule") == "127.0.0.1", str(dec.get("rule")))
     check("  带出条目备注（回答「当初为什么封它」）",
           bool(dec.get("note")), str(dec.get("note")))
+    # 给人看的那句话要同时说清「哪份名单」和「哪条规则」——
+    # 只说规则的话，多份名单并存时用户不知道该去改哪一份。
+    check("  文案里点明名单名与规则",
+          "本机演示黑名单" in dec.get("message", "") and "127.0.0.1" in dec.get("message", ""),
+          str(dec.get("message")))
 
     steps = dec.get("steps") or []
     check("  回放全部三层判定", len(steps) == 3, str(steps))
@@ -637,6 +656,8 @@ def run_acl_section(cfg_path):
           str([s.get("layer") for s in steps]))
     check("  全局黑名单未配置时不参与拦截",
           steps and steps[0].get("configured") is False, str(steps[:1]))
+    check("  命中的那一层带出名单名（供界面直接定位）",
+          steps and steps[2].get("list") == "本机演示黑名单", str(steps[-1:]))
 
     # 没配任何名单的路由必须放行 —— 「没配」和「配了空白名单」是两件事，
     # 后者是配置错误（validate 会拒），前者是完全不限制。
@@ -697,16 +718,78 @@ def run_acl_section(cfg_path):
     # config.json 里每条规则都撑成 {"cidr": …}，配置文件不再是给人读的。
     check("  没备注的条目回写成字符串简写", gd[1] == "203.0.113.99", str(gd[1:2]))
 
-    # 给 svc-a 配一条白名单，让 203.0.113.66 同时出现在「白名单内」和「全局黑名单里」。
+    # ---- 命名地址列表库：新建 / 校验 / 改名 / 删除 ----
+    #
+    # v0.8.0 起名单不再内联写在路由里，而是集中定义在顶层 ip_lists、路由按名字引用。
+    # 引用关系带来三件必须验的事：改名要连带改写引用、被引用的名单不许删、
+    # 解除引用之后可以删。这一节就是围着这三件事建的。
+    st, _h, b = get("/_goproxy/config")
+    base_lists = json.loads(b).get("ip_lists") or []
+    check("配置里能读到 ip_lists 名单库",
+          isinstance(base_lists, list) and len(base_lists) >= 1, str(base_lists))
+
+    built = base_lists + [
+        {"name": "e2e 白名单A", "kind": "allow",
+         "rules": [{"cidr": "203.0.113.66", "note": "e2e 白名单"}]},
+        {"name": "e2e 内网段", "kind": "allow", "rules": ["10.0.0.0/8"]},
+        {"name": "e2e 内部例外", "kind": "deny",
+         "rules": [{"cidr": "10.0.0.5", "note": "e2e 内部例外"}]},
+    ]
+    st, _h, b = post("/_goproxy/config", {"ip_lists": built}, method="PATCH")
+    check("新建三份名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:300]))
+
+    st, _h, b = get("/_goproxy/config")
+    got = {d["name"]: d for d in (json.loads(b).get("ip_lists") or [])}
+    check("  三份都存进去了",
+          all(n in got for n in ("e2e 白名单A", "e2e 内网段", "e2e 内部例外")),
+          str(sorted(got)))
+    # 角色（白/黑）记在名单自己身上，路由那边只管引用。
+    # 若把角色写在引用点上，同一份名单被两条路由引用就可能一处当白、一处当黑，
+    # 「这份名单到底什么意思」就没有唯一答案了。
+    check("  角色（allow/deny）记在名单上，不在引用点上",
+          got.get("e2e 白名单A", {}).get("kind") == "allow"
+          and got.get("e2e 内部例外", {}).get("kind") == "deny",
+          str(sorted((n, d.get("kind")) for n, d in got.items())))
+
+    # 空的黑名单只是什么都不禁，放行。
+    st, _h, b = post("/_goproxy/config",
+                     {"ip_lists": built + [{"name": "e2e 空黑名单", "kind": "deny", "rules": []}]},
+                     method="PATCH")
+    check("空的黑名单 -> 允许保存（它只是什么都不禁）",
+          st == 200, "实际 %s :: %s" % (st, b[:250]))
+
+    # 空的白名单不行：它一旦被引用就只剩「只允许名单内的地址」一个含义，
+    # 结果是把引用它的路由整个封死。这是配置事故，不是意图，必须在写盘前拦下。
+    st, _h, b = post("/_goproxy/config",
+                     {"ip_lists": built + [{"name": "e2e 空白名单", "kind": "allow", "rules": []}]},
+                     method="PATCH")
+    check("空的白名单 -> 400 拒绝", st == 400 and b"invalid_config" in b,
+          "实际 %s :: %s" % (st, b[:250]))
+    st, _h, b = get("/_goproxy/config")
+    check("  被拒后名单库里没有它（没落盘）",
+          "e2e 空白名单" not in {d["name"] for d in (json.loads(b).get("ip_lists") or [])},
+          str(json.loads(b).get("ip_lists")))
+
+    # 把上面那份临时空黑名单收掉，后面改名/删除用到的名单集合才是确定的。
+    st, _h, b = post("/_goproxy/config", {"ip_lists": built}, method="PATCH")
+    check("  撤回临时名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:250]))
+
+    # 让 svc-a 引用「e2e 白名单A」，于是 203.0.113.66 同时落在
+    # 「引用的白名单内」和「全局黑名单里」—— 正好验层级顺序。
     st, h, b = get("/_goproxy/routes")
     etag = hdr(h, "ETag")
-    st, h, b = post(
-        "/_goproxy/routes/svc-a",
-        {"acl": {"allow": [{"cidr": "203.0.113.66", "note": "e2e 白名单"}]}},
-        method="PATCH",
-        headers={"If-Match": etag},
-    )
-    check("给路由配白名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+    st, h, b = post("/_goproxy/routes/svc-a", {"acl": {"lists": ["e2e 白名单A"]}},
+                    method="PATCH", headers={"If-Match": etag})
+    check("路由按名字引用一份名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:250]))
+
+    # 引用不存在的名单必须被拦下 —— 把它当成「不限制来源」就是一次无声的放行。
+    st, h, b = get("/_goproxy/routes")
+    etag = hdr(h, "ETag")
+    st, h, b = post("/_goproxy/routes/svc-a", {"acl": {"lists": ["e2e 查无此单"]}},
+                    method="PATCH", headers={"If-Match": etag})
+    check("引用不存在的名单 -> 400 拒绝",
+          st == 400 and inbody("查无此单") and inbody("e2e"),
+          "实际 %s :: %s" % (st, b[:300]))
 
     st, h, b = post("/_goproxy/acl/test", {"ip": "203.0.113.66", "route_id": "svc-a"})
     dec = json.loads(b)["decision"]
@@ -714,6 +797,10 @@ def run_acl_section(cfg_path):
     check("  原因是 acl_global_deny，不是白名单没命中",
           dec.get("reason") == "acl_global_deny", str(dec.get("reason")))
     check("  层名是「全局黑名单」", dec.get("layer") == "全局黑名单", str(dec.get("layer")))
+    # 全局黑名单是独立的一份、没有名字，所以这一层命中时不该报出名单名。
+    # 若这里冒出一个名字，说明判定把全局层和路由层的数据混在一起了。
+    check("  全局层不报「哪份名单」（它没有名字）",
+          not dec.get("list"), str(dec.get("list")))
 
     # 反证：把同一个地址从全局黑名单里摘掉，它在同一条路由上就放行了。
     # 没有这一步，上一条可能只是「白名单没生效」造成的假象。
@@ -727,34 +814,99 @@ def run_acl_section(cfg_path):
     check("不在全局黑名单、但在白名单内 -> 放行",
           json.loads(b)["decision"]["allowed"] is True, b[:200])
 
-    # 白名单一旦配置，名单外的地址就该被拒 —— 这是「收紧范围」而不是「额外放行」。
+    # 白名单一旦被引用，名单外的地址就该被拒 —— 这是「收紧范围」而不是「额外放行」。
     st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1", "route_id": "svc-a"})
     dec = json.loads(b)["decision"]
     check("白名单里的地址之外 -> 拒绝", dec["allowed"] is False, str(dec))
     check("  原因是 acl_route_allow_miss", dec.get("reason") == "acl_route_allow_miss", str(dec.get("reason")))
     check("  层名是「白名单」", dec.get("layer") == "白名单", str(dec.get("layer")))
+    # 「整层没命中」不该说成是某一份名单拦的 —— 那一层可能有好几份名单，
+    # 点其中一份的名会冤枉它。
+    check("  整层未命中时不报具体名单", not dec.get("list"), str(dec.get("list")))
+    # 但 steps 里要说清这一层有哪些名单、共几条规则，否则用户只看到「未命中」，
+    # 不知道该往哪份名单里加地址。
+    allow_step = [s for s in dec.get("steps") or [] if s.get("layer") == "白名单"]
+    check("  steps 里白名单层列明引用了哪几份名单",
+          allow_step and "「e2e 白名单A」" in allow_step[0].get("detail", ""),
+          str(allow_step))
 
-    # 两份名单并存：allow=10.0.0.0/8 里单独剔掉 10.0.0.5。
-    # 这正是旧版 mode 二选一表达不出来的配置。
+    # ---- 改名：必须连带改写引用，而且是一次原子写 ----
+    #
+    # 若拆成「先删旧名、再加新名」两步，中间态里所有引用都悬空，
+    # 而悬空引用是硬错误 —— 保存根本提交不下去，用户会碰到一个无法完成的操作。
+    renamed_to = "e2e 白名单A（改名后）"
+    renamed = [dict(d, name=renamed_to) if d["name"] == "e2e 白名单A" else d for d in built]
+    st, _h, b = post("/_goproxy/config",
+                     {"ip_lists": renamed, "ip_list_renames": {"e2e 白名单A": renamed_to}},
+                     method="PATCH")
+    check("改名（一次请求里连带改写引用）-> 200", st == 200, "实际 %s :: %s" % (st, b[:300]))
+
+    st, _h, b = get("/_goproxy/routes")
+    refs = None
+    for r in json.loads(b) or []:
+        if r.get("id") == "svc-a":
+            refs = (r.get("acl") or {}).get("lists")
+    check("  路由里的引用被一起改写成了新名字", refs == [renamed_to], str(refs))
+
+    # 引用改了名，判定行为必须一模一样 —— 否则「改名成功但生效的名单换了」
+    # 是一类只能靠行为对比才发现的错误。
+    st, h, b = post("/_goproxy/acl/test", {"ip": "203.0.113.66", "route_id": "svc-a"})
+    check("  改名后白名单仍在起作用（名单内 -> 放行）",
+          json.loads(b)["decision"]["allowed"] is True, b[:200])
+    st, h, b = post("/_goproxy/acl/test", {"ip": "127.0.0.1", "route_id": "svc-a"})
+    check("  改名后白名单仍然生效（名单外 -> 拒绝）",
+          json.loads(b)["decision"].get("reason") == "acl_route_allow_miss", b[:200])
+
+    # ---- 删除：还被引用着的名单不许删 ----
+    #
+    # 不拦的话，删除会一路走到 validate 才报「某条路由引用了不存在的名单」，
+    # 用户看到的是「引用写错了」，而真正发生的是一次删除动作 ——
+    # 两者的下一步操作完全不同（一个去改引用，一个去解除引用）。
+    st, _h, b = post("/_goproxy/config",
+                     {"ip_lists": [d for d in renamed if d["name"] != renamed_to]},
+                     method="PATCH")
+    check("删掉还被引用的名单 -> 409 list_in_use",
+          st == 409 and b"list_in_use" in b, "实际 %s :: %s" % (st, b[:300]))
+    check("  报错点名了在用的路由（告诉用户去哪解除引用）", b"svc-a" in b, b[:300])
+    st, _h, b = get("/_goproxy/config")
+    check("  被拒后名单还在（没被写坏）",
+          renamed_to in {d["name"] for d in (json.loads(b).get("ip_lists") or [])},
+          str(json.loads(b).get("ip_lists")))
+
+    # 两份名单并存：白名单 10.0.0.0/8 里单独剔掉 10.0.0.5。
+    # 这正是旧版 mode 二选一表达不出来的配置 —— 现在就是引用两份名单，
+    # 各自独立维护，一条路由同时用。
     st, h, b = get("/_goproxy/routes")
     etag = hdr(h, "ETag")
-    st, h, b = post(
-        "/_goproxy/routes/svc-a",
-        {"acl": {"allow": ["10.0.0.0/8"], "deny": [{"cidr": "10.0.0.5", "note": "e2e 内部例外"}]}},
-        method="PATCH",
-        headers={"If-Match": etag},
-    )
-    check("白名单 + 黑名单并存 -> 200", st == 200, "实际 %s :: %s" % (st, b[:200]))
+    st, h, b = post("/_goproxy/routes/svc-a",
+                    {"acl": {"lists": ["e2e 内网段", "e2e 内部例外"]}},
+                    method="PATCH", headers={"If-Match": etag})
+    check("路由同时引用白名单 + 黑名单两份 -> 200", st == 200, "实际 %s :: %s" % (st, b[:250]))
 
     st, h, b = post("/_goproxy/acl/test", {"ip": "10.0.0.5", "route_id": "svc-a"})
     dec = json.loads(b)["decision"]
     check("白名单内的地址仍可被黑名单剔掉",
           dec["allowed"] is False and dec.get("reason") == "acl_route_deny", str(dec))
+    check("  报出的是内容里的那份黑名单（多份名单时这一点必须准确）",
+          dec.get("list") == "e2e 内部例外", str(dec.get("list")))
     check("  备注来自黑名单那条", dec.get("note") == "e2e 内部例外", str(dec.get("note")))
+    check("  文案里点明了是哪份名单拦的",
+          "e2e 内部例外" in dec.get("message", ""), str(dec.get("message")))
 
     st, h, b = post("/_goproxy/acl/test", {"ip": "10.0.0.9", "route_id": "svc-a"})
     check("白名单内且未被黑名单命中 -> 放行",
           json.loads(b)["decision"]["allowed"] is True, b[:200])
+
+    # 解除引用之后就能删了。这是上面那条 409 的反证：没有这一步，
+    # 409 有可能只是「删除功能整个坏掉了」的另一种表现。
+    st, _h, b = post("/_goproxy/config",
+                     {"ip_lists": [d for d in renamed if d["name"] != renamed_to]},
+                     method="PATCH")
+    check("解除引用后删除同一份名单 -> 200", st == 200, "实际 %s :: %s" % (st, b[:250]))
+    st, _h, b = get("/_goproxy/config")
+    check("  名单库里已经没有它",
+          renamed_to not in {d["name"] for d in (json.loads(b).get("ip_lists") or [])},
+          str(sorted(d["name"] for d in (json.loads(b).get("ip_lists") or []))))
 
     # ---- 落地验证：判定对了，真实请求也要真的被拦 ----
     #
@@ -787,17 +939,28 @@ def run_acl_section(cfg_path):
             time.sleep(0.3)
         return last, body
 
-    # (a) 8081 上刚配的是一份「只允许 10.0.0.0/8」的白名单，请求来自 127.0.0.1。
+    # (a) 8081 上的 svc-a 引用着「e2e 内网段」（只允许 10.0.0.0/8），
+    #     而请求来自 127.0.0.1 —— 白名单没命中。
     st, body = wait_port_status("http://127.0.0.1:8081/whitelist-miss", 403,
                                 marker=b"acl_route_allow_miss")
     check("业务端口白名单未命中 -> 403", st == 403, "实际 %s" % st)
     check("  响应体带 reason=acl_route_allow_miss", b"acl_route_allow_miss" in body, body[:150])
 
-    # (b) 8088 挂的是 svc-acl（deny 127.0.0.1），同一个来源应当 403。
+    # (b) 8088 挂的是 svc-acl，它引用着「本机演示黑名单」（deny 127.0.0.1），
+    #     同一个来源应当 403。这一条同时证明「引用式名单真的接到了请求管线上」——
+    #     上一条只说明白名单层生效了，管不了黑名单这一层。
     st, body = wait_port_status("http://127.0.0.1:8088/real-deny", 403,
                                 marker=b"acl_route_deny")
-    check("业务端口命中黑名单 -> 403", st == 403, "实际 %s" % st)
+    check("业务端口命中引用式黑名单 -> 403", st == 403, "实际 %s" % st)
     check("  响应体带 reason=acl_route_deny", b"acl_route_deny" in body, body[:150])
+    # 响应体只到「哪一层」，不带规则和名单名。
+    # 这是刻意的：告诉对方「你踩到哪条线了」等于送它一份探测地图。
+    # 具体规则与名单名只进访问日志和命中测试（运维看得到，对面学不到）。
+    check("  带层名",
+          "黑名单".encode("utf-8") in body, body[:250])
+    check("  但不泄漏命中的规则与名单名",
+          "本机演示黑名单".encode("utf-8") not in body and b"127.0.0.1" not in body,
+          body[:250])
 
     # (c) 对照组：8000 只命中兜底路由，那条路由没配任何名单，必须照常 200。
     #     少了这一条，上面的 403 有可能只是「端口整个不通」造成的。

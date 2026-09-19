@@ -140,23 +140,34 @@ func mustList(t *testing.T, rules ...string) *IPList {
 
 // mustACL 建一份路由级名单。
 //
-// nil 与空切片在这里被刻意区分开：nil = 这份名单没配，
-// 空切片 = 显式配了但是空的（白名单这么写是配置错误）。
+// v0.8.0 起路由不再内联写规则，只引用命名名单，所以这里按「建名单 + 引用」
+// 两步走，和线上路径完全一致 —— 测试里另走一条捷径的话，捷径本身就成了
+// 没被测过的代码。allow / deny 传 nil 表示「这一层不引用任何名单」。
 func mustACL(t *testing.T, allow, deny []string) *ACL {
 	t.Helper()
-	mk := func(list []string) []IPRule {
-		if list == nil {
-			return nil
+	var defs []IPListDef
+	var refs []string
+	add := func(kind, name string, rules []string) {
+		if rules == nil {
+			return
 		}
-		out := make([]IPRule, 0, len(list))
-		for _, s := range list {
-			out = append(out, IPRule{CIDR: s})
+		rs := make([]IPRule, 0, len(rules))
+		for _, s := range rules {
+			rs = append(rs, IPRule{CIDR: s})
 		}
-		return out
+		defs = append(defs, IPListDef{Name: name, Kind: kind, Rules: rs})
+		refs = append(refs, name)
 	}
-	a, err := NewACL(&RouteACLConfig{Allow: mk(allow), Deny: mk(deny)})
+	add(IPListKindAllow, "allow-1", allow)
+	add(IPListKindDeny, "deny-1", deny)
+
+	set, err := NewIPListSet(defs)
 	if err != nil {
-		t.Fatalf("构建 ACL 失败: %v", err)
+		t.Fatalf("构建名单库失败: %v", err)
+	}
+	a, err := set.Resolve(refs)
+	if err != nil {
+		t.Fatalf("展开名单引用失败: %v", err)
 	}
 	return a
 }
@@ -391,29 +402,101 @@ func TestIPListMatchesMappedIPv6(t *testing.T) {
 	}
 }
 
-// TestRouteACLEmptyAllowRejected：空白名单是三层里唯一「配了就出事」的写法。
-func TestRouteACLEmptyAllowRejected(t *testing.T) {
-	c := &Config{Routes: []RouteConfig{{
-		ID: "r", Target: "http://127.0.0.1:9000", PathPrefix: "/",
-		ACL: &RouteACLConfig{Allow: []IPRule{}}, // 显式空数组
-	}}}
-	if err := c.validate(); err == nil {
-		t.Error("acl.allow 写成空数组会让整条路由拒绝所有请求，必须在写盘前报错")
+// TestRouteACLReferences：路由只能引用**存在**的名单，悬空引用必须报错。
+//
+// 这条比它看起来重要：一条 allow 引用写错了名字，如果被当成「没引用」，
+// 结果是这条路由不限制来源 —— 一次无声的放行。涉及白名单效力的事情一律 fail-closed，
+// 宁可启动失败也不猜。
+func TestRouteACLReferences(t *testing.T) {
+	base := func(refs []string) *Config {
+		return &Config{
+			IPLists: []IPListDef{
+				{Name: "办公网", Kind: IPListKindAllow, Rules: []IPRule{{CIDR: "10.0.0.0/8"}}},
+				{Name: "爬虫", Kind: IPListKindDeny, Rules: []IPRule{{CIDR: "203.0.113.66"}}},
+			},
+			Routes: []RouteConfig{{
+				ID: "r", Target: "http://127.0.0.1:9000", PathPrefix: "/",
+				ACL: &RouteACLConfig{Lists: refs},
+			}},
+		}
 	}
 
-	// 对照：完全不写 allow（nil）表示不限制来源，是合法的
-	c2 := &Config{Routes: []RouteConfig{{
-		ID: "r", Target: "http://127.0.0.1:9000", PathPrefix: "/",
-		ACL: &RouteACLConfig{Deny: []IPRule{{CIDR: "10.0.0.0/8"}}},
-	}}}
-	if err := c2.validate(); err != nil {
-		t.Errorf("只配 deny 应当合法: %v", err)
+	if err := base([]string{"办公网", "爬虫"}).validate(); err != nil {
+		t.Errorf("引用已定义的名单应当合法: %v", err)
 	}
 
-	// 空的黑名单是合法的：什么都不禁，没有危害
-	c3 := &Config{GlobalIPDeny: []IPRule{}}
-	if err := c3.validate(); err != nil {
-		t.Errorf("空的 global_ip_deny 应当合法: %v", err)
+	err := base([]string{"办公网", "打错的名字"}).validate()
+	if err == nil {
+		t.Fatal("引用不存在的名单必须报错，不能当成「没引用」静默放行")
+	}
+	if !strings.Contains(err.Error(), "打错的名字") {
+		t.Errorf("报错里应点名是哪份名单不存在，实际: %v", err)
+	}
+	// 名单少的时候顺手把可选项报出来，省得用户去翻配置文件
+	if !strings.Contains(err.Error(), "办公网") {
+		t.Errorf("报错里应列出当前可用的名单，实际: %v", err)
+	}
+
+	if err := base([]string{"  "}).validate(); err == nil {
+		t.Error("acl.lists 里的空名字应当报错")
+	}
+	if err := base(nil).validate(); err != nil {
+		t.Errorf("不引用任何名单 = 不做 IP 限制，应当合法: %v", err)
+	}
+}
+
+// TestIPListDefValidated：名单库自身的校验（名字、角色、规则、空名单）。
+func TestIPListDefValidated(t *testing.T) {
+	bad := []struct {
+		name string
+		cfg  *Config
+		why  string
+	}{
+		{"名字重复", &Config{IPLists: []IPListDef{
+			{Name: "x", Kind: IPListKindDeny, Rules: []IPRule{{CIDR: "10.0.0.0/8"}}},
+			{Name: "x", Kind: IPListKindDeny, Rules: []IPRule{{CIDR: "10.0.0.0/8"}}},
+		}}, "名字是引用键，不能重名"},
+		{"名字为空", &Config{IPLists: []IPListDef{
+			{Name: "  ", Kind: IPListKindDeny},
+		}}, "路由靠名字引用，空名字无从引用"},
+		{"名字首尾有空白", &Config{IPLists: []IPListDef{
+			{Name: "办公网 ", Kind: IPListKindDeny, Rules: []IPRule{{CIDR: "10.0.0.0/8"}}},
+		}}, "静默 trim 会让「写了一样的名字却引用不到」更难查"},
+		{"kind 非法", &Config{IPLists: []IPListDef{
+			{Name: "x", Kind: "black", Rules: []IPRule{{CIDR: "10.0.0.0/8"}}},
+		}}, "kind 只能是 allow|deny"},
+		{"kind 缺失", &Config{IPLists: []IPListDef{
+			{Name: "x", Rules: []IPRule{{CIDR: "10.0.0.0/8"}}},
+		}}, "不给 kind 猜默认值，猜错的后果是放行"},
+		{"CIDR 非法", &Config{IPLists: []IPListDef{
+			{Name: "x", Kind: IPListKindDeny, Rules: []IPRule{{CIDR: "not-an-ip"}}},
+		}}, "坏 CIDR 要在写盘前拦下"},
+		{"空白名单", &Config{IPLists: []IPListDef{
+			{Name: "x", Kind: IPListKindAllow, Rules: []IPRule{}},
+		}}, "白名单一旦被引用就只有「只允许名单内地址」一个含义，空名单会让路由拒绝所有请求"},
+		{"名字太长", &Config{IPLists: []IPListDef{
+			{Name: strings.Repeat("长", 65), Kind: IPListKindDeny},
+		}}, "名字会进日志，限制长度"},
+		{"名字带斜杠", &Config{IPLists: []IPListDef{
+			{Name: "办公网/内网", Kind: IPListKindDeny},
+		}}, "斜杠会让「按名字定位一份名单」产生歧义"},
+		{"名字带换行", &Config{IPLists: []IPListDef{
+			{Name: "办公网\n伪造日志", Kind: IPListKindDeny},
+		}}, "名单名会和规则打进日志的同一行，换行能伪造出一条不存在的记录"},
+	}
+	for _, c := range bad {
+		c.cfg.applyDefaults()
+		if err := c.cfg.validate(); err == nil {
+			t.Errorf("%s：应当校验失败（%s）但通过了", c.name, c.why)
+		}
+	}
+
+	// 对照：空的黑名单只是什么都不禁，没有危害，放行
+	// （与空白的白名单相反，后者会让引用它的路由拒绝所有请求）
+	ok := &Config{IPLists: []IPListDef{{Name: "空黑名单", Kind: IPListKindDeny, Rules: []IPRule{}}}}
+	ok.applyDefaults()
+	if err := ok.validate(); err != nil {
+		t.Errorf("空的黑名单应当合法: %v", err)
 	}
 }
 
@@ -429,33 +512,54 @@ func TestGlobalIPDenyValidated(t *testing.T) {
 	if err := ok.validate(); err != nil {
 		t.Errorf("合法的 global_ip_deny 不应报错: %v", err)
 	}
+	// 空数组是合法的：什么都不禁，没有危害（白名单不同，空数组会拒绝所有人）
+	if err := (&Config{GlobalIPDeny: []IPRule{}}).validate(); err != nil {
+		t.Errorf("空的 global_ip_deny 应当合法: %v", err)
+	}
 }
 
-// TestLegacyACLRejected：v0.6.x 的 acl.mode / acl.cidrs 必须显式报错。
+// TestLegacyACLRejected：两代旧 acl 写法都必须显式报错，且给出迁移映射。
 //
-// 这是本次改动里最要紧的一条防线。旧配置里 mode=allow 表达的是一条**白名单**；
-// 新结构没有 mode 字段，静默忽略的后果是白名单不再生效、所有来源都能访问 ——
-// 一次无声的安全降级。配置文件还在、启动也不报错，但防护已经没了，
-// 比启动失败危险得多。
+// 这是本次改动里最要紧的一条防线。旧配置里 mode=allow 表达的是一条**白名单**，
+// 内联的 allow 同理。新结构没有这些字段，静默忽略的后果是白名单不再生效、
+// 所有来源都能访问 —— 一次无声的安全降级。配置文件还在、启动也不报错，
+// 但防护已经没了，比启动失败危险得多。
 func TestLegacyACLRejected(t *testing.T) {
+	// v0.6.x：mode + cidrs
 	for _, mode := range []string{"allow", "deny"} {
 		raw := []byte(`{"routes":[{"id":"r","acl":{"mode":"` + mode + `","cidrs":["10.0.0.0/8"]}}]}`)
 		err := rejectLegacyACL(raw)
 		if err == nil {
 			t.Fatalf("旧的 acl.mode=%s + cidrs 必须报错，不能静默失效", mode)
 		}
-		if !strings.Contains(err.Error(), "acl.allow") {
-			t.Errorf("报错信息里应当给出迁移映射，实际: %v", err)
+		if !strings.Contains(err.Error(), "acl.lists") {
+			t.Errorf("报错信息里应当给出当前写法的迁移映射，实际: %v", err)
 		}
+	}
+
+	// v0.7.x：内联的 allow / deny
+	for _, field := range []string{"allow", "deny"} {
+		raw := []byte(`{"routes":[{"id":"r","acl":{"` + field + `":["10.0.0.0/8"]}}]}`)
+		err := rejectLegacyACL(raw)
+		if err == nil {
+			t.Fatalf("内联的 acl.%s 必须报错 —— 静默忽略等于这份名单不再生效", field)
+		}
+		if !strings.Contains(err.Error(), "ip_lists") {
+			t.Errorf("报错信息里应当说明规则现在写在顶层 ip_lists 里，实际: %v", err)
+		}
+	}
+	// 写成空数组也算写了：那正是「谁都进不来」的事故写法，更不能放过
+	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r","acl":{"allow":[]}}]}`)); err == nil {
+		t.Error("内联 acl.allow 写成空数组也必须报错")
 	}
 
 	// 纯 mode=none 的残留是空操作，放行 —— 免得为一行无意义的遗留卡住升级
 	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r","acl":{"mode":"none"}}]}`)); err != nil {
 		t.Errorf("mode=none 的残留不应阻塞升级，实际报错: %v", err)
 	}
-	// 新写法当然要能过
-	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r","acl":{"allow":["10.0.0.0/8"]}}]}`)); err != nil {
-		t.Errorf("新写法不应被拦，实际报错: %v", err)
+	// 当前写法当然要能过
+	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r","acl":{"lists":["办公网"]}}]}`)); err != nil {
+		t.Errorf("当前写法不应被拦，实际报错: %v", err)
 	}
 	// 完全没有 acl 的路由
 	if err := rejectLegacyACL([]byte(`{"routes":[{"id":"r"}]}`)); err != nil {
@@ -694,11 +798,13 @@ func TestAuthConfigValidation(t *testing.T) {
 		}}},
 		{Routes: []RouteConfig{{
 			ID: "e", Target: "http://x",
-			ACL: &RouteACLConfig{Deny: []IPRule{{CIDR: "not-an-ip"}}}, // CIDR 非法
-		}}},
+			ACL: &RouteACLConfig{Lists: []string{"x"}},
+		}}, IPLists: []IPListDef{{Name: "x", Kind: IPListKindDeny,
+			Rules: []IPRule{{CIDR: "not-an-ip"}}}}, // 名单里 CIDR 非法
+		},
 		{Routes: []RouteConfig{{
 			ID: "f", Target: "http://x",
-			ACL: &RouteACLConfig{Allow: []IPRule{}}, // 空白名单 = 谁都进不来
+			ACL: &RouteACLConfig{Lists: []string{"没这份"}}, // 引用了不存在的名单
 		}}},
 		// 顶层全局黑名单里的坏 CIDR 同样要在写盘前拦下
 		{GlobalIPDeny: []IPRule{{CIDR: "10.0.0.0/40"}}},

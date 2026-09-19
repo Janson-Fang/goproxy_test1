@@ -74,6 +74,23 @@ type Config struct {
 	// 万一从别的途径写死了，仍然可以手工改配置文件后重启恢复。
 	GlobalIPDeny []IPRule `json:"global_ip_deny,omitempty"`
 
+	// IPLists 是可复用的命名地址列表库。
+	//
+	// 为什么要有它：路由级的白名单 / 黑名单以前只能内联写在每条路由里，
+	// 于是「办公网」这一段网段会在 5 条路由里各写一遍 —— 改一次要改 5 处，
+	// 漏一处就是一条路由的防护没跟上，而且肉眼看不出哪条漏了。
+	// 现在地址列表建一次、路由按名字引用，改一处全场生效。
+	//
+	// 每条列表自带 kind（allow / deny），也就是**角色定义在列表上**：
+	// 同一条列表在所有路由里扮演同一个角色，读配置时不必回到引用点去猜。
+	// 想实现「A 路由把它当白名单、B 路由当黑名单」这种需求，就建两条同名不同
+	// 前缀的列表 —— 那是两件不同的事，本就该是两个名字。
+	//
+	// 注意全局黑名单**不**在这里：它仍然只有一份内联的 GlobalIPDeny。
+	// 全局名单作用于所有入口（含管理端口），是「紧急封禁」用的单一开关，
+	// 拆成多份反而会让「我到底封干净了没有」这个最要紧的问题变难回答。
+	IPLists []IPListDef `json:"ip_lists,omitempty"`
+
 	// TLS 是全局 TLS/ACME 配置。默认 enabled=false，即完全保持历史行为：
 	// 所有端口跑明文 HTTP。打开后路由默认走 ACME 自动证书，可逐条覆盖。
 	TLS TLSConfig `json:"tls,omitzero"`
@@ -129,10 +146,10 @@ type RouteConfig struct {
 	CircuitBreaker *CBConfig `json:"circuit_breaker,omitempty"`
 	// Auth 不配或 mode=none 则不做认证
 	Auth *RouteAuthConfig `json:"auth,omitempty"`
-	// ACL 这条路由的 IP 白名单 / 黑名单，不配则不按 IP 限制。
+	// ACL 是这条路由引用的地址列表，不配则不按 IP 限制。
 	//
-	// 与 v0.6.x 的区别：以前是 mode 二选一（要么白名单要么黑名单），
-	// 现在两者并存 —— allow 收紧范围，deny 在范围内开例外。
+	// 规则本身写在顶层的 ip_lists 里，这里只放名字。这样一个网段
+	// 只需要维护一处，改完对所有引用它的路由一起生效。
 	ACL *RouteACLConfig `json:"acl,omitempty"`
 }
 
@@ -144,22 +161,53 @@ type RouteAuthConfig struct {
 	JWT   *JWTConfig       `json:"jwt"`
 }
 
-// RouteACLConfig 是一条路由上的 IP 名单。
+// 地址列表的两种角色。取值直接进 JSON，所以是短横线风格的英文小写。
+const (
+	// IPListKindAllow 白名单：**一旦被路由引用就只有一个含义 —— 只允许名单内的地址**。
+	// 它是在收紧范围，不是在额外放行，所以不存在「和黑名单谁优先」的问题。
+	IPListKindAllow = "allow"
+	// IPListKindDeny 黑名单：在允许的范围内再剔掉若干地址。
+	IPListKindDeny = "deny"
+)
+
+// IPListDef 是一份可复用的命名地址列表。
 //
-// 两份名单的语义（判定顺序见 acl.go 的 decideIP）：
+//	"ip_lists": [
+//	  {"name": "办公网", "kind": "allow", "rules": ["10.0.0.0/8", {"cidr": "10.1.2.3", "note": "临时接入"}]},
+//	  {"name": "爬虫",   "kind": "deny",  "rules": ["203.0.113.66 扫目录"]}
+//	]
 //
-//   - Allow 是白名单。**一旦配置就只有一个含义：只允许名单内的地址**。
-//     它的存在是在「收紧」，不是在「额外放行」—— 所以它没有「与黑名单谁优先」
-//     的问题，白名单只负责划定范围。
-//   - Deny 是黑名单。在白名单划定的范围内再剔掉若干地址；
-//     如果没配白名单，就是在全部来源里剔掉这些地址。
+// Name 既是显示名也是引用键（路由的 acl.lists 里写的就是它）。用名字当键
+// 而不是引入一套 id：配置文件是给人读的，"lists": ["办公网"] 比 "lists": ["l-3f2a"]
+// 有用得多。代价是改名会牵动引用 —— 写接口为此提供了 ip_list_renames，
+// 改名时由服务端把路由里的引用一起改写掉，所以控制台里改名永远是原子的。
 //
-// 两者都可以为 nil（表示没配这份名单）。但**显式写成空数组**只有 Deny 是
-// 合法的：Allow 配成 [] 意味着「谁的请求都不允许」，那是配置事故而不是意图，
-// validate 阶段会直接报错。
+// Rules 用 IPRule 而不是 []string：条目可以带备注，备注会出现在命中依据和
+// 拦截日志里，回答「这个地址当初到底是为什么被封的」。
+type IPListDef struct {
+	Name string `json:"name"`
+	// Kind 只能是 allow 或 deny。空串会在 validate 阶段被拒 ——
+	// 不给默认值是因为默认成哪个都是猜，而猜错的后果是这个地址段被放行。
+	Kind  string   `json:"kind"`
+	Rules []IPRule `json:"rules,omitempty"`
+}
+
+// RouteACLConfig 是一条路由对地址列表的**引用**。
+//
+// v0.8.0 起只保留引用，不再支持内联写规则（旧的内联写法会被
+// rejectLegacyACL 明确拦下，附迁移映射）。理由是内联和引用并存时，
+// 「这条路由到底受哪几条规则管」要同时看两处，而漏看一处的后果是防护失效。
+//
+// 一份都不引用（Lists 为空）表示这条路由不做 IP 限制。
 type RouteACLConfig struct {
-	Allow []IPRule `json:"allow,omitempty"`
-	Deny  []IPRule `json:"deny,omitempty"`
+	// Lists 是引用到的名单名，可以多个 —— 同一层的多份名单取并集。
+	//
+	// 两层的语义（判定顺序见 acl.go 的 decideIP）：
+	//   allow 的名单们 → 划范围：至少命中其中之一才继续往下走
+	//   deny  的名单们 → 开例外：命中任意一份就拒绝
+	// 角色由名单自己的 kind 决定，引用点不重复声明，所以不会出现
+	// 「同一份名单在 A 路由是白名单、在 B 路由是黑名单」这种要对照两处才看得懂的配置。
+	Lists []string `json:"lists,omitempty"`
 }
 
 type RateLimitConfig struct {
@@ -211,12 +259,20 @@ func parseConfigFile(path string) (raw []byte, cfg *Config, err error) {
 	return raw, cfg, nil
 }
 
-// rejectLegacyACL 拦住 v0.6.x 的旧 acl 写法（mode + cidrs）。
+// rejectLegacyACL 拦住两种已经不再支持的旧 acl 写法，并给出迁移映射：
+//
+//	v0.6.x  acl.mode + acl.cidrs      —— mode 二选一（要么白名单要么黑名单）
+//	v0.7.x  acl.allow / acl.deny      —— 内联写规则，两份可并存
+//	v0.8.0+ acl.lists                 —— 只引用顶层 ip_lists 里的命名名单
 //
 // 为什么必须显式报错，而不是让不认识的字段静默落空：旧配置里 acl.mode=allow
 // 表达的是一条**白名单**。新结构没有 mode 字段，静默忽略的后果是白名单不再生效、
 // 所有来源都能访问 —— 这是一次无声的安全降级。配置文件还在、启动日志也不报错，
 // 但防护已经没了，比启动失败危险得多。
+//
+// 内联写法（allow / deny）同理：它们的规则**不会**被自动搬到 ip_lists 里去。
+// 自动搬运要替用户决定「这份规则该叫什么名字」「多条路由里一样的规则要不要
+// 合并成一份」，猜错了用户还得去猜系统猜的是什么。宁可在这里停下来说清楚。
 //
 // 纯 mode=none 且没有 cidrs 的残留是空操作（新结构里删掉即可），
 // 这种情况放行，免得为一行无意义的遗留卡住升级。
@@ -225,8 +281,10 @@ func rejectLegacyACL(raw []byte) error {
 		Routes []struct {
 			ID  string `json:"id"`
 			ACL *struct {
-				Mode  *string   `json:"mode"`
-				CIDRs *[]string `json:"cidrs"`
+				Mode  *string          `json:"mode"`
+				CIDRs *[]string        `json:"cidrs"`
+				Allow *json.RawMessage `json:"allow"`
+				Deny  *json.RawMessage `json:"deny"`
 			} `json:"acl"`
 		} `json:"routes"`
 	}
@@ -237,26 +295,55 @@ func rejectLegacyACL(raw []byte) error {
 		if r.ACL == nil {
 			continue
 		}
-		// 用指针是为了区分「文件里写了 mode」和「压根没这个键」。
+		id := r.ID
+		if id == "" {
+			id = "未命名"
+		}
+
+		// v0.6.x：mode 二选一 + cidrs
 		mode := ""
 		if r.ACL.Mode != nil {
 			mode = strings.ToLower(strings.TrimSpace(*r.ACL.Mode))
 		}
 		hasCIDRs := r.ACL.CIDRs != nil && len(*r.ACL.CIDRs) > 0
-		if !hasCIDRs && (mode == "" || mode == "none") {
-			continue
+		if hasCIDRs || (mode != "" && mode != "none") {
+			return fmt.Errorf("routes[%d] (%s): acl.mode / acl.cidrs 是 v0.6.x 的旧写法，"+
+				"早已不再支持。三代的写法是：\n"+
+				"      v0.6.x  acl.mode=allow|deny + acl.cidrs   二选一\n"+
+				"      v0.7.x  acl.allow / acl.deny               内联规则，两份可并存\n"+
+				"      v0.8.0  acl.lists                          只引用命名名单（当前）\n"+
+				"    迁移到当前写法：先在顶层 ip_lists 里建一份名单，再让路由引用它 ——\n"+
+				"      \"ip_lists\": [{\"name\": \"办公网\", \"kind\": \"allow\", \"rules\": [\"10.0.0.0/8\"]}],\n"+
+				"      \"routes\": [{\"id\": \"%s\", \"acl\": {\"lists\": [\"办公网\"]}}]\n"+
+				"    详见 README「IP 名单（命名列表 + 引用）」。",
+				i, id, id)
 		}
-		id := r.ID
-		if id == "" {
-			id = "未命名"
+
+		// v0.7.x：内联的 allow / deny
+		// 用 *json.RawMessage 是为了区分「文件里写了 allow」和「压根没这个键」——
+		// 写成 [] 也算写了（那正是「谁都进不来」的事故写法，更不能放过）。
+		if r.ACL.Allow != nil || r.ACL.Deny != nil {
+			which := "acl.allow"
+			if r.ACL.Allow == nil {
+				which = "acl.deny"
+			} else if r.ACL.Deny != nil {
+				which = "acl.allow / acl.deny"
+			}
+			return fmt.Errorf("routes[%d] (%s): %s 是 v0.7.x 的内联写法，"+
+				"v0.8.0 起路由只能**引用**顶层 ip_lists 里的命名名单。迁移映射：\n"+
+				"      acl.allow: [...]  →  ip_lists 里建一份 kind=\"allow\" 的名单，再在 acl.lists 里写它的名字\n"+
+				"      acl.deny:  [...]  →  同理，kind=\"deny\"\n"+
+				"    例：\n"+
+				"      \"ip_lists\": [\n"+
+				"        {\"name\": \"办公网\", \"kind\": \"allow\", \"rules\": [\"10.0.0.0/8\"]},\n"+
+				"        {\"name\": \"爬虫\",   \"kind\": \"deny\",  \"rules\": [\"203.0.113.66\"]}\n"+
+				"      ],\n"+
+				"      \"routes\": [{\"id\": \"%s\", \"acl\": {\"lists\": [\"办公网\", \"爬虫\"]}}]\n"+
+				"    这样做的好处：同一段网段只维护一处，改完对所有引用它的路由一起生效。\n"+
+				"    顶层 global_ip_deny（全局黑名单）写法不变，仍是一份内联规则。\n"+
+				"    详见 README「IP 名单（命名列表 + 引用）」。",
+				i, id, which, id)
 		}
-		return fmt.Errorf("routes[%d] (%s): acl.mode / acl.cidrs 是 v0.6.x 的旧写法，"+
-			"v0.7.0 起已换成两份可并存的名单。迁移映射：\n"+
-			"      acl.mode=allow + cidrs   →   acl.allow\n"+
-			"      acl.mode=deny  + cidrs   →   acl.deny\n"+
-			"    两者现在可以同时配置：allow 收紧来源范围，deny 在范围内开例外。\n"+
-			"    另有顶层 global_ip_deny，作为对所有入口（含管理端口）生效的全局黑名单。",
-			i, id)
 	}
 	return nil
 }
@@ -410,6 +497,127 @@ func (c *Config) validateAdminUsers() error {
 	return nil
 }
 
+// validateIPLists 校验名单库，返回「名字 → 角色」的映射供路由引用检查。
+//
+// 单独抽出来是因为它有两个调用点：配置校验，以及「改名 / 删除」这类
+// 需要先知道有哪些名字的写路径（见 admin_api.go 的 listUsage）。
+func (c *Config) validateIPLists() (map[string]string, error) {
+	kinds := make(map[string]string, len(c.IPLists))
+	for i, d := range c.IPLists {
+		name := strings.TrimSpace(d.Name)
+		if name == "" {
+			return nil, fmt.Errorf("ip_lists[%d]: name 不能为空 —— 路由靠名字引用名单", i)
+		}
+		// 首尾空白不做静默 trim：名字是引用键，`"办公网 "` 和 `"办公网"` 是两个
+		// 不同的键，静默归一化只会让「明明写了一样的名字却引用不到」更难查。
+		if name != d.Name {
+			return nil, fmt.Errorf("ip_lists[%d] (%q): name 首尾不能有空白", i, d.Name)
+		}
+		if err := checkIPListName(name); err != nil {
+			return nil, fmt.Errorf("ip_lists[%d] (%s): %w", i, name, err)
+		}
+		if _, dup := kinds[name]; dup {
+			return nil, fmt.Errorf("ip_lists[%d]: 名单名 %q 重复 —— 名字是引用键，不能重名", i, name)
+		}
+
+		kind := strings.ToLower(strings.TrimSpace(d.Kind))
+		switch kind {
+		case IPListKindAllow, IPListKindDeny:
+		default:
+			return nil, fmt.Errorf("ip_lists[%d] (%s): kind 必须是 %s|%s，当前 %q",
+				i, name, IPListKindAllow, IPListKindDeny, d.Kind)
+		}
+
+		l, err := NewIPList(d.Rules)
+		if err != nil {
+			return nil, fmt.Errorf("ip_lists[%d] (%s): %w", i, name, err)
+		}
+		// 空的黑名单只是什么都不禁，没有危害，放行。
+		// 空的白名单不行：它一旦被引用就表示「只允许名单内的地址」，
+		// 结果是引用它的路由拒绝所有请求 —— 这是配置事故，不是意图。
+		if kind == IPListKindAllow && l.Len() == 0 {
+			return nil, fmt.Errorf("ip_lists[%d] (%s): 这是白名单，但一条规则都没有。"+
+				"白名单一旦被路由引用就只有「只允许名单内的地址」一个含义，"+
+				"空名单会让引用它的路由拒绝所有请求；先填几条地址再保存", i, name)
+		}
+		kinds[name] = kind
+	}
+	return kinds, nil
+}
+
+// checkIPListName 校验名单名可用的字符。
+//
+// 名单名会出现在 config.json、控制台、命中测试结果和拦截日志里。两条限制：
+//   - 控制字符 / 换行：名字和规则会打进日志的同一行，一个换行就能在日志里
+//     伪造出一条并不存在的记录（日志是排障时唯一可信的东西，不能让它可被配置污染）。
+//   - 斜杠：名单名将来可能进 URL 路径段，带斜杠会让「按名字定位一份名单」产生歧义。
+func checkIPListName(name string) error {
+	if n := len([]rune(name)); n > 64 {
+		return fmt.Errorf("名单名太长（%d 个字符，上限 64）", n)
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("名单名里不能有控制字符或换行")
+		}
+		if r == '/' || r == '\\' {
+			return fmt.Errorf("名单名里不能有 / 或 \\")
+		}
+	}
+	return nil
+}
+
+// knownListHint 生成「当前可用的名单有哪些」，贴在「引用了不存在的名单」后面。
+//
+// 报「不存在」却不说什么存在，用户只能去翻配置文件；名单少的时候一句话就能说清。
+func knownListHint(kinds map[string]string) string {
+	if len(kinds) == 0 {
+		return "当前一份地址列表都没有定义，请先在顶层 ip_lists 里加一份，" +
+			"或到控制台「IP 名单」页签创建。"
+	}
+	names := make([]string, 0, len(kinds))
+	for n := range kinds {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return "当前可用的名单：" + strings.Join(names, "、") + "。"
+}
+
+// indexIPList 按名字找一份名单定义。找不到返回 -1。
+//
+// 名字比较沿用校验时的规则：trim 之后比，大小写敏感 —— 名单名是给人看的中文居多，
+// 做大小写折叠反而会让 "Office" 和 "office" 悄悄合并，那是另一场事故。
+func indexIPList(defs []IPListDef, name string) int {
+	want := strings.TrimSpace(name)
+	for i, d := range defs {
+		if d.Name == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// listUsage 统计「每份名单被哪些路由引用」，给控制台展示与删除前置检查用。
+//
+// 键是名单名，值是引用它的路由 ID（按配置顺序，去重）。
+func listUsage(routes []RouteConfig) map[string][]string {
+	out := map[string][]string{}
+	for _, r := range routes {
+		if r.ACL == nil {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, ref := range r.ACL.Lists {
+			name := strings.TrimSpace(ref)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out[name] = append(out[name], r.ID)
+		}
+	}
+	return out
+}
+
 func (c *Config) validate() error {
 	// trusted_proxies 每一项必须是 IP 或 CIDR。不在这里拦，
 	// 写接口就会先把坏配置落盘、再在 reload 阶段失败。
@@ -432,6 +640,13 @@ func (c *Config) validate() error {
 	// 而且文件里已经留下了错误内容。
 	if _, err := NewIPList(c.GlobalIPDeny); err != nil {
 		return fmt.Errorf("global_ip_deny: %w", err)
+	}
+
+	// 名单库先校验。路由的引用要拿它的结论来查，顺序反了就会把
+	// 「名单本身写错了」报成「引用了不存在的名单」，指错方向。
+	listKinds, err := c.validateIPLists()
+	if err != nil {
+		return err
 	}
 
 	seen := make(map[string]struct{}, len(c.Routes))
@@ -487,19 +702,22 @@ func (c *Config) validate() error {
 		}
 
 		if acl := r.ACL; acl != nil {
-			// 空白名单要单独拦。它是三层名单里唯一一个「配了就出事」的写法：
-			// 白名单一旦存在就表示「只允许名单内的地址」，空数组等于谁都拒绝。
-			// 这和「没配白名单 = 不限制」只差一个字符，必须报错而不是让它生效。
-			if acl.Allow != nil && len(acl.Allow) == 0 {
-				return fmt.Errorf("routes[%d] (%s): acl.allow 是空数组。白名单一旦配置就意味着"+
-					"「只允许名单内的地址」，空数组会让这条路由拒绝所有请求；想取消限制请删掉 allow 字段本身",
-					i, r.ID)
-			}
-			if _, err := NewIPList(acl.Allow); err != nil {
-				return fmt.Errorf("routes[%d] (%s): acl.allow: %w", i, r.ID, err)
-			}
-			if _, err := NewIPList(acl.Deny); err != nil {
-				return fmt.Errorf("routes[%d] (%s): acl.deny: %w", i, r.ID, err)
+			// 引用必须存在。校验放在这里而不是「用到时才报错」：
+			// 写接口的顺序是先落盘再 reload，漏了这一步就会先把悬空引用写进
+			// 文件、再在 reload 阶段失败，进程停在一个半坏的状态上。
+			//
+			// 这里刻意不「自动忽略不认识的引用」：一条 allow 名单引用写错名字
+			// 就等于「不限制来源」，那是一次无声的放行 —— 和白名单效力有关的事情
+			// 一律 fail-closed。
+			for _, ref := range acl.Lists {
+				name := strings.TrimSpace(ref)
+				if name == "" {
+					return fmt.Errorf("routes[%d] (%s): acl.lists 里有空名字", i, r.ID)
+				}
+				if _, ok := listKinds[name]; !ok {
+					return fmt.Errorf("routes[%d] (%s): acl.lists 引用了不存在的名单 %q。%s",
+						i, r.ID, name, knownListHint(listKinds))
+				}
 			}
 		}
 	}
