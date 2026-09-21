@@ -4,13 +4,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -108,50 +105,6 @@ func TestCompareBuildRefusesIncomparable(t *testing.T) {
 	}
 	if got := compareBuild(a, b); got != 0 {
 		t.Errorf("比不了时应当返回 0，得到 %d", got)
-	}
-}
-
-func TestPlatformAssetNames(t *testing.T) {
-	pkg, sums := platformAssetNames()
-	if !strings.HasPrefix(pkg, "goproxy-"+runtime.GOOS+"-"+runtime.GOARCH) {
-		t.Errorf("资源名 %q 的平台部分不对", pkg)
-	}
-	if !strings.HasSuffix(pkg, ".tar.gz") {
-		t.Errorf("资源名 %q 应当以 .tar.gz 结尾（发布产物就是 tar.gz）", pkg)
-	}
-	if sums != "SHA256SUMS-"+runtime.GOARCH+".txt" {
-		t.Errorf("校验和文件名 %q 与 CI 打出来的不一致", sums)
-	}
-}
-
-func TestTagFromReleaseURL(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"/owner/repo/releases/tag/v0.9.1", "v0.9.1"},
-		{"/owner/repo/releases/tag/v0.9.1/", "v0.9.1"},
-		{"/owner/repo/releases/latest", ""},
-		{"", ""},
-	}
-	for _, c := range cases {
-		if got := tagFromReleaseURL(c.in); got != c.want {
-			t.Errorf("tagFromReleaseURL(%q) = %q，期望 %q", c.in, got, c.want)
-		}
-	}
-}
-
-func TestParseSums(t *testing.T) {
-	raw := []byte("aaaa\n" +
-		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  goproxy-linux-amd64.tar.gz\n" +
-		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  SHA256SUMS-amd64.txt\n")
-	got := parseSums(raw, "goproxy-linux-amd64.tar.gz")
-	if got != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
-		t.Errorf("parseSums 取错了行：%q", got)
-	}
-	// 镜像站经常回一个 200 的 HTML 错误页，这种情况必须解析不出来
-	if got := parseSums([]byte("<html>not a sums file</html>"), "goproxy-linux-amd64.tar.gz"); got != "" {
-		t.Errorf("HTML 页面不该被解析成校验和：%q", got)
-	}
-	if got := parseSums(raw, "goproxy-linux-arm64.tar.gz"); got != "" {
-		t.Errorf("没有的文件名应当返回空，得到 %q", got)
 	}
 }
 
@@ -273,85 +226,6 @@ func TestStageFromDiskRejectsWrongSHA(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 发布源（用 httptest 假装成 GitHub Releases）
-// ---------------------------------------------------------------------------
-
-func TestFetchReleaseOverHTTP(t *testing.T) {
-	binary := []byte("fake-binary-bytes")
-	srv, sum := fakeReleaseServer(t, "v9.9.9", binary)
-	src := newTestSource(srv)
-
-	info, err := src.latestRelease(context.Background(), "")
-	if err != nil {
-		t.Fatalf("latestRelease: %v", err)
-	}
-	if info.Tag != "v9.9.9" {
-		t.Fatalf("解析出的版本是 %q，期望 v9.9.9", info.Tag)
-	}
-
-	dest := filepath.Join(t.TempDir(), "goproxy.staged")
-	res, err := src.fetchRelease(context.Background(), info, dest, 1<<20)
-	if err != nil {
-		t.Fatalf("fetchRelease: %v", err)
-	}
-	if !res.SumsVerified || res.ArchiveSHA256 != sum {
-		t.Errorf("校验信息不对：%+v", res)
-	}
-	got, err := os.ReadFile(dest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, binary) {
-		t.Errorf("解出来的二进制是 %q，期望 %q", got, binary)
-	}
-	if _, err := os.Stat(dest + ".tar.gz"); !os.IsNotExist(err) {
-		t.Errorf("下载的 tar.gz 临时文件应当被清掉")
-	}
-}
-
-func TestFetchReleaseRejectsSumsMismatch(t *testing.T) {
-	srv, _ := fakeReleaseServer(t, "v9.9.9", []byte("payload"))
-	// 把校验和换成另一个值的服务端：模拟镜像缓存了旧版本
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "SHA256SUMS") {
-			assetName, _ := platformAssetNames()
-			fmt.Fprintf(w, "%s  %s\n", strings.Repeat("a", 64), assetName)
-			return
-		}
-		srv.Config.Handler.ServeHTTP(w, r)
-	}))
-	t.Cleanup(bad.Close)
-
-	src := newTestSource(bad)
-	info := releaseInfo{Tag: "v9.9.9"}
-	dest := filepath.Join(t.TempDir(), "goproxy.staged")
-	_, err := src.fetchRelease(context.Background(), info, dest, 1<<20)
-	if err == nil {
-		t.Fatal("校验和对不上时必须拒绝安装")
-	}
-	var ae *apiError
-	if !errors.As(err, &ae) || ae.code != "upgrade_sha256_mismatch" {
-		t.Fatalf("错误码不对：%v", err)
-	}
-}
-
-func TestLatestReleaseAcceptsPinnedVersion(t *testing.T) {
-	srv, _ := fakeReleaseServer(t, "v9.9.9", []byte("x"))
-	src := newTestSource(srv)
-	// 指定版本时不该联网解析（这里甚至不需要服务端活着）
-	info, err := src.latestRelease(context.Background(), "0.8.0")
-	if err != nil {
-		t.Fatalf("latestRelease(指定版本): %v", err)
-	}
-	if info.Tag != "v0.8.0" {
-		t.Errorf("指定版本应当被补上 v 前缀，得到 %q", info.Tag)
-	}
-	if !strings.HasSuffix(info.HTMLURL, "/releases/tag/v0.8.0") {
-		t.Errorf("release 地址不对：%q", info.HTMLURL)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // 管理接口
 // ---------------------------------------------------------------------------
 
@@ -380,36 +254,6 @@ func TestHandleUpgradeState(t *testing.T) {
 	}
 	if got.Busy {
 		t.Error("没有升级动作在跑时不该是 busy")
-	}
-}
-
-func TestHandleUpgradeCheckStoresResult(t *testing.T) {
-	um, _ := testManager(t)
-	srv, sum := fakeReleaseServer(t, "v9.9.9", []byte("x"))
-	um.source = newTestSource(srv)
-	app := &App{upgrade: um}
-
-	rec := httptest.NewRecorder()
-	app.handleUpgradeCheck(rec, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/check", strings.NewReader("{}")))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("状态码 %d：%s", rec.Code, rec.Body.String())
-	}
-	var got upgradeCheckResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Latest != "v9.9.9" || !got.SumsVerified || got.Asset.SHA256 != sum {
-		t.Errorf("检查结果不对：%+v", got)
-	}
-	// 测试进程的 version 是 dev，不是发布版本，所以「比不了」并且按有更新处理
-	if got.CurrentComparable {
-		t.Errorf("dev 版本不该被当成可比较版本")
-	}
-	if !got.UpdateAvailable {
-		t.Errorf("dev 版本应当报告有可用更新")
-	}
-	if um.lastCheck() == nil {
-		t.Errorf("检查结果应当被记住，供状态接口复用")
 	}
 }
 
@@ -450,7 +294,7 @@ func TestUploadThenInstallFlow(t *testing.T) {
 
 	rec2 := httptest.NewRecorder()
 	app.handleUpgradeInstall(rec2, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/install",
-		strings.NewReader(`{"source":"upload"}`)))
+		strings.NewReader(`{}`)))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("安装失败 %d：%s", rec2.Code, rec2.Body.String())
 	}
@@ -467,33 +311,66 @@ func TestUploadThenInstallFlow(t *testing.T) {
 	}
 }
 
-func TestInstallFromGitHubSourceFlow(t *testing.T) {
-	um, exe := testManager(t)
-	srv, sum := fakeReleaseServer(t, "v9.9.9", []byte("FROM-GITHUB"))
-	um.source = newTestSource(srv)
+// TestUploadTarGzIsExtracted 覆盖「传上来的是发布用的 tar.gz」这条路：
+// 服务端按文件头认出 gzip 并解出里面的 goproxy，而不是把压缩包本身当二进制。
+// 归档解包逻辑是上传这条路上唯一的复杂步骤，必须有用例守着。
+func TestUploadTarGzIsExtracted(t *testing.T) {
+	um, _ := testManager(t)
+	app := &App{upgrade: um}
+
+	archive := buildTarGz(t, map[string][]byte{
+		"./goproxy":   []byte("NEW-BINARY"),
+		"./README.md": []byte("docs"),
+	})
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile("file", "goproxy-linux-amd64.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(archive); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	app.handleUpgradeUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("上传 tar.gz 失败 %d：%s", rec.Code, rec.Body.String())
+	}
+
+	got, err := os.ReadFile(um.stagePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("NEW-BINARY")) {
+		t.Errorf("暂存位上应当是解出来的二进制 %q，得到 %q", "NEW-BINARY", got)
+	}
+}
+
+// TestInstallRejectsLegacySource 守住「旧字段必须报错」。
+//
+// v0.11.0 删掉了下载式升级，但旧的控制台页面（浏览器缓存）仍会带上
+// `{"source":"github"}`。静默忽略它会让这个请求变成另一个意思 ——
+// 「装服务端手上那份暂存文件」，而不是用户以为的「去下载一版」。
+func TestInstallRejectsLegacySource(t *testing.T) {
+	um, _ := testManager(t)
 	app := &App{upgrade: um}
 
 	rec := httptest.NewRecorder()
 	app.handleUpgradeInstall(rec, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/install",
 		strings.NewReader(`{"source":"github"}`)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("安装失败 %d：%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("带旧 source 字段的请求应当被拒，得到 %d：%s", rec.Code, rec.Body.String())
 	}
-	var got upgradeInstallResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(rec.Body.String(), "upgrade_source_removed") {
+		t.Errorf("错误码不对：%s", rec.Body.String())
 	}
-	if !got.SumsVerified || got.SHA256 == "" || got.To != "v9.9.9" {
-		t.Errorf("安装结果不对：%+v", got)
-	}
-	if got.ArchiveSHA256 != sum {
-		t.Errorf("archive_sha256 应当是发布包（tar.gz）的校验和，得到 %q 期望 %q", got.ArchiveSHA256, sum)
-	}
-	if want := sha256Hex([]byte("FROM-GITHUB")); got.SHA256 != want {
-		t.Errorf("sha256 应当是最终装上去那个二进制的哈希，得到 %q 期望 %q", got.SHA256, want)
-	}
-	assertContent(t, exe, "FROM-GITHUB")
-	assertContent(t, exe+".old", "OLD-BINARY")
 }
 
 func TestInstallRefusesNothingStaged(t *testing.T) {
@@ -501,7 +378,7 @@ func TestInstallRefusesNothingStaged(t *testing.T) {
 	app := &App{upgrade: um}
 	rec := httptest.NewRecorder()
 	app.handleUpgradeInstall(rec, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/install",
-		strings.NewReader(`{"source":"upload"}`)))
+		strings.NewReader(`{}`)))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("没有暂存文件时应当 409，得到 %d：%s", rec.Code, rec.Body.String())
 	}
@@ -620,50 +497,6 @@ func testManager(t *testing.T) (*upgradeManager, string) {
 	um.restart = func(upgradeEnv) error { return nil }
 	um.restartDelay = 0
 	return um, exe
-}
-
-// fakeReleaseServer 造一个最小的「GitHub Releases」：/releases/latest 会 302 到
-// 指定 tag，校验和文件与 tar.gz 都按真实发布的命名提供。
-func fakeReleaseServer(t *testing.T, tag string, binary []byte) (*httptest.Server, string) {
-	t.Helper()
-	archive := buildTarGz(t, map[string][]byte{
-		"./goproxy":   binary,
-		"./README.md": []byte("docs"),
-		"./LICENSE":   []byte("license"),
-	})
-	assetName, sumsName := platformAssetNames()
-	sum := sha256Hex(archive)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
-			http.Redirect(w, r, "/owner/repo/releases/tag/"+tag, http.StatusFound)
-		case strings.Contains(r.URL.Path, "/releases/tag/"):
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = io.WriteString(w, "<html>release "+tag+"</html>")
-		case strings.HasSuffix(r.URL.Path, "/"+sumsName):
-			fmt.Fprintf(w, "%s  %s\n", sum, assetName)
-		case strings.HasSuffix(r.URL.Path, "/"+assetName):
-			w.Header().Set("Content-Type", "application/gzip")
-			_, _ = w.Write(archive)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv, sum
-}
-
-// newTestSource 把发布源指到一个 httptest 服务上。apiBase 指到同一个服务的
-// /api 前缀（会 404）：这样「API 富化」那条路会安静地失败，测试不碰外网。
-func newTestSource(srv *httptest.Server) *releaseSource {
-	return &releaseSource{
-		githubBase: srv.URL,
-		apiBase:    srv.URL + "/api",
-		repo:       "owner/repo",
-		mode:       "direct",
-		client:     srv.Client(),
-	}
 }
 
 func buildTarGz(t *testing.T, files map[string][]byte) []byte {
@@ -948,7 +781,7 @@ func TestUpgradeDelegatesToRootOnReadOnlyExeDir(t *testing.T) {
 	// 2) 安装：回 200（已暂存，不是失败）+ needs_root + 命令，且绝对不能动 exe
 	rec2 := httptest.NewRecorder()
 	app.handleUpgradeInstall(rec2, httptest.NewRequest(http.MethodPost, "/_goproxy/upgrade/install",
-		strings.NewReader(`{"source":"upload"}`)))
+		strings.NewReader(`{}`)))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("托管安装应当回 200，得到 %d：%s", rec2.Code, rec2.Body.String())
 	}

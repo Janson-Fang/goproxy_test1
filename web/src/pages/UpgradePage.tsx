@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
-import type { UpgradeCheck, UpgradeState } from '../types'
+import type { UpgradeState } from '../types'
 import { Badge, Card, ConfirmDialog, CopyBtn, Empty, Note, Spinner, toast } from '../ui'
 import { bytes, datetime } from '../format'
 import { usePolling } from '../hooks'
@@ -21,10 +21,8 @@ export function UpgradePage({ active }: { active: boolean }) {
   const [state, setState] = useState<UpgradeState | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  /** 正在进行的动作：'' | check | install | upload | rollback */
+  /** 正在进行的动作：'' | install | upload | rollback */
   const [busy, setBusy] = useState('')
-  const [check, setCheck] = useState<UpgradeCheck | null>(null)
-  const [pinned, setPinned] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [progress, setProgress] = useState<{ loaded: number; total: number } | null>(null)
   const [confirm, setConfirm] = useState<null | { kind: 'install' | 'rollback'; title: string; message: ReactNode }>(null)
@@ -39,8 +37,6 @@ export function UpgradePage({ active }: { active: boolean }) {
       const s = await api.getUpgradeState()
       setState(s)
       setErr(null)
-      // 上一次检查的结论由服务端记着，刷新页面不用重新联网检查一遍
-      if (s.last_check) setCheck((c) => c ?? (s.last_check as UpgradeCheck))
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -78,32 +74,16 @@ export function UpgradePage({ active }: { active: boolean }) {
     pending !== null,
   )
 
-  const doCheck = useCallback(async (version: string) => {
-    setBusy('check')
-    try {
-      const res = await api.checkUpgrade(version)
-      setCheck(res)
-      toast(
-        res.update_available ? 'info' : 'ok',
-        res.update_available ? `发现新版本 ${res.latest}` : `已是最新（${res.latest}）`,
-      )
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy('')
-    }
-  }, [])
-
-  const doInstall = useCallback(async (req: { source: 'github' | 'upload'; version?: string; sha256?: string; force?: boolean }) => {
+  const doInstall = useCallback(async (req: { sha256?: string }) => {
     setConfirm(null)
     setBusy('install')
     try {
       const res = await api.installUpgrade(req)
       if (res.needs_root) {
-        // 托管：下载、校验、-version 验证都在服务端做完了，但进程写不进二进制目录，
+        // 托管：校验与 -version 验证都在服务端做完了，但进程写不进二进制目录，
         // 最后一步要 root 在服务器上执行。所以不走「等服务重启」那套轮询。
         setRootCmd({ cmd: res.apply_command ?? '', what: `把 ${res.to} 装上去` })
-        toast('info', `已下载并校验完毕（${res.to}），等 root 应用`)
+        toast('info', `已校验完毕（${res.to}），等 root 应用`)
         setFile(null)
         setProgress(null)
         if (fileRef.current) fileRef.current.value = ''
@@ -178,7 +158,7 @@ export function UpgradePage({ active }: { active: boolean }) {
 
       {rootCmd && rootCmd.cmd && (
         <Note kind="ok">
-          {rootCmd.what}：下载、校验和 <span className="mono">-version</span> 验证都已经在服务端做完了，
+          {rootCmd.what}：校验和 <span className="mono">-version</span> 验证都已经在服务端做完了，
           最后一步要在这台机器上以 root 执行：
           <pre className="code" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
             {rootCmd.cmd}
@@ -197,7 +177,7 @@ export function UpgradePage({ active }: { active: boolean }) {
           这个实例的最后一步不能由服务自己做：服务账号写不进{' '}
           <span className="mono">{state.runtime.exe_dir}</span>
           （install.sh 装出来的实例都是这样：服务以 goproxy 跑、二进制目录归 root）。
-          所以控制台只负责下载、校验、验证并暂存，收尾要在服务器上以 root 执行：
+          所以控制台只负责校验、验证并暂存，收尾要在服务器上以 root 执行：
           {state.apply_command && (
             <pre className="code" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
               {state.apply_command}
@@ -290,14 +270,14 @@ export function UpgradePage({ active }: { active: boolean }) {
                   </td>
                 </tr>
                 <tr>
-                  <th>发布源</th>
+                  <th>发布页</th>
                   <td className="small">
-                    <span className="mono">{state?.source.repo}</span>
+                    <a href={state?.release_page} target="_blank" rel="noreferrer">
+                      {state?.release_page}
+                    </a>
                     <div className="faint">
-                      通道：{state?.source.channels.join(' / ')}（{state?.source.mode}）
-                    </div>
-                    <div className="faint">
-                      资源：{state?.source.asset_name}
+                      升级不向 GitHub 发请求（跑反代的服务器常常连不上它）：去发布页下载 tar.gz，
+                      再用下面的「上传文件升级」传上来。
                     </div>
                   </td>
                 </tr>
@@ -308,119 +288,8 @@ export function UpgradePage({ active }: { active: boolean }) {
       </Card>
 
       <Card
-        title="从 GitHub Releases 升级"
-        sub="和 install.sh 走同一套约定：同一个仓库、同一个资源命名、同一份 SHA256SUMS、同一批镜像通道"
-        actions={
-          <div className="row">
-            <input
-              className="input"
-              style={{ width: 130 }}
-              placeholder="指定版本"
-              value={pinned}
-              onChange={(e) => setPinned(e.target.value)}
-              disabled={!supported || busy !== ''}
-            />
-            <button className="btn sm" onClick={() => void doCheck(pinned.trim())} disabled={!supported || busy !== ''}>
-              {busy === 'check' ? '检查中' : pinned.trim() ? '检查该版本' : '检查最新版本'}
-            </button>
-          </div>
-        }
-      >
-        {!check ? (
-          <Empty icon="" text="还没有检查过：点右上角「检查最新版本」" />
-        ) : (
-          <div className="stack">
-            <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
-              <Badge kind={check.update_available ? 'info' : 'ok'} dot>
-                {check.update_available ? `有新版本 ${check.latest}` : `已是最新（${check.latest}）`}
-              </Badge>
-              <span className="faint small">当前 {check.current}</span>
-              {check.asset.size > 0 && <span className="faint small">包大小 {bytes(check.asset.size)}</span>}
-              {check.channel && <span className="faint small">通道 {check.channel}</span>}
-              {check.sums_verified ? (
-                <Badge kind="ok" title="已从发布方的 SHA256SUMS 拿到该包的 sha256">
-                  有校验和
-                </Badge>
-              ) : (
-                <Badge kind="warn" title="没拿到 SHA256SUMS：install.sh 在这种情况下会跳过完整性校验，这里保持一致">
-                  无校验和
-                </Badge>
-              )}
-              <span className="faint small">检查于 {datetime(check.checked_at)}</span>
-            </div>
-
-            {check.asset.sha256 && (
-              <div className="small">
-                发布包 sha256：<span className="mono">{check.asset.sha256}</span>
-              </div>
-            )}
-
-            {!check.latest_comparable && (
-              <Note kind="warn">
-                发布版本号 {check.latest} 不是 vX.Y.Z 形式，服务端不会拿它和当前版本比大小，
-                只能按你指定的版本去装。这种情况建议先确认发布页上的产物名。
-              </Note>
-            )}
-
-            <div className="row" style={{ flexWrap: 'wrap' }}>
-              <button
-                className="btn primary"
-                disabled={!supported || busy !== ''}
-                onClick={() =>
-                  setConfirm({
-                    kind: 'install',
-                    title: `安装 ${check.latest}`,
-                    message: (
-                      <>
-                        <div>
-                          来源：GitHub Releases（{state?.source.repo}）
-                        </div>
-                        <div>
-                          目标版本：<span className="mono">{check.latest}</span>
-                        </div>
-                        <div>
-                          资源：<span className="mono">{check.asset.name}</span>
-                          {check.asset.size > 0 ? `（${bytes(check.asset.size)}）` : ''}
-                        </div>
-                        <div style={{ marginTop: 8 }}>
-                          安装前的旧二进制会备份到 <span className="mono">*.old</span>，
-                          换文件之前会先跑一次新文件的 <span className="mono">-version</span> 确认它能启动。
-                          写入完成后进程会被替换，页面会短暂连不上。
-                        </div>
-                      </>
-                    ),
-                  })
-                }
-              >
-                {busy === 'install' ? '安装中' : '安装这个版本'}
-              </button>
-              <button
-                className="btn"
-                disabled={!supported || busy !== ''}
-                title="当前已经不低于这个版本时，用它可以强制重装一遍（用来修复被改坏的二进制）"
-                onClick={() =>
-                  setConfirm({
-                    kind: 'install',
-                    title: `强制重装 ${check.latest}`,
-                    message: '即使当前版本已经不低于它，也重新下载并替换一次二进制。',
-                  })
-                }
-              >
-                强制重装
-              </button>
-              {check.release_url && (
-                <a className="btn ghost" href={check.release_url} target="_blank" rel="noreferrer">
-                  看发布页
-                </a>
-              )}
-            </div>
-          </div>
-        )}
-      </Card>
-
-      <Card
         title="上传文件升级"
-        sub="离线 / 内网用：直接传 goproxy 二进制，或者传发布用的 tar.gz（按文件头自动识别并解包）"
+        sub="把 goproxy 二进制或发布用的 tar.gz 传上来（按文件头自动识别并解包）—— 服务器连不上 GitHub 时走这条路"
       >
         <div className="stack">
           <div className="row" style={{ flexWrap: 'wrap' }}>
@@ -572,16 +441,9 @@ export function UpgradePage({ active }: { active: boolean }) {
               void doRollback()
               return
             }
-            // 上传源装的是暂存文件，GitHub 源装的是检查出来的那个版本
-            if (state?.staged.present && confirm.title.includes('暂存')) {
-              void doInstall({ source: 'upload', sha256: state.staged.sha256 })
-              return
-            }
-            void doInstall({
-              source: 'github',
-              version: check?.latest,
-              force: confirm.title.includes('强制'),
-            })
+            // 只有「安装暂存的文件」一种情况：把 sha256 带上，
+            // 让服务端再确认一次这份文件在上传之后没被换过。
+            void doInstall({ sha256: state?.staged.sha256 })
           }}
         />
       )}

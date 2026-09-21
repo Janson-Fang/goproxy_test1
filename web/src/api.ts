@@ -28,7 +28,6 @@ import type {
   Route,
   SessionInfo,
   Stats,
-  UpgradeCheck,
   UpgradeInstallResult,
   UpgradeState,
   UpgradeStaged,
@@ -482,29 +481,14 @@ export async function getUpgradeState(): Promise<UpgradeState> {
 }
 
 /**
- * 检查新版本。version 留空表示「最新」。
+ * 执行升级：把「已经上传并暂存好」的文件装上去。
  *
- * 服务端会顺带把发布方的 SHA256SUMS-<arch>.txt 拿下来当通道探针
- * （几十字节，秒级判断哪条下载通道通），所以这次请求可能比别的接口慢一点。
- */
-export async function checkUpgrade(version = ''): Promise<UpgradeCheck> {
-  const { data } = await raw<UpgradeCheck>('POST', '/_goproxy/upgrade/check', {
-    body: version ? { version } : {},
-  })
-  return data
-}
-
-/**
- * 执行升级。服务端在响应之后会替换掉自己的进程，所以这个请求
+ * 服务端在响应之后可能会替换掉自己的进程（二进制目录可写时），所以这个请求
  * **成功返回不代表新版本已经在跑**：调用方应当接着轮询 getUpgradeState()
- * 直到版本变化或服务恢复。
+ * 直到版本变化或服务恢复。写不进去二进制目录时不会替换进程，而是回一个
+ * needs_root=true + apply_command，等人在服务器上以 root 收尾。
  */
-export async function installUpgrade(req: {
-  source: 'github' | 'upload'
-  version?: string
-  sha256?: string
-  force?: boolean
-}): Promise<UpgradeInstallResult> {
+export async function installUpgrade(req: { sha256?: string }): Promise<UpgradeInstallResult> {
   const { data } = await raw<UpgradeInstallResult>('POST', '/_goproxy/upgrade/install', { body: req })
   return data
 }

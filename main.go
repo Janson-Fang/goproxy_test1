@@ -784,9 +784,8 @@ func serveAdminIndex(w http.ResponseWriter) {
 		"  /_goproxy/events          实时访问日志（SSE）\n"+
 		"  /_goproxy/reload          POST 手动重载配置\n"+
 		"  /_goproxy/upgrade         GET 当前版本 / 升级能力 / 备份与暂存状态\n"+
-		"  /_goproxy/upgrade/check   POST 检查新版本（body 可省略，或 {\"version\":\"v0.9.1\"}）\n"+
 		"  /_goproxy/upgrade/upload  POST 上传二进制（multipart 的 file 字段，或直接把文件当请求体）\n"+
-		"  /_goproxy/upgrade/install POST {source:\"github\"|\"upload\", version?, sha256?, force?} 执行升级\n"+
+		"  /_goproxy/upgrade/install POST {\"sha256\":\"可选\"} 安装已暂存的文件\n"+
 		"  /_goproxy/upgrade/rollback POST 回退到 <exe>.old（上一次升级前的版本）\n")
 }
 
@@ -877,7 +876,6 @@ func (a *App) adminMux() *http.ServeMux {
 	// 所有动作串行（upgradeManager.busy），每次动作写审计日志（谁触发的），
 	// 并且安装 / 回退在换文件之前一律先跑一次新二进制的 -version。
 	mux.HandleFunc("GET /_goproxy/upgrade", a.handleUpgradeState)
-	mux.HandleFunc("POST /_goproxy/upgrade/check", a.handleUpgradeCheck)
 	mux.HandleFunc("POST /_goproxy/upgrade/upload", a.handleUpgradeUpload)
 	mux.HandleFunc("POST /_goproxy/upgrade/install", a.handleUpgradeInstall)
 	mux.HandleFunc("POST /_goproxy/upgrade/rollback", a.handleUpgradeRollback)

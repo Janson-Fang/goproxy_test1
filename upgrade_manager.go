@@ -4,7 +4,6 @@ package main
 // 从 upgrade.go 拆出，纯机械移动，逻辑未动。
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,16 +20,13 @@ import (
 
 // stagedBinary 是一份已经验证过、等着被换上去的二进制。
 type stagedBinary struct {
-	Path         string
-	Size         int64
-	SHA256       string
-	Version      string
-	Commit       string
-	MTime        time.Time
-	Source       string // github | upload
-	Channel      string
-	SumsVerified bool
-	ArchiveSHA   string
+	Path    string
+	Size    int64
+	SHA256  string
+	Version string
+	Commit  string
+	MTime   time.Time
+	Source  string // upload | rollback
 }
 
 type upgradeManager struct {
@@ -38,7 +34,6 @@ type upgradeManager struct {
 	// configDB 是配置库路径：托管升级用它定位暂存目录（配置库旁边的 upgrade/），
 	// root 用 -upgrade-apply 应用时也会算出同一个位置。
 	configDB string
-	source   *releaseSource
 
 	// verify / restart / restartDelay 是留给单测的注入点。
 	// 这三件事在测试进程里必须有替身：verify 会真的去执行「被验证的文件」，
@@ -51,10 +46,9 @@ type upgradeManager struct {
 
 	mu     sync.Mutex
 	staged *stagedBinary
-	last   *upgradeCheckResult
 
-	// busy 保证同一时刻只有一个升级动作（检查 / 上传 / 安装 / 回退）。
-	// 用 CAS 而不是加锁：拿到锁之后要做的可能是几十秒的下载，
+	// busy 保证同一时刻只有一个升级动作（上传 / 安装 / 回退）。
+	// 用 CAS 而不是加锁：拿到锁之后要做的可能是几十秒的写入与校验，
 	// 而「现在忙不忙」这个判断本身必须是瞬时的、不能被阻塞。
 	busy atomic.Bool
 }
@@ -74,7 +68,6 @@ func newUpgradeManagerFor(exe, configDB string) *upgradeManager {
 	return &upgradeManager{
 		exe:          exe,
 		configDB:     configDB,
-		source:       newReleaseSource(),
 		verify:       verifyBinary,
 		restart:      restartProcess,
 		restartDelay: upgradeRestartDelay,
@@ -141,37 +134,20 @@ func (um *upgradeManager) currentStaged() *stagedBinary {
 	return um.staged
 }
 
-func (um *upgradeManager) setLastCheck(res *upgradeCheckResult) {
-	um.mu.Lock()
-	um.last = res
-	um.mu.Unlock()
-}
-
-func (um *upgradeManager) lastCheck() *upgradeCheckResult {
-	um.mu.Lock()
-	defer um.mu.Unlock()
-	return um.last
-}
-
 func (um *upgradeManager) stagedView() upgradeStagedView {
 	if st := um.currentStaged(); st != nil {
 		return upgradeStagedView{
-			Present:      true,
-			Path:         st.Path,
-			Size:         st.Size,
-			SHA256:       st.SHA256,
-			Version:      st.Version,
-			Commit:       st.Commit,
-			MTime:        formatLogTime(st.MTime),
-			Verified:     true,
-			Source:       st.Source,
-			Channel:      st.Channel,
-			SumsVerified: st.SumsVerified,
+			Present:  true,
+			Path:     st.Path,
+			Size:     st.Size,
+			SHA256:   st.SHA256,
+			Version:  st.Version,
+			Commit:   st.Commit,
+			MTime:    formatLogTime(st.MTime),
+			Verified: true,
+			Source:   st.Source,
 		}
 	}
-	// 进程里没有记录（多半是刚重启过）但磁盘上还留着一份：只报存在性和大小。
-	// sha256 / 自述版本不必为了显示再算一遍，真装的时候一定会重新验证，
-	// 到时候才算才有意义。
 	// 进程里没有记录（多半是刚重启过）但磁盘上还留着一份：只报存在性和大小。
 	// sha256 / 自述版本不必为了显示再算一遍，真装的时候一定会重新验证，
 	// 到时候才算才有意义。
@@ -255,7 +231,7 @@ func (um *upgradeManager) install(env upgradeEnv, st *stagedBinary) error {
 func (um *upgradeManager) stageFromDisk(expectedSHA string) (*stagedBinary, error) {
 	path := um.findStaged()
 	if path == "" {
-		return nil, upgradeConflict("upgrade_nothing_staged", "服务端没有待安装的文件：请先在控制台上传一个二进制，或先检查更新。")
+		return nil, upgradeConflict("upgrade_nothing_staged", "服务端没有待安装的文件：请先在控制台上传一个二进制。")
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -283,67 +259,6 @@ func (um *upgradeManager) stageFromDisk(expectedSHA string) (*stagedBinary, erro
 	}
 	um.setStaged(st)
 	return st, nil
-}
-
-// stageFromGitHub 从 GitHub Releases 取指定版本（空 = 最新）并落到暂存位。
-func (um *upgradeManager) stageFromGitHub(ctx context.Context, want string, force bool) (*stagedBinary, *fetchResult, error) {
-	info, err := um.source.latestRelease(ctx, want)
-	if err != nil {
-		return nil, nil, &apiError{http.StatusBadGateway, "upgrade_source_unreachable",
-			"取不到发布信息：" + err.Error()}
-	}
-	newVer := parseBuildVersion(info.Tag)
-	if !newVer.OK {
-		return nil, nil, &apiError{http.StatusBadGateway, "upgrade_bad_release_tag",
-			fmt.Sprintf("发布版本号 %q 解析不了，拒绝自动升级（可以指定一个具体版本，或改用上传文件）。", info.Tag)}
-	}
-
-	cur := parseBuildVersion(version)
-	if cur.OK && compareBuild(cur, newVer) >= 0 && !force {
-		return nil, nil, upgradeConflict("upgrade_already_current",
-			fmt.Sprintf("当前 %s 已经不低于 %s，没有需要安装的更新。确实要重装同一版本，请带上 force。", version, info.Tag))
-	}
-
-	dest := um.stagePath()
-	if dest == "" {
-		return nil, nil, upgradeConflict("upgrade_unsupported",
-			"没有可写的暂存位置（二进制目录与状态目录都写不进去），无法升级。")
-	}
-	res, err := um.source.fetchRelease(ctx, info, dest, upgradeMaxStagedBytes)
-	if err != nil {
-		_ = os.Remove(dest)
-		return nil, nil, err
-	}
-
-	bv, commit, err := um.verify(dest)
-	if err != nil {
-		_ = os.Remove(dest)
-		return nil, nil, &apiError{http.StatusBadGateway, "upgrade_bad_binary", err.Error()}
-	}
-	// 自述版本比发布 tag 还旧：最常见成因是加速镜像缓存了旧文件。
-	// 装下去就会出现「升级成功了但版本没变」这种最费解的现象，所以直接拦住。
-	if bv.OK && compareBuild(bv, newVer) < 0 {
-		_ = os.Remove(dest)
-		return nil, nil, &apiError{http.StatusBadGateway, "upgrade_stale_mirror",
-			fmt.Sprintf("下载到的二进制自述版本是 %s，低于发布版本 %s（多半是加速镜像缓存着旧文件），已放弃安装。", bv.Raw, info.Tag)}
-	}
-	sha, err := hashFile(dest)
-	if err != nil {
-		_ = os.Remove(dest)
-		return nil, nil, err
-	}
-	fi, err := os.Stat(dest)
-	if err != nil {
-		return nil, nil, err
-	}
-	st := &stagedBinary{
-		Path: dest, Size: fi.Size(), SHA256: sha,
-		Version: bv.Raw, Commit: commit, MTime: fi.ModTime(),
-		Source: "github", Channel: res.Channel, SumsVerified: res.SumsVerified,
-		ArchiveSHA: res.ArchiveSHA256,
-	}
-	um.setStaged(st)
-	return st, res, nil
 }
 
 // restartSoon 在响应发出去之后替换进程。

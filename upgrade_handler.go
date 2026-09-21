@@ -4,7 +4,6 @@ package main
 // 从 upgrade.go 拆出，纯机械移动，逻辑未动。
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 )
 
 // HTTP 视图
@@ -33,26 +31,17 @@ type upgradeRuntimeView struct {
 	Comparable bool   `json:"version_comparable"`
 }
 
-type upgradeSourceView struct {
-	Repo      string   `json:"repo"`
-	Mode      string   `json:"mode"`
-	Channels  []string `json:"channels"`
-	AssetName string   `json:"asset_name"`
-	SumsName  string   `json:"sums_name"`
-}
-
+// upgradeStagedView 是「有一份等着被装上去的文件」的对外表示。
 type upgradeStagedView struct {
-	Present      bool   `json:"present"`
-	Path         string `json:"path,omitempty"`
-	Size         int64  `json:"size,omitempty"`
-	SHA256       string `json:"sha256,omitempty"`
-	Version      string `json:"version,omitempty"`
-	Commit       string `json:"commit,omitempty"`
-	MTime        string `json:"mtime,omitempty"`
-	Verified     bool   `json:"verified"`
-	Source       string `json:"source,omitempty"`
-	Channel      string `json:"channel,omitempty"`
-	SumsVerified bool   `json:"sums_verified"`
+	Present  bool   `json:"present"`
+	Path     string `json:"path,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	SHA256   string `json:"sha256,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Commit   string `json:"commit,omitempty"`
+	MTime    string `json:"mtime,omitempty"`
+	Verified bool   `json:"verified"`
+	Source   string `json:"source,omitempty"`
 }
 
 type upgradeBackupView struct {
@@ -64,38 +53,19 @@ type upgradeBackupView struct {
 	MTime   string `json:"mtime,omitempty"`
 }
 
-type upgradeAssetView struct {
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256,omitempty"`
-}
-
-type upgradeCheckResult struct {
-	Current           string           `json:"current"`
-	CurrentComparable bool             `json:"current_comparable"`
-	Latest            string           `json:"latest"`
-	LatestComparable  bool             `json:"latest_comparable"`
-	UpdateAvailable   bool             `json:"update_available"`
-	ReleaseURL        string           `json:"release_url"`
-	Asset             upgradeAssetView `json:"asset"`
-	Channel           string           `json:"channel"`
-	SumsVerified      bool             `json:"sums_verified"`
-	CheckedAt         string           `json:"checked_at"`
-	Notes             string           `json:"notes,omitempty"`
-}
-
 type upgradeStateResponse struct {
-	Runtime   upgradeRuntimeView  `json:"runtime"`
-	Supported bool                `json:"supported"`
-	Reason    string              `json:"reason,omitempty"`
-	Writable  bool                `json:"writable"`
-	Source    upgradeSourceView   `json:"source"`
-	Staged    upgradeStagedView   `json:"staged"`
-	Backup    upgradeBackupView   `json:"backup"`
-	Busy      bool                `json:"busy"`
-	LastCheck *upgradeCheckResult `json:"last_check,omitempty"`
-	// NeedsRoot 表示升级 / 回退的最后一步必须由 root 做：进程能下载、能校验、
-	// 能跑 -version 验证，但写不进二进制目录（install.sh 装出来的实例就是这种）。
+	Runtime   upgradeRuntimeView `json:"runtime"`
+	Supported bool               `json:"supported"`
+	Reason    string             `json:"reason,omitempty"`
+	Writable  bool               `json:"writable"`
+	// ReleasePage 是发布页地址：这台机器可能连不上 GitHub（升级要走「上传文件」），
+	// 但**你的浏览器**通常能打开它 —— 界面把它给出，省得人去猜去哪下 tar.gz。
+	ReleasePage string            `json:"release_page"`
+	Staged      upgradeStagedView `json:"staged"`
+	Backup      upgradeBackupView `json:"backup"`
+	Busy        bool              `json:"busy"`
+	// NeedsRoot 表示升级 / 回退的最后一步必须由 root 做：进程能校验、能跑
+	// -version 验证，但写不进二进制目录（install.sh 装出来的实例就是这种）。
 	// 这时 StageDir 是暂存位置，ApplyCommand / RollbackCommand 是给人复制的命令。
 	NeedsRoot       bool   `json:"needs_root"`
 	StageDir        string `json:"stage_dir,omitempty"`
@@ -107,20 +77,15 @@ type upgradeStateResponse struct {
 // 注意它是在**进程被替换之前**写出去的，所以里面的 restart 字段描述的是
 // 接下来会发生什么，而不是已经发生了什么。
 type upgradeInstallResult struct {
-	OK           bool   `json:"ok"`
-	From         string `json:"from"`
-	To           string `json:"to"`
-	SHA256       string `json:"sha256"`
-	Backup       string `json:"backup"`
-	Restart      string `json:"restart"`
-	Service      string `json:"service"`
-	Source       string `json:"source"`
-	Verified     bool   `json:"verified"`
-	Channel      string `json:"channel,omitempty"`
-	SumsVerified bool   `json:"sums_verified"`
-	// ArchiveSHA256 是发布包（tar.gz）的 sha256，也就是校验和文件里那一个。
-	// 它和 SHA256 不是一回事：SHA256 是最终装上去那个二进制的哈希。
-	ArchiveSHA256 string `json:"archive_sha256,omitempty"`
+	OK       bool   `json:"ok"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	SHA256   string `json:"sha256"`
+	Backup   string `json:"backup"`
+	Restart  string `json:"restart"`
+	Service  string `json:"service"`
+	Source   string `json:"source"`
+	Verified bool   `json:"verified"`
 	// NeedsRoot 为 true 时这次「安装」只是把新版本暂存好了，还没换上去：
 	// ApplyCommand 是下一步要在服务器上执行的 root 命令，StagedPath / StagedSHA256
 	// 是那份待应用文件的落点与哈希，方便人工核对。
@@ -142,7 +107,7 @@ func upgradeConflict(code, msg string) *apiError {
 //
 // 管理接口的 readBody 把空 body 当错误（对写配置的接口来说是对的：静默接受
 // 一个空 PATCH 会让人以为改成功了）。升级这几个接口不一样
-// `curl -X POST /_goproxy/upgrade/check` 不带 body 是完全合理的用法。
+// `curl -X POST /_goproxy/upgrade/install` 不带 body 是完全合理的用法。
 func readOptionalJSON(r *http.Request, v any) error {
 	defer r.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
@@ -178,11 +143,16 @@ func actorLabel(user string, via authVia) string {
 	return "(unknown)"
 }
 
+// upgradeReleasePage 是发布页地址。
+//
+// 升级本身已经不向 GitHub 发请求了（跑反代的服务器经常连不上），但**使用者的
+// 浏览器**通常能打开它 —— 界面把地址摆出来，人就知道该去哪儿下 tar.gz 再上传。
+const upgradeReleasePage = "https://github.com/Janson-Fang/goproxy_test1/releases"
+
 func (a *App) handleUpgradeState(w http.ResponseWriter, r *http.Request) {
 	um := a.upgrade
 	env := um.env()
 	cur := parseBuildVersion(version)
-	pkg, sums := platformAssetNames()
 
 	resp := upgradeStateResponse{
 		Runtime: upgradeRuntimeView{
@@ -196,86 +166,22 @@ func (a *App) handleUpgradeState(w http.ResponseWriter, r *http.Request) {
 			Strategy:   string(env.Strategy),
 			Comparable: cur.OK,
 		},
-		Supported: env.supported(),
-		Reason:    env.Reason,
-		Writable:  env.Writable,
-		Source: upgradeSourceView{
-			Repo:      um.source.repo,
-			Mode:      um.source.mode,
-			Channels:  channelLabels(um.source.channels()),
-			AssetName: pkg,
-			SumsName:  sums,
-		},
-		Staged:    um.stagedView(),
-		Backup:    um.backupView(),
-		Busy:      um.isBusy(),
-		LastCheck: um.lastCheck(),
+		Supported:   env.supported(),
+		Reason:      env.Reason,
+		Writable:    env.Writable,
+		ReleasePage: upgradeReleasePage,
+		Staged:      um.stagedView(),
+		Backup:      um.backupView(),
+		Busy:        um.isBusy(),
 	}
 	if env.Delegated {
-		// 能下载、能校验、能验证，但写不进二进制目录：把「以 root 应用」的命令给出来。
+		// 能校验、能验证，但写不进二进制目录：把「以 root 应用」的命令给出来。
 		resp.NeedsRoot = true
 		resp.StageDir = env.StageDir
 		resp.ApplyCommand = um.applyCommand(false)
 		resp.RollbackCommand = um.applyCommand(true)
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func (a *App) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
-	um := a.upgrade
-	var req struct {
-		Version string `json:"version"`
-	}
-	if err := readOptionalJSON(r, &req); err != nil {
-		writeErr(w, err)
-		return
-	}
-	if !um.begin() {
-		writeErr(w, upgradeConflict("upgrade_busy", "已经有一个升级动作在进行中，等它结束再来。"))
-		return
-	}
-	defer um.end()
-
-	ctx, cancel := context.WithTimeout(r.Context(), upgradeCheckTimeout)
-	defer cancel()
-
-	info, err := um.source.latestRelease(ctx, req.Version)
-	if err != nil {
-		writeErr(w, &apiError{http.StatusBadGateway, "upgrade_source_unreachable",
-			"取不到发布信息：" + err.Error()})
-		return
-	}
-
-	pkg, sumsName := platformAssetNames()
-	cur := parseBuildVersion(version)
-	lat := parseBuildVersion(info.Tag)
-	res := &upgradeCheckResult{
-		Current:           version,
-		CurrentComparable: cur.OK,
-		Latest:            info.Tag,
-		LatestComparable:  lat.OK,
-		// 当前版本比不了（dev / 裸提交号）时按「有更新」处理：
-		// 那不是发布版本，给一条能升到正式版本的路径比说「已是最新」有用。
-		UpdateAvailable: !cur.OK || (lat.OK && compareBuild(cur, lat) < 0),
-		ReleaseURL:      info.HTMLURL,
-		Asset:           upgradeAssetView{Name: pkg},
-		CheckedAt:       formatLogTime(time.Now()),
-		Notes:           info.Notes,
-	}
-	// 顺手把校验和文件拿下来：它是发布方给出的权威 sha256，也是 install.sh
-	// 用来探测「哪个下载通道通」的探针（只有几十字节，秒级）。拿不到不算失败，
-	// 只是这次检查给不出 sha256，界面上会标成「未校验」。
-	if sum, ch, err := um.source.fetchSums(ctx, info.Tag, pkg, sumsName); err == nil {
-		res.Asset.SHA256 = sum
-		res.Channel = ch
-		res.SumsVerified = true
-	} else {
-		slog.Warn("升级：取校验和文件失败，本次检查不提供 sha256", "tag", info.Tag, "err", err)
-	}
-	res.Asset.Size = um.source.assetSize(ctx, info, pkg, res.Channel)
-
-	um.setLastCheck(res)
-	writeJSON(w, http.StatusOK, res)
 }
 
 func (a *App) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +271,11 @@ func (a *App) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, um.stagedView())
 }
 
+// handleUpgradeInstall 把「已经暂存好的文件」装上去。
+//
+// 只有上传这一个来源。下载式升级（向 GitHub Releases 取包）在这台机器上常常
+// 连不通 —— 跑反代的服务器多半在受限网络里 —— 与其让一段总是失败的网络逻辑
+// 留在升级这条关键路径上，不如把「取更新包」交给使用者的浏览器去做。
 func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 	um := a.upgrade
 	env := um.env()
@@ -374,20 +285,22 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Source  string `json:"source"`
-		Version string `json:"version"`
-		SHA256  string `json:"sha256"`
-		Force   bool   `json:"force"`
+		// Source 是 v0.11.0 之前的字段（github | upload）。这里**只为了报错**才留着：
+		// 静默忽略一个「选下载源」的字段，会让旧页面提交的 "github" 变成一个含义
+		// 完全不同的请求（去装服务端手上那份暂存文件）—— 宁可明确拒绝。
+		Source string `json:"source"`
+		// SHA256 可选：填了就要求暂存文件和它对得上（防的是「上传之后、
+		// 安装之前」这段窗口里文件被换掉）。
+		SHA256 string `json:"sha256"`
 	}
 	if err := readOptionalJSON(r, &req); err != nil {
 		writeErr(w, err)
 		return
 	}
-	if req.Source == "" {
-		req.Source = "github"
-	}
-	if req.Source != "github" && req.Source != "upload" {
-		writeErr(w, badRequest("bad_source", "source 只能是 github 或 upload，收到 %q", req.Source))
+	if req.Source != "" {
+		writeErr(w, badRequest("upgrade_source_removed",
+			"升级源已下线：v0.11.0 起控制台只支持「上传文件升级」。"+
+				"如果你看到的是旧的页面，刷新一下控制台再试。"))
 		return
 	}
 	if !um.begin() {
@@ -399,58 +312,39 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 	actor := actorLabel(a.identifyAdminRequest(r, sessionHandleFrom(r)))
 	from := version
 
-	var (
-		st  *stagedBinary
-		res *fetchResult
-		err error
-	)
-	if req.Source == "upload" {
-		st, err = um.stageFromDisk(req.SHA256)
-	} else {
-		st, res, err = um.stageFromGitHub(r.Context(), req.Version, req.Force)
-	}
+	st, err := um.stageFromDisk(req.SHA256)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 
-	// 托管：下载、校验、-version 验证都已经做完了，但进程写不进去二进制目录，
+	// 托管：校验与 -version 验证都已经做完了，但进程写不进去二进制目录，
 	// 最后那一步（写文件 + 重启服务）得由 root 来。这不是失败，所以回 200，
 	// 把该执行的命令一并给出去；界面据此显示「等待 root 应用」。
 	if !env.canSwap() {
-		slog.Info("升级：已暂存，等待 root 应用", "actor", actor, "source", req.Source,
+		slog.Info("升级：已暂存，等待 root 应用", "actor", actor,
 			"from", from, "to", st.Version, "staged", st.Path, "sha256", st.SHA256)
-		out := upgradeInstallResult{
+		writeJSON(w, http.StatusOK, upgradeInstallResult{
 			OK: true, From: from, To: st.Version, SHA256: st.SHA256,
 			Backup: filepath.Base(um.backupPath()), Restart: string(env.Strategy),
 			Service: env.Service, Source: st.Source, Verified: true,
-			Channel: st.Channel, SumsVerified: st.SumsVerified, ArchiveSHA256: st.ArchiveSHA,
 			NeedsRoot: true, ApplyCommand: um.applyCommand(false),
 			StagedPath: st.Path, StagedSHA256: st.SHA256,
-		}
-		if res != nil {
-			out.Channel = res.Channel
-		}
-		writeJSON(w, http.StatusOK, out)
+		})
 		return
 	}
 
-	slog.Info("升级：开始安装", "actor", actor, "source", req.Source,
-		"from", from, "to", st.Version, "sha256", st.SHA256, "sums_verified", st.SumsVerified)
+	slog.Info("升级：开始安装", "actor", actor,
+		"from", from, "to", st.Version, "sha256", st.SHA256)
 	if err := um.install(env, st); err != nil {
 		writeErr(w, err)
 		return
 	}
-	out := upgradeInstallResult{
+	writeJSON(w, http.StatusOK, upgradeInstallResult{
 		OK: true, From: from, To: st.Version, SHA256: st.SHA256,
 		Backup: filepath.Base(um.backupPath()), Restart: string(env.Strategy),
 		Service: env.Service, Source: st.Source, Verified: true,
-		Channel: st.Channel, SumsVerified: st.SumsVerified, ArchiveSHA256: st.ArchiveSHA,
-	}
-	if res != nil {
-		out.Channel = res.Channel
-	}
-	writeJSON(w, http.StatusOK, out)
+	})
 
 	// 最后一步：把当前进程换成新二进制。放在响应之后，因为 syscall.Exec
 	// 会把进程镜像整个换掉，响应必须已经发出去。

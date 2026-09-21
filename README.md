@@ -1006,22 +1006,21 @@ systemctl show -p ExecMainStartTimestamp goproxy                  # 重启时间
 
 ### 控制台里升级
 
-控制台的「升级」页把上面这套流程搬进了网页，**约定完全一致**：同一个仓库、同一份资源命名
-（`goproxy-<os>-<arch>.tar.gz` / `SHA256SUMS-<arch>.txt`）、同一批镜像通道、同一个回滚文件名
-（`goproxy.old`）。所以界面里装出来的东西和再跑一遍 `install.sh` 是同一个，排障时两种路子可以互换。
+控制台的「升级」页只走**上传文件**这一条路：把要装的二进制（或发布用的 `.tar.gz`）传上去，
+服务端算 sha256、跑一次 `-version` 验证，然后替换二进制并重启。
 
-两条更新源：
+为什么不做「一键检查更新」：那要求**服务器自己**去访问 GitHub。跑反代的机器多半在受限网络里
+（国内云主机常常连不通 `github.com`，只能靠第三方加速镜像中转），一段注定失败、或者要把
+二进制托付给第三方中转的网络逻辑，不该留在升级这条关键路径上。让**你的浏览器**去发布页下载、
+再把文件传上来，更可靠也可控 —— 代价是升级要手动两步。
 
-| 来源 | 适合 |
-|---|---|
-| **GitHub Releases** | 常规升级。默认走 `Janson-Fang/goproxy_test1`，先直连、不通再依次试 `gh-proxy.com` / `ghfast.top` / `ghproxy.net` |
-| **上传文件** | 内网 / 离线。传 `goproxy` 二进制或发布用的 `.tar.gz` 都行（按文件头自动识别并解包） |
+回滚文件名仍是 `goproxy.old`，和 `install.sh` 一致，所以「界面点的」「命令行做的」「脚本装的」
+三边可以互换着排障。
 
 ```text
 GET  /_goproxy/upgrade           当前版本、升级能力、备份与暂存状态
-POST /_goproxy/upgrade/check     检查新版本（body 可省略，或 {"version":"v0.9.1"}）
 POST /_goproxy/upgrade/upload    上传二进制（multipart 的 file 字段，或直接把文件当请求体）
-POST /_goproxy/upgrade/install   {"source":"github"|"upload", "version":"", "sha256":"", "force":false}
+POST /_goproxy/upgrade/install   {"sha256":""} 安装已暂存的文件（sha256 可选，填了就要求对得上）
 POST /_goproxy/upgrade/rollback  回退到 <exe>.old
 ```
 
@@ -1031,9 +1030,7 @@ POST /_goproxy/upgrade/rollback  回退到 <exe>.old
 |---|---|
 | 换二进制之前先执行一次 `新文件 -version` | 校验和只能证明字节没坏，证明不了它能在这台机器上跑（下错架构的包哈希也是对的）。跑得起来才允许替换 |
 | 旧二进制先备份成 `<exe>.old` | 和 `install.sh` 同一个文件名，回滚命令可以直接照抄 |
-| 拿不到 `SHA256SUMS` 时**标出来**但继续 | 与 `install.sh` 保持一致；区别只在于界面和响应里会明说「未校验」，不是默默跳过 |
-| 下载到的二进制自述版本比发布 tag 还旧就拒绝 | 镜像缓存旧文件时的典型症状是「升级成功了但版本没变」，直接拦住比事后排查省事 |
-| 直连优先、镜像兜底，并且会放弃「连得上但龟速」的通道 | 和 `install.sh` 相同的取舍：镜像有缓存，刚发布的版本可能还拉不到 |
+| 上传时就验证一次，安装前再验证一次 | 后者防的是「上传之后、安装之前」这段窗口里文件被换掉（提交时带上 `sha256` 可以钉死） |
 | 响应写完再替换进程 | `syscall.Exec` 会把当前进程镜像整个换掉，先写响应才拿得到结果 |
 
 重启方式按平台自动选：Linux/macOS 用 `syscall.Exec` 原地替换（PID 不变，不依赖服务管理器）；
@@ -1053,7 +1050,7 @@ Windows 起一个新进程再退出旧进程（这条路是**尽力而为**：�
 替换自己二进制的权限**（这是对的：拿到控制台不等于拿到 root）。这种情况下升级页不会变成
 不可用，而是走「托管」：
 
-1. 控制台照旧完成下载、`SHA256SUMS` 校验，以及对暂存文件跑一次 `-version` 验证；
+1. 控制台照旧完成 sha256 校验，以及对暂存文件跑一次 `-version` 验证；
 2. 文件落在配置库旁边的 `upgrade/` 目录（`ReadWritePaths` 已经放行了那里，不需要额外授权）；
 3. 页面给出一条命令，在服务器上以 root 执行它完成替换与重启：
 
@@ -1077,16 +1074,6 @@ curl -fsSL https://cdn.jsdelivr.net/gh/Janson-Fang/goproxy_test1@main/install.sh
 
 代价要明白：**从此这个服务能改写自己的二进制**，控制台一旦被攻破就等于持久化。
 项目默认不这么做，`install.sh` 也不会替你改。
-
-可覆盖的环境变量（都只在服务端读）：
-
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `GOPROXY_UPGRADE_REPO` | `Janson-Fang/goproxy_test1` | 发布源仓库（`owner/name`） |
-| `GOPROXY_UPGRADE_MIRROR` | `auto` | `auto` / `direct` / 具体镜像前缀 |
-| `GOPROXY_UPGRADE_MIRRORS` | `https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/` | `auto` 模式下按顺序尝试的镜像 |
-| `GOPROXY_UPGRADE_GITHUB` | `https://github.com` | GitHub 基址（自建 / 企业版） |
-| `GOPROXY_UPGRADE_API` | `https://api.github.com` | 只用来兜底解析版本和取发布说明 |
 
 ### 版本号从哪来
 
