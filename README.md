@@ -115,6 +115,8 @@ INFO 配置已生效 routes=6 ports=[8000 8081 8082 8083 8085]
 | **谁在写** | 只有管理接口（控制台 / curl），写完全是事务性的 |
 | **不再支持的路径** | 文件轮询（已删）；直接拿 `sqlite3` 改库 —— 那条路会绕过校验、自锁检查和引用完整性，而这几样恰恰是配置安全的地方。要批量改就用下面两个命令行开关 |
 | **表结构** | `settings`（顶层标量）、`default_ports`、`trusted_proxies`、`global_ip_deny`、`admin_users`、`ip_lists` + `ip_list_rules`、`routes`、`route_acl_lists`（路由 → 名单引用）、`tls_settings`、`acme_hosts`、`config_history`。限流 / 熔断 / 认证这三段叶子配置仍然是整块 JSON 列 —— 它们要么整块配、要么整块不配，从来不会被单独查询或按字段过滤 |
+| **库里还有两张「不是配置」的表** | `ban_entries` 与 `honeypot_ports` / `honeypot_settings`。它们和上面那些表睡在同一个库里，但**刻意不属于 `Config`**：不进 `revision`、不进 `config_history`、不出现在 `-config-export`、也不会被 `-config-import` 覆盖。理由是 `revision` 是整份配置的哈希 —— 自动封禁要是写进配置，每封一个 IP 都会让正在控制台编辑的人下一次保存撞 409，20 版历史窗口也会被自动事件挤满。它们**不在 `writeConfigTx` 的清空清单里**，所以改配置不会顺手抹掉封禁 |
+| **新增这几张表没有 bump schema 版本** | 因为 `migrate()` 在版本不一致时是硬失败，bump 上去会让「升级后回滚到旧二进制」直接起不来。而加表是纯增量的：旧二进制既不读它们、也不删它们。**只有给已有表加列才必须先 bump** |
 | **引用完整性** | `route_acl_lists.list_name` 上两条约束：`ON DELETE RESTRICT`（**还被引用的名单删不掉**，对应原来的 `listUsage` 扫描 + `409 list_in_use`）和 `ON UPDATE CASCADE`（**改名自动改写所有引用**，对应原来的 `renameListRefs`） |
 | **历史版本** | 每次写入前把上一版存进 `config_history` 表，**保留最近 20 版**并按 revision 去重。替代了原来的 `config.json.bak`（只留一版 = 改错两次就回不去了） |
 | **schema 版本** | `meta.schema_version`。用新二进制打开旧库会**明确报错**，而不是等某条 `SELECT` 报 `no such column` 才被发现 |
@@ -263,6 +265,10 @@ cd web && npm run dev                       # 调前端不必每次编译 Go，V
 | `/_goproxy/logs` | GET | 最近 N 条访问记录，`?limit=200`（上限 1000） |
 | `/_goproxy/events` | GET | 实时访问日志，SSE 推送 |
 | `/_goproxy/reload` | POST | 手动触发重载 |
+| `/_goproxy/bans` | GET | 自动封禁列表 + 蜜罐状态与命中样本 + 阶梯说明（**运行态，不是配置**） |
+| `/_goproxy/bans` | POST | 手动封禁 `{"ip","reason","secs"}`（不走豁免、不受突发熔断限制，立即落盘） |
+| `/_goproxy/bans/unban` | POST | `{"ip":"1.2.3.4"}` 或 `{"ip":"all"}` 解封 |
+| `/_goproxy/honeypot` | PUT | 蜜罐端口 / 开关 / 模式（`observe`\|`enforce`）/ 豁免 CIDR；端口与本进程监听的端口冲突会被拒绝 |
 | `/_goproxy/login` | POST | 用 `{"username","password"}` 或 `{"token"}` 换会话 Cookie（**在鉴权闸门之外**） |
 | `/_goproxy/session` | GET / DELETE | 会话状态 / 登出（也接受 `POST`） |
 | 其余 `/_goproxy/` 下的路径 | 任意 | 通过认证后 404；**没配任何凭据时一律 403** |
@@ -725,6 +731,117 @@ EOF
 
 ---
 
+## 自动封禁与蜜罐端口
+
+反代的被动防护（名单、限流、熔断）都有同一个盲区：**纯 L4 扫描在应用层完全看不见**。
+Go 的 http server 只有收到请求才进 handler —— 一个 connect 完就关的 TCP 扫描
+在应用层一个字节都不留，日志里没有，指标里也没有。
+
+所以这里不是去「检测」扫描，而是**提供一个不该有人访问的端口**：
+
+> 正常用户没有任何理由连一个没有服务的端口。所以「连上了」本身就是扫描的充分证据 ——
+> 不需要评分、不需要频率阈值、不需要观察窗口。
+
+内核替我们回 SYN-ACK，对方的 `connect()` 因此成功、判定该端口 **open**；我们随后
+把对方发来的数据读干净再正常关闭（**不发 RST** —— RST 会让对方改判端口没开，
+诱饵当场失效），一个字节都不回。
+
+### 开启
+
+默认**关闭**。先用命令行设端口：
+
+```bash
+# 设了几个端口 = 想用它，所以会自动启用 —— 但只到观察模式
+goproxy -c goproxy.db -honeypot-set "23,3389,5900/udp,8080"
+
+# 观察模式：会监听、会记录，一个都不封。先让它跑一段。
+goproxy -c goproxy.db -bans
+
+# 确认没有误报后再切 enforce（命中即封禁）
+goproxy -c goproxy.db -honeypot-mode enforce
+sudo systemctl restart goproxy      # 或 POST /_goproxy/reload
+```
+
+控制台也可以改（`PUT /_goproxy/honeypot`，body 就是 `GET /_goproxy/bans` 里的 `config`）。
+
+**先跑观察模式是强烈建议**：这一层「没人该访问这些端口」的假设是你做的，
+而这台机器上到底哪些端口真的没人用，只有真实流量能回答。
+
+### 选哪些端口
+
+| 该选 | 不该选 |
+|---|---|
+| 你**没有**在用的高危端口：`23`、`2323`、`3389`、`5900`、`6379`、`9200`、`11211`… | 任何本进程要监听的端口（路由端口、管理端口、TLS 端口）—— 会被**拒绝绑定**并报错 |
+| 你把 SSH 挪走之后的 `22` | 你正在用的 `22`（端口被 sshd 占着，绑定会失败并告警） |
+
+> ⚠️ **蜜罐端口前面如果有 CDN / 反代，看到的源 IP 是上一跳的地址**，不是真正的扫描器。
+> 那样封禁会打在上游代理身上。蜜罐端口的价值恰恰在于「直暴露」—— 让它能被直接连到。
+
+### 封禁与解封
+
+命中之后按阶梯封禁，**24 小时是自动上限**（自动判据会过期，永久封禁是人工的事）：
+
+第 1 次 `ban_secs`（默认 1 小时）→ 第 2 次 ×6 → 第 3 次 ×24 → 之后 7 天封顶。
+连续 7 天没有新封禁，阶梯记忆清零。
+
+解封有五条路，都不依赖控制台：
+
+```bash
+goproxy -c goproxy.db -bans                 # 看当前封禁（服务在不在跑都能用）
+goproxy -c goproxy.db -unban 1.2.3.4        # 解封一个（运行中的服务一分钟内发现）
+goproxy -c goproxy.db -unban all            # 全部清空
+```
+
+控制台 `POST /_goproxy/bans/unban {"ip":"all"}`；把地址加进任意白名单也是立刻生效的
+（豁免在判定时优先）；再加上手动封禁 `POST /_goproxy/bans {"ip":...,"secs":...}`。
+
+**运行时数据不放在配置里**：封禁条目在自己的表（`ban_entries`），不进 `revision`、
+不进 `config_history`、不出现在 `-config-export`。否则每封一个 IP 都会让正在编辑控制台
+的人下一次保存撞一次 409。
+
+### 谁永远不会被自动封
+
+自动封禁只管外部来源。下面这些命中会记录、但一个都不封：
+
+| 豁免 | 为什么 |
+|---|---|
+| 回环 / 私网 / 链路本地 / CGNAT / 保留段 | 封内网只会误伤自己人 |
+| `trusted_proxies` 里的地址 | 蜜罐看到的是直连对端，那可能是你的上游反代 |
+| 任意白名单命中的地址 | 白名单是人工声明的「自己人」，不该被自动判据推翻 |
+| 最近用过控制台的来源 | 别把正在操作的人关在门外（蜜罐路径上没有 `consoleClientIPs`，所以是鉴权通过时顺手记的） |
+| `exempt` 里显式列出的 CIDR | 运营知道、代码不知道的那些 |
+
+另外三条自保机制：
+
+- **突发熔断**：1 分钟内新增超过 200 个不同来源就暂停自动写入并告警。真正被扫的时候
+  来的是一整片「连一次就走」的地址，把它们全写进表里收益接近零，还会把库撑爆。
+- **条目上限** 20000 条，超出淘汰最久没活动的。
+- **人工封禁不受上面两条限制**，也不看豁免 —— 那是人明确做出的决定。
+
+### 想让「一整段端口」看起来都开着
+
+不用在服务里开一堆监听。把没人用的那一段重定向到蜜罐端口即可（需要 root）：
+
+```bash
+# nftables：把 20000-20099 整段重定向到本机的 9001（蜜罐）
+nft add table inet goproxy_trap
+nft 'add chain inet goproxy_trap prerouting { type nat hook prerouting priority dstnat; }'
+nft add rule inet goproxy_trap prerouting tcp dport 20000-20099 redirect to :9001
+```
+
+扫描器会看到这一百个端口全部 open，而你的进程只开了一个 socket。
+（这条规则要持久化需自行写进 `/etc/nftables.conf`；`goproxy` 不会替 root 改防火墙 ——
+理由见「已知限制」。）
+
+### 已知边界
+
+- **纯 SYN 扫描（半开、不完成握手）依然看不见**：内核不会把连接交给应用层。
+  要挡它只有内核侧（conntrack 限速 / 上面的 REDIRECT 规则本身也是一种挡法）。
+- 蜜罐端口是**真占端口**的：占用期间别的进程用不了它。
+- 自动封禁只影响本进程能看到的流量。多副本部署时各算各的。
+
+---
+
 ## TLS / HTTPS
 
 ### 总开关 + 路由覆盖
@@ -1092,6 +1209,7 @@ tag 之后又有提交是 `v0.4.0-9-gef38364`（距该 tag 9 个提交）；有�
 ```bash
 goproxy [-c 配置库] [-log-level 级别] [-text-log] [-version] [-hash-password 密码]
         [-config-import JSON] [-config-export JSON] [-upgrade-apply] [-upgrade-rollback]
+        [-bans] [-unban IP|all] [-honeypot-set "23,3389"] [-honeypot-mode observe|enforce|off]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -1105,6 +1223,10 @@ goproxy [-c 配置库] [-log-level 级别] [-text-log] [-version] [-hash-passwor
 | `-config-export <JSON>` | — | 把数据库里的配置导出成 JSON 后退出（人可读，适合 diff / 备份） |
 | `-upgrade-apply` | `-` | 以 **root** 应用控制台「升级」页暂存好的新版本（服务账号写不进二进制目录时用它） |
 | `-upgrade-rollback` | `-` | 以 **root** 回退到 `<exe>.old`（上一次升级前的版本，同样要权限） |
+| `-bans` | — | 列出当前的自动封禁并退出（服务在不在跑都能用；过期的会标成「仅保留阶梯记忆」） |
+| `-unban <IP\|all>` | — | 解封一个地址或全部。**这是控制台进不去时的救急通道** |
+| `-honeypot-set "<端口>"` | — | 设置蜜罐端口，如 `23,3389,5900/udp`（逗号/分号/空白分隔）。设了端口即启用，但只到 `observe` |
+| `-honeypot-mode <模式>` | — | `observe`（记录不封，默认）\| `enforce`（命中即封）\| `off`（关闭） |
 
 > 后两个子命令**都需要同时给 `-c`**，例如 `goproxy -c goproxy.db -config-export config.json`。
 > 它们的作用和用法见[配置存在哪儿](#配置存在哪儿sqlitev090-起)。
@@ -1214,12 +1336,14 @@ docker build -t goproxy:demo . && docker run --network host \
 | `router.go` / `proxy.go` / `listener.go` | 三级匹配表（端口 → host → path，不可变快照）；ReverseProxy 封装（连接池、超时、XFF）；多端口监听管理 |
 | `tlsconfig.go` / `tls.go` | TLS/ACME 配置与校验；证书管理器（按 SNI 分发、manual 热加载、autocert、证书状态） |
 | `ratelimit.go` / `circuitbreaker.go` | 按 IP 分桶的令牌桶；滑动窗口熔断器 |
+| `banlist.go` / `honeypot.go` / `honeypotstore.go` / `banapi.go` | **自动封禁与蜜罐**：封禁集合（不可变快照 + 阶梯时长 + 豁免判定 + 独立表持久化 + 突发熔断）；蜜罐 TCP/UDP 监听；两张运行态表的读写；以及把前两者接到请求管线与管理接口上的那一层 |
 | `acl.go` | 三层 IP 名单：`global_ip_deny` + 命名列表库（`IPListSet` 解析一次供多路由共享，`Resolve` 按引用展开成 allow / deny 两组），由 `decideIP` 判定并产出可回放的 `Steps`（含命中的是哪份名单） |
 | `auth.go` / `jwt.go` | Basic（bcrypt + 校验缓存）与 JWT 认证（带算法白名单） |
 | `metrics.go` / `accesslog.go` / `stats.go` | Prometheus 指标 + 每秒采样曲线；访问记录环形缓冲（兼 SSE 广播源）；三个监控接口 |
 | `webui.go` / `web/` | 内嵌并托管控制台（`go:embed`、缓存策略、SPA 回落、根路径分流）；前端工程（React 19 + Vite + TypeScript），产物 `web/dist` 提交进仓库 |
 | `*_test.go` | 单测：路由匹配、熔断/ACL/JWT/Basic（`governance_test`）、管理接口 CRUD 与并发冲突、环形缓冲与 SSE、控制台托管、TLS，**配置存储层（`configstore_test`：字节级往返稳定、事务回滚、外键 RESTRICT / CASCADE、历史封顶、导入校验）**，另有两个守卫测试（示例配置必须能加载、部署文件必须暴露 443 且 `ReadWritePaths`/`chown` 到位） |
 | `scripts/e2e_console.py` | 端到端自检（见下） |
+| `scripts/e2e_honeypot.py` | 蜜罐与自动封禁的端到端自检（见下） |
 | `scripts/check_release_notes.py` | 发布后核对：Release 正文是否来自 annotated tag 说明 |
 
 ```bash
@@ -1230,6 +1354,12 @@ go vet ./...    # 静态检查
 # 路由 CRUD + ETag 并发、三层 IP 名单 + 命名列表库 + 命中测试、配置库的 export/import 逃生通道）。
 # 需要 PATH 里有 go 和 python3，产物落在临时目录；最后一节会刻意把管理端口封掉再恢复，所以它跑在最后。
 python scripts/e2e_console.py
+
+# 蜜罐与封禁的端到端：真二进制、真端口、真进程。验的是单测覆盖不到的那一层 ——
+# 蜜罐端口真的在监听且一个字节都不回、回环来源命中豁免、手动封禁后业务端口与控制台
+# 同时被拒（403 且什么都不说）、命令行 -bans/-unban 跨进程读写同一张表、
+# 运行中解封能自己收敛、重启后封禁仍在。跑完约 90 秒（含一次一分钟的重读等待）。
+python scripts/e2e_honeypot.py
 ```
 
 TLS 另有两个实机端到端脚本（仓库外的开发目录，自签证书 + 真实进程）：**`e2e_tls.py`** 逐个 SNI 校验

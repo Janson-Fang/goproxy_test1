@@ -75,6 +75,41 @@ type App struct {
 	// 它是 App 上唯一会去改动「自己这个二进制文件」的东西，所以所有写动作
 	// 都串在它自己的 busy 标记里，并且只经管理接口触发。
 	upgrade *upgradeManager
+
+	// store 是配置库的连接（进程内按路径缓存，见 storeFor）。
+	// 只给「配置之外」的读写用：封禁表、蜜罐设置 —— 它们同样在库里，
+	// 但不属于 Config，所以走这条直达连接而不是 loadConfig。
+	store *configStore
+
+	// bans 是自动封禁的运行态（实现见 banlist.go）。
+	//
+	// 它**不是配置**：条目不进 revision、不进 config_history、不进 -config-export，
+	// 只在自己的表里（ban_entries）。理由见 banlist.go 开头的说明 ——
+	// 一句话是「自动封禁每跳一次都撞 revision 的话，控制台就没法编辑了」。
+	bans *banList
+
+	// trap 是蜜罐端口监听（实现见 honeypot.go）：在不该有人访问的端口上等着，
+	// 谁连上来谁就是扫描来源。
+	//
+	// 它补的是「纯 L4 扫描在应用层完全看不见」这个盲区：被动检测那条路
+	// 对 connect 完就关的扫描是断的，主动提供一个诱饵才是可行的做法。
+	trap *honeypot
+
+	// honeypotCfg 是蜜罐配置的不可变快照（含预解析的豁免网段）。
+	// 蜜罐路径只读它，不取锁 —— 它会在 reload 持锁期间被回调读取。
+	honeypotCfg atomic.Pointer[honeypotRuntime]
+
+	// consoleSeen 记住最近用过控制台的来源地址，用于自动封禁的豁免
+	// （别把正在操作的人关在门外）。蜜罐路径没有 HTTP 上下文，
+	// 拿不到 consoleClientIPs(r)，只能在鉴权通过时顺手记一笔。
+	consoleSeen *recentIPs
+
+	// trapLog 是蜜罐日志的限流器：被刷时不能每个包写一行日志。
+	trapLog *logLimiter
+
+	// trapObserved 是观察模式下记下的命中次数 —— 它回答的是
+	// 「如果现在开启 enforce，会封掉哪些」这个问题。
+	trapObserved atomic.Int64
 }
 
 func NewApp(configDB string) (*App, error) {
@@ -87,7 +122,11 @@ func NewApp(configDB string) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{
+	st, err := storeFor(configDB)
+	if err != nil {
+		return nil, err
+	}
+	a := &App{
 		configDB:      configDB,
 		transport:     newTransport(),
 		listeners:     NewListenerManager(),
@@ -96,7 +135,22 @@ func NewApp(configDB string) (*App, error) {
 		sessions:      newSessionStore(),
 		adminAccounts: empty,
 		upgrade:       newUpgradeManager(executablePath(), configDB),
-	}, nil
+		store:         st,
+		consoleSeen:   newRecentIPs(10 * time.Minute),
+		trapLog:       newLogLimiter(5, 10*time.Second),
+	}
+	a.bans = newBanList(st, time.Now)
+	a.bans.SetExempt(a.banExempt)
+	a.trap = newHoneypot(a.onTrapProbe)
+
+	// 把上次进程留下的封禁读回来。
+	//
+	// 失败只告警、不阻止启动：一张读不出来的封禁表不该让反代起不来 ——
+	// 起不来才是攻击者想要的结果（重启即解封 + 服务中断）。
+	if err := a.bans.load(); err != nil {
+		slog.Warn("读取封禁表失败，本次从零开始（不影响代理功能）", "err", err)
+	}
+	return a, nil
 }
 
 // prepareConfigStore 打开配置数据库，并在库还是空的时候用旁边的 config.json
@@ -280,6 +334,22 @@ func (a *App) reload() error {
 		// 单个端口失败不影响其它端口，只告警
 		slog.Warn("部分端口监听失败", "err", err)
 	}
+
+	// 蜜罐端口：把配置里的端口集合同步过来（幂等的增/删）。
+	//
+	// 放在 listeners.Sync 之后：本进程要监听的端口集合这时才确定，
+	// 冲突判断才有依据 —— 蜜罐绝不能占掉一条真实路由的端口，
+	// 那会让那条路由静默失效，比蜜罐不生效糟得多。
+	if a.store != nil {
+		if hc, err := a.store.readHoneypot(); err != nil {
+			slog.Warn("读取蜜罐配置失败，本次不启用蜜罐", "err", err)
+		} else if err := a.applyHoneypot(hc, cfg); err != nil {
+			slog.Warn("蜜罐端口部分未能生效", "err", err)
+		} else if hc.Enabled {
+			slog.Info("蜜罐已启用", "mode", hc.Mode, "ports", len(hc.Ports),
+				"hint", "连上这些端口的来源会被记账；observe 模式只记录不封禁")
+		}
+	}
 	a.metrics.SetRouteCount(len(tbl.routes))
 	a.metrics.IncReload()
 	adminShown := a.adminAddr
@@ -405,6 +475,15 @@ func (a *App) handler() http.Handler {
 			return
 		}
 
+		// 0.5) 自动封禁（实现见 banlist.go / banapi.go）
+		//
+		// 必须在路由匹配**之前**，理由和全局黑名单完全一样：扫描流量大多
+		// 匹配不到任何路由，放在后面等于对它们完全失效。
+		// 放在人工黑名单之后：人工声明是权威、自动判据是临时态。
+		if a.checkAutoBan(rec, r, ip, &blocked) {
+			return
+		}
+
 		// 明文端口：ACME 挑战、HTTP→HTTPS 跳转
 		if a.handlePlaintext(rec, r, tbl, port, &blocked) {
 			return
@@ -413,6 +492,12 @@ func (a *App) handler() http.Handler {
 		// 路由匹配
 		rt = tbl.Match(port, r.Host, r.URL.Path)
 		if rt == nil {
+			// blocked 标签这里必须有名字。
+			//
+			// 不设的话，访问日志里「未匹配到路由」与普通请求长得一模一样 ——
+			// 而它恰恰是最重要的一个信号：扫描器挨个路径试过来时，
+			// 绝大多数请求就落在这一支（日志页看不出来，行为检测也没有抓手）。
+			blocked = "no_route"
 			a.metrics.IncRequest("", http.StatusNotFound)
 			writeJSON(rec, http.StatusNotFound, map[string]any{
 				"error": "no_route_matched",
@@ -672,6 +757,16 @@ func (a *App) adminIPGuard(next http.Handler) http.Handler {
 			})
 			return
 		}
+		// 自动封禁同样覆盖管理端口。
+		//
+		// 「全局」的意思是对所有入口生效，自动封禁和全局黑名单在这一点上
+		// 没有区别：被封的来源是扫描器，它没有任何理由访问控制台。
+		// 不会把自己关在门外 —— 正在用控制台的人命中豁免（见 banExempt）。
+		if entry, banned := a.bans.lookup(ip); banned {
+			a.metrics.IncRejected("", "auto_ban")
+			refuseAutoBanned(w, r, ip, entry)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -783,6 +878,9 @@ func serveAdminIndex(w http.ResponseWriter) {
 		"  /_goproxy/logs            最近访问记录  ?limit=N\n"+
 		"  /_goproxy/events          实时访问日志（SSE）\n"+
 		"  /_goproxy/reload          POST 手动重载配置\n"+
+		"  /_goproxy/bans            GET 自动封禁列表 + 蜜罐状态  POST {ip,reason,secs} 手动封禁\n"+
+		"  /_goproxy/bans/unban      POST {ip:\"1.2.3.4\"} 或 {ip:\"all\"} 解封\n"+
+		"  /_goproxy/honeypot        PUT 蜜罐端口 / 开关 / 模式（observe|enforce）\n"+
 		"  /_goproxy/upgrade         GET 当前版本 / 升级能力 / 备份与暂存状态\n"+
 		"  /_goproxy/upgrade/upload  POST 上传二进制（multipart 的 file 字段，或直接把文件当请求体）\n"+
 		"  /_goproxy/upgrade/install POST {\"sha256\":\"可选\"} 安装已暂存的文件\n"+
@@ -879,6 +977,16 @@ func (a *App) adminMux() *http.ServeMux {
 	mux.HandleFunc("POST /_goproxy/upgrade/upload", a.handleUpgradeUpload)
 	mux.HandleFunc("POST /_goproxy/upgrade/install", a.handleUpgradeInstall)
 	mux.HandleFunc("POST /_goproxy/upgrade/rollback", a.handleUpgradeRollback)
+
+	// ---------- 自动封禁与蜜罐（实现见 banlist.go / honeypot.go / banapi.go）----------
+	//
+	// 这一组管的是**运行态**而不是配置：封禁条目故意不进 Config，
+	// 所以它有自己的读写接口，也不进 revision（否则每次自动封禁都会让
+	// 正在编辑控制台的人撞一次 409）。
+	mux.HandleFunc("GET /_goproxy/bans", a.handleBansState)
+	mux.HandleFunc("POST /_goproxy/bans", a.handleBanCreate)
+	mux.HandleFunc("POST /_goproxy/bans/unban", a.handleBanRemove)
+	mux.HandleFunc("PUT /_goproxy/honeypot", a.handleHoneypotUpdate)
 
 	// 这里刻意**不注册** "/" 兜底。兜底一旦放在 mux 里，它就会替所有拼错的
 	// 接口地址回 200，把 404 变成「看起来成功」。未知路径由 adminHandler 统一处置。
@@ -1004,6 +1112,9 @@ func (a *App) Run(ctx context.Context) error {
 	go a.statsLoop(ctx)
 	go a.sampleLoop(ctx)
 	go a.sessionSweepLoop(ctx)
+	// 封禁集合自己起两个循环：攒批落盘 + 周期清扫与外部同步。
+	// 它们由 bans.Close() 收尾，所以这里不挂 ctx。
+	a.bans.Start()
 
 	<-ctx.Done()
 	slog.Info("收到退出信号，开始优雅停机")
@@ -1011,6 +1122,12 @@ func (a *App) Run(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	a.listeners.ShutdownAll(shutdownCtx)
+	// 蜜罐端口也要关：它监听的是业务之外的端口，listeners 管不到它。
+	a.trap.Close()
+	// 封禁落盘：bans.Close 会先把攒着的写下去再退出。
+	// 否则「刚封完就重启」会丢一批 —— 而重启恰好可能是运维为了别的
+	// 事情做的，不该顺手把封禁清掉。
+	a.bans.Close()
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
@@ -1075,6 +1192,14 @@ func main() {
 		"以 root 应用控制台「升级」页暂存好的新版本（服务账号写不进二进制目录时用它）")
 	rollbackUpgrade := flag.Bool("upgrade-rollback", false,
 		"以 root 回退到 <exe>.old（升级模块留下的上一版）")
+	listBans := flag.Bool("bans", false,
+		"列出当前的自动封禁并退出（服务在不在跑都能用）")
+	unban := flag.String("unban", "",
+		"解封一个地址或全部：-unban 1.2.3.4 / -unban all")
+	honeypotSet := flag.String("honeypot-set", "",
+		"设置蜜罐端口列表，例如 -honeypot-set \"23,3389,5900/udp\"（逗号或空格分隔）")
+	honeypotMode := flag.String("honeypot-mode", "",
+		"蜜罐模式：observe（只记录，默认）| enforce（命中即封禁）| off（关闭）")
 	flag.Parse()
 
 	if *showVer {
@@ -1139,6 +1264,53 @@ func main() {
 	if *applyUpgrade || *rollbackUpgrade {
 		if err := runUpgradeApply(*configDB, *rollbackUpgrade); err != nil {
 			slog.Error("应用升级失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// 封禁与蜜罐的命令行入口：干完就退出，不起服务。
+	//
+	// 这一组存在的理由是「控制台进不去的时候还有路可走」：
+	// 自动封禁有可能把正在操作的人封在外面（判据完全来自网络行为），
+	// 所以必须有一条不依赖控制台、也不依赖网络的解封通道。
+	// 与 -upgrade-apply 同一个思路。
+	if *listBans {
+		if err := runBanList(*configDB); err != nil {
+			slog.Error("读取封禁列表失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *unban != "" {
+		if err := runUnban(*configDB, *unban); err != nil {
+			slog.Error("解封失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *honeypotSet != "" || *honeypotMode != "" {
+		var (
+			mode    string
+			enabled *bool
+		)
+		set := func(b bool) *bool { return &b }
+		switch *honeypotMode {
+		case "":
+			// 只改端口，不动开关
+		case honeypotModeObserve, "observe-only":
+			mode, enabled = honeypotModeObserve, set(true)
+		case honeypotModeEnforce, "on":
+			mode, enabled = honeypotModeEnforce, set(true)
+		case "off", "disable", "false":
+			enabled = set(false)
+		default:
+			slog.Error("honeypot-mode 取值不合法",
+				"got", *honeypotMode, "want", "observe|enforce|off")
+			os.Exit(1)
+		}
+		if err := runHoneypotSet(*configDB, *honeypotSet, mode, enabled); err != nil {
+			slog.Error("设置蜜罐失败", "err", err)
 			os.Exit(1)
 		}
 		return

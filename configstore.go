@@ -171,6 +171,52 @@ CREATE TABLE IF NOT EXISTS config_history (
 
 CREATE INDEX IF NOT EXISTS idx_route_acl_list_name ON route_acl_lists(list_name);
 CREATE INDEX IF NOT EXISTS idx_ip_list_rules_list  ON ip_list_rules(list_name);
+
+-- 下面三张表是**运行态**，不属于 Config，因此刻意不写进 writeConfigTx 的
+-- 清空清单：改配置（含 -config-import 覆盖）不该顺手抹掉封禁和蜜罐设置。
+--
+-- 也刻意**不 bump configSchemaVersion**。migrate() 在版本不一致时是硬失败
+-- （"库比程序新，请升级"），bump 上去会让「升级后回滚到旧二进制」直接起不来。
+-- 而这几张表是纯增量的：旧二进制既不读它们、也不删它们（它的清空清单里没有），
+-- 所以新旧二进制都能正常跑同一个库。只有**给已有表加列**才必须先 bump。
+
+-- 蜜罐端口：这些端口上不该有任何真实服务，任何访问都视为扫描。
+CREATE TABLE IF NOT EXISTS honeypot_ports (
+  seq   INTEGER PRIMARY KEY,
+  port  INTEGER NOT NULL,
+  proto TEXT    NOT NULL CHECK (proto IN ('tcp','udp')),
+  note  TEXT    NOT NULL DEFAULT ''
+);
+
+-- 蜜罐的开关与处置策略。严格单行，同 settings / tls_settings。
+CREATE TABLE IF NOT EXISTS honeypot_settings (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled  INTEGER NOT NULL DEFAULT 0,
+  -- observe = 只记录不封禁；enforce = 命中即封禁。
+  -- 默认 observe：这个功能的判定依据很硬（没人该访问那些端口），但
+  -- 「哪些端口算没人访问」是你说了算的，先用真实流量看一轮再开更稳。
+  mode     TEXT    NOT NULL DEFAULT 'observe',
+  -- 第 1 级封禁时长（秒），阶梯按 banLadderRatios 放大。
+  ban_secs INTEGER NOT NULL DEFAULT 3600,
+  -- JSON 数组：额外豁免的 CIDR（内网与可信代理已经在代码里硬豁免了）。
+  exempt   TEXT    NOT NULL DEFAULT '[]'
+);
+
+-- 自动封禁条目。运行态，不进 Config、不进 revision、不进 config_history、
+-- 不出现在 -config-export。唯一目的是重启后封禁还在 ——
+-- 否则「打崩进程」就等于免费解封，而那是攻击者能做到的事。
+CREATE TABLE IF NOT EXISTS ban_entries (
+  ip         TEXT PRIMARY KEY,
+  reason     TEXT    NOT NULL DEFAULT '',
+  source     TEXT    NOT NULL DEFAULT '',
+  level      INTEGER NOT NULL DEFAULT 1,
+  hits       INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT    NOT NULL DEFAULT '',
+  expires_at TEXT    NOT NULL DEFAULT '',
+  last_at    TEXT    NOT NULL DEFAULT '',
+  samples    TEXT    NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_ban_last_at ON ban_entries(last_at);
 `
 
 // configStore 是配置的持久化层。

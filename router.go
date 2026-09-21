@@ -403,3 +403,23 @@ func (t *RouteTable) ListenPorts() []int {
 	sort.Ints(ports)
 	return ports
 }
+
+// allowHit 报告某个地址是否落在任意一条路由引用的白名单里，并返回名单名。
+//
+// 自动封禁用它做豁免，所以这里遍历**所有**路由而不是某一条：
+// 白名单的语义是「这些地址是我自己人」，与它挂在哪条路由上无关 ——
+// 自动判据要避免的正是「把一个已经被人工认定为自己人的地址封掉」。
+func (t *RouteTable) allowHit(ip net.IP) (string, bool) {
+	if t == nil || ip == nil {
+		return "", false
+	}
+	for _, r := range t.routes {
+		if r.acl == nil {
+			continue
+		}
+		if nl, _, ok := matchAny(r.acl.allowLists(), ip); ok {
+			return nl.Name, true
+		}
+	}
+	return "", false
+}

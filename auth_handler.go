@@ -370,12 +370,14 @@ func (a *App) adminGuard(next http.Handler) http.Handler {
 				})
 				return
 			}
+			a.rememberConsoleSource(r)
 			next.ServeHTTP(w, r)
 			return
 
 		case viaBearer:
 			// Bearer 不随请求自动携带，本来就没有 CSRF 面，
 			// 所以这里**不做**同源校验 —— 给 curl 增加负担没有收益。
+			a.rememberConsoleSource(r)
 			next.ServeHTTP(w, r)
 			return
 		}
