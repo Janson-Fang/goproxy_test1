@@ -1,12 +1,70 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from '../api'
 import type { StreamState } from '../api'
-import type { LogEntry, LogsResponse } from '../types'
+import type { GeoMeta, IpGeo, LogEntry, LogsResponse } from '../types'
 import { Badge, Card, Empty, Note, Switch, toast } from '../ui'
 import { blockedLabel, clock, fullPath, ms, num, statusClass } from '../format'
 
 /** 前端最多保留多少条。超过就丢最旧的 —— 浏览器标签页的内存不是无限的。 */
 const MAX_ENTRIES = 2000
+
+/**
+ * 把一个 IP 的地域压成一行短文本。
+ *
+ * 显示取舍：国内地址省 + 市就够了（「江苏 南京」），国外要带国家
+ * （「美国 加利福尼亚州 圣克拉拉」）；只有国家一段时就只显示它。
+ * 完整原文（含 ISP）放在 title 里 —— 省市切分是启发式的，原文是唯一依据。
+ */
+function geoText(g?: IpGeo): { text: string; title: string; muted: boolean } {
+  if (!g || !g.status) return { text: '', title: '', muted: true }
+  const from = '地域来自服务端本地的 qqwry.dat'
+  switch (g.status) {
+    case 'ok': {
+      // 中国的地址不必每行都写「中国」；直辖市的省与市相同（北京–北京）也去重
+      const parts = [g.country === '中国' ? '' : g.country, g.province, g.city].filter(Boolean) as string[]
+      const dedup: string[] = []
+      for (const p of parts) if (dedup[dedup.length - 1] !== p) dedup.push(p)
+      return { text: dedup.join(' ') || g.country || '', title: g.detail ? `${g.detail}（${from}）` : from, muted: false }
+    }
+    case 'internal':
+      return { text: '局域网', title: '内网 / 回环 / 保留地址 —— 地域库不覆盖这类地址，这是确定的结论', muted: true }
+    case 'unsupported':
+      return { text: 'IPv6', title: '地域库（qqwry）只覆盖 IPv4，所以这条没有归属地', muted: true }
+    case 'unknown':
+      return { text: '未收录', title: g.detail || '地域库里没有这个网段（库有覆盖范围的边界）', muted: true }
+    case 'bad_ip':
+      return { text: '地址不合法', title: '来源地址解析不出 IP，无法查地域', muted: true }
+    case 'unavailable':
+      return {
+        text: '未启用',
+        title: `没有载入地域库：${g.detail || 'qqwry.dat 不在预期位置'}；把 qqwry.dat 放到配置库同目录（或用 -qqwry 指定）后重载或重启即可`,
+        muted: true,
+      }
+    case 'failed':
+      return { text: '查询失败', title: `地域库查询出错：${g.detail || '未知原因'}`, muted: true }
+    default:
+      return { text: '', title: '', muted: true }
+  }
+}
+
+/** 客户端 IP 下面的那一行地域。地域不存在时什么都不渲染（不占位、不留空行）。 */
+function GeoLine({ geo }: { geo?: IpGeo }) {
+  const { text, title, muted } = geoText(geo)
+  if (!text) return null
+  return (
+    <div className={`small${muted ? ' faint' : ''}`} style={{ marginTop: 2 }} title={title}>
+      {text}
+    </div>
+  )
+}
+
+/** 地域库的自述行：来源、版本时间、条数。不摆出来，用户只能猜数据新不新。 */
+function geoSourceLine(m?: GeoMeta): string | null {
+  if (!m) return null
+  if (!m.available) return `地域信息未启用（${m.reason || '未找到 qqwry.dat'}）`
+  const when = m.updated_at ? new Date(m.updated_at).toLocaleString() : '未知'
+  return `${m.path}（${num(m.entries ?? 0)} 条索引，文件时间 ${when}）`
+}
 
 type StatusFilter = 'all' | '2xx' | '3xx' | '4xx' | '5xx' | 'blocked'
 
@@ -138,7 +196,10 @@ export function LogsPage({
       if (routeFilter === '__none__' ? e.route : routeFilter && e.route !== routeFilter) return false
       if (methodFilter && e.method !== methodFilter) return false
       if (kw) {
-        const hay = `${e.path}?${e.query ?? ''} ${e.host ?? ''} ${e.client_ip ?? ''} ${e.ua ?? ''} ${e.route ?? ''} ${e.route_name ?? ''}`.toLowerCase()
+        // 地域也算进关键字：能按「南京」筛出某地来的请求，这是排查时最顺手的一种用法
+        const geo = e.ip_geo
+        const geoTxt = geo ? `${geo.country ?? ''} ${geo.province ?? ''} ${geo.city ?? ''} ${geo.detail ?? ''}` : ''
+        const hay = `${e.path}?${e.query ?? ''} ${e.host ?? ''} ${e.client_ip ?? ''} ${geoTxt} ${e.ua ?? ''} ${e.route ?? ''} ${e.route_name ?? ''}`.toLowerCase()
         if (!hay.includes(kw)) return false
       }
       return true
@@ -146,12 +207,20 @@ export function LogsPage({
   }, [entries, statusFilter, routeFilter, methodFilter, keyword])
 
   const blockedCount = entries.filter((e) => e.blocked).length
+  const geoLine = geoSourceLine(meta?.geo)
 
   return (
     <div className="stack">
       <Note kind="info">
         日志来自进程内的定长环形缓冲（{meta ? `${meta.buffered}/${meta.capacity}` : '—'} 条，只看得到最近的一段）。
         完整历史请用 <code>access_log: true</code> 输出到 stdout，交给 journald / logrotate 去管。
+        {geoLine && (
+          <>
+            <br />
+            地域信息：{geoLine}
+            {meta?.geo?.available && ' —— 换库后重载一次即可生效，不必重启'}
+          </>
+        )}
       </Note>
 
       <Card
@@ -205,7 +274,7 @@ export function LogsPage({
 
           <input
             className="input search"
-            placeholder="搜路径 / Host / 客户端 IP / UA / 路由"
+            placeholder="搜路径 / Host / 客户端 IP / 地域 / UA / 路由"
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
           />
@@ -305,7 +374,10 @@ export function LogsPage({
                         </span>
                       )}
                     </td>
-                    <td className="nowrap mono-sm">{e.client_ip || '—'}</td>
+                    <td className="nowrap mono-sm">
+                      <div>{e.client_ip || '—'}</div>
+                      <GeoLine geo={e.ip_geo} />
+                    </td>
                     <td>
                       <div className="ua-cell" title={e.ua}>
                         {e.ua || '—'}

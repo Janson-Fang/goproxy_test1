@@ -110,6 +110,17 @@ type App struct {
 	// trapObserved 是观察模式下记下的命中次数 —— 它回答的是
 	// 「如果现在开启 enforce，会封掉哪些」这个问题。
 	trapObserved atomic.Int64
+
+	// geo 是 IP 地域库的运行时状态（实现见 ipgeo.go）。
+	//
+	// 它是个**可选的运行时数据文件**（qqwry.dat，26 MB）：找不到就明确显示
+	// 「未启用」，其余功能一律不受影响。整体用原子指针替换，所以查询路径无锁，
+	// 换库（reload 时 mtime 变了）也不会让正在渲染的日志看到半截状态。
+	geo atomic.Pointer[geoState]
+
+	// geoHint 是显式指定的地域库路径（-qqwry / GOPROXY_QQWRY）。
+	// 非空时只用它，不再去猜其它位置 —— 显式配置不该被兜底逻辑悄悄盖过。
+	geoHint string
 }
 
 func NewApp(configDB string) (*App, error) {
@@ -334,6 +345,13 @@ func (a *App) reload() error {
 		// 单个端口失败不影响其它端口，只告警
 		slog.Warn("部分端口监听失败", "err", err)
 	}
+
+	// IP 地域库（qqwry.dat）：载入或在文件变了之后重新载入。
+	//
+	// 放在 reload 里而不是只在启动时做一次，是为了让「换库」有个明确动作：
+	// 覆盖 qqwry.dat 之后调一次 POST /_goproxy/reload 即可，不必重启进程。
+	// 内部会比对 mtime 与大小，没变就什么都不做（缓存与统计都留着）。
+	a.refreshGeo(a.geoHint)
 
 	// 蜜罐端口：把配置里的端口集合同步过来（幂等的增/删）。
 	//
@@ -1128,6 +1146,11 @@ func (a *App) Run(ctx context.Context) error {
 	// 否则「刚封完就重启」会丢一批 —— 而重启恰好可能是运维为了别的
 	// 事情做的，不该顺手把封禁清掉。
 	a.bans.Close()
+	// 地域库的文件句柄。进程马上要退，关不关都不影响功能，
+	// 但留着句柄会让「停机后清理数据目录」这类操作莫名失败。
+	if st := a.geo.Load(); st != nil && st.db != nil {
+		st.db.Close()
+	}
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
@@ -1200,6 +1223,10 @@ func main() {
 		"设置蜜罐端口列表，例如 -honeypot-set \"23,3389,5900/udp\"（逗号或空格分隔）")
 	honeypotMode := flag.String("honeypot-mode", "",
 		"蜜罐模式：observe（只记录，默认）| enforce（命中即封禁）| off（关闭）")
+	qqwryPath := flag.String("qqwry", "",
+		"IP 地域库（qqwry.dat）路径，给访问日志里的客户端 IP 补国家/省/市。"+
+			"留空则依次找：配置库同目录 → 可执行文件同目录 → 当前目录；"+
+			"都没有时日志里的地域显示为「未启用」，不影响其它功能")
 	flag.Parse()
 
 	if *showVer {
@@ -1320,6 +1347,13 @@ func main() {
 		slog.Error("初始化失败", "err", err)
 		os.Exit(1)
 	}
+	// 地域库路径：命令行优先，其次环境变量（systemd 部署时用 Environment= 更顺手，
+	// 不必改 ExecStart）。都没给就走自动查找（见 geoPathCandidates）。
+	geoPath := *qqwryPath
+	if geoPath == "" {
+		geoPath = os.Getenv("GOPROXY_QQWRY")
+	}
+	app.SetGeoPath(geoPath)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

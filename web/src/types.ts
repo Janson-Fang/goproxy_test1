@@ -455,6 +455,45 @@ export interface LogEntry {
   ua?: string
   /** 非空表示请求没被转发出去，值是拦截原因：acl / rate_limited / circuit_open / auth_xxx */
   blocked?: string
+  /**
+   * 客户端 IP 的地域（国家 / 省 / 市）。
+   *
+   * 服务端是在**出站时**把地域挂到这条记录上的，所以它和同一个对象里的
+   * client_ip 天然是一对 —— 不存在「地域和 IP 配错行」的可能（那不是靠
+   * 两边按顺序对齐维持的，而是靠它们在同一个对象里）。
+   * 没有来源地址（client_ip 为空）时这里就没有。
+   */
+  ip_geo?: IpGeo
+}
+
+/**
+ * 一个 IP 的地域结论。
+ *
+ * status 分得细是有意的：它们对使用者是**不同的事** ——
+ * 「内网地址」是确定的结论，「库没启用」是部署问题，「未收录」是数据边界，
+ * 「查询失败」是故障。混成一句「未知」会让人以为功能坏了。
+ */
+export interface IpGeo {
+  status: 'ok' | 'internal' | 'unsupported' | 'unknown' | 'bad_ip' | 'unavailable' | 'failed' | string
+  country?: string
+  province?: string
+  city?: string
+  district?: string
+  /** 地域库里的原始文本（地点串 · ISP），做 tooltip；省市切分是启发式的，原文是唯一依据 */
+  detail?: string
+}
+
+/** 地域库自述：来源、版本时间、命中统计。日志页用它说明「地域是哪来的、什么时候更新的」。 */
+export interface GeoMeta {
+  available: boolean
+  path?: string
+  entries?: number
+  updated_at?: string
+  reason?: string
+  queries: number
+  hits: number
+  misses: number
+  errors: number
 }
 
 export interface LogsResponse {
@@ -464,6 +503,7 @@ export interface LogsResponse {
   latest_seq: number
   subscribers: number
   dropped: number
+  geo?: GeoMeta
 }
 
 // ---------- 写操作的返回体 ----------

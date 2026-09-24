@@ -130,13 +130,21 @@ func (a *App) handleLogs(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 	subs, dropped := a.logs.Stats()
+	// 地域在**出站时**补：环形缓冲里那份不带地域（见 LogEntry.IPGeo 的说明）。
+	// Recent 返回的是副本，直接改不会影响缓冲。
+	entries := a.logs.Recent(limit)
+	a.enrichGeo(entries)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"entries":     a.logs.Recent(limit),
+		"entries":     entries,
 		"buffered":    a.logs.Len(),
 		"capacity":    logRingSize,
 		"latest_seq":  a.logs.Seq(),
 		"subscribers": subs,
 		"dropped":     dropped,
+		// 地域库的自述：来源、版本时间、命中统计。界面据此在日志页上说明
+		// 「地域是哪来的、什么时候更新的」—— 这类信息不摆出来，
+		// 用户只能猜数据新不新。
+		"geo": a.geoMeta(),
 	})
 }
 
@@ -188,6 +196,9 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
+			// 与 /logs 一样在出站时补地域，让实时推送与首次加载的显示一致。
+			// e 是从通道取出的副本，改它不影响环形缓冲。
+			a.enrichGeoOne(&e)
 			b, err := json.Marshal(e)
 			if err != nil {
 				continue

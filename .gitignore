@@ -23,3 +23,8 @@ goproxy.staged
 goproxy.staged.tar.gz
 goproxy.swap-old
 goproxy.old
+
+# IP 地域库（纯真 qqwry.dat）。26 MB 的二进制数据，而且每几天就有一版，
+# 跟着仓库走既撑大 clone 又马上过期。需要它的人自己下一份放到配置库旁边
+# （见 README 的「日志里的 IP 地域」）。放这里是为了防止有人顺手拷进仓库目录。
+qqwry.dat

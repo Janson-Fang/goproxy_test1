@@ -39,6 +39,16 @@ type LogEntry struct {
 	// acl / rate_limited / circuit_open / auth_no_credentials 等。
 	// 管理台用它把「被拦掉的请求」单独标色 —— 排查限流误伤时全靠它。
 	Blocked string `json:"blocked,omitempty"`
+
+	// IPGeo 是客户端 IP 的地域（国家/省/市）。
+	//
+	// 它**只在出站时补上**（见 App.enrichGeo），环形缓冲里那份始终是 nil：
+	// 写日志是每个请求都要走、且持着缓冲锁的路径，不宜在里面读地域库；
+	// 而地域只有人打开日志页时才需要。
+	//
+	// 放在 LogEntry 里而不是让前端另发一次查询，是为了「地域与它对应的 IP
+	// 天然对齐」—— 两者在同一个对象里，不存在按行号配错的可能。
+	IPGeo *GeoInfo `json:"ip_geo,omitempty"`
 }
 
 // logBuffer 是访问记录的定长环形缓冲，同时充当 SSE 的广播源。
