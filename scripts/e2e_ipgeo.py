@@ -98,9 +98,39 @@ def visit(port, path, xff=None):
 
 
 def start(exe, db, cwd, extra=None):
+    """起一个实例，把它自己的输出写进 cwd 下的 instance.log。
+
+    刻意不用 stdout=PIPE。管道有两个坑，都在真机上踩过：
+
+    1. 没人读它：实例写到 64KB 就卡在写日志上，看着像「服务起不来」。
+    2. 「起不来时读一下输出看原因」这句 `proc.stdout.read()`，
+       在实例**还活着**时永不返回（管道没 EOF）——于是整个自检静默挂死，
+       既没有失败信息也没有退出，比没诊断还糟。
+       实测：一次启动失败让脚本卡了 16 分钟，最后只能靠 /proc 反推。
+
+    落文件就没这些事：随时可读、读不完也不影响对方，而且日志天然留下。
+    """
     args = [exe, "-c", db] + (extra or [])
-    proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    path = os.path.join(cwd, "instance.log")
+    logf = open(path, "ab", buffering=0)
+    proc = subprocess.Popen(args, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT)
+    proc.logf = logf
+    proc.logpath = path
     return proc
+
+
+def tail_log(proc, n=1500):
+    """读实例日志的末尾。读不到就如实说，不抛异常、不阻塞。"""
+    path = getattr(proc, "logpath", None)
+    if not path:
+        return "(这个实例没有日志文件)"
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return "(读日志失败: %s)" % e
+    text = data[-n:].decode("utf-8", "replace")
+    return text or "(日志是空的 —— 实例什么都没输出就卡住了?)"
 
 
 def wait_ready(admin, proc, tries=60):
@@ -124,6 +154,9 @@ def stop(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+    logf = getattr(proc, "logf", None)
+    if logf is not None:
+        logf.close()
 
 
 def main():
@@ -171,8 +204,7 @@ def main():
     print("== 2. 起服务 ==")
     proc = start(exe, db, work)
     if not wait_ready(admin, proc):
-        out = proc.stdout.read().decode("utf-8", "replace")[-1500:]
-        print("服务没起来:\n" + out)
+        print("服务没起来，实例日志：\n" + tail_log(proc))
         stop(proc)
         return 1
     check("服务启动并就绪", True)
@@ -297,7 +329,8 @@ def main():
         os.remove(os.path.join(work, "qqwry.dat"))
         proc = start(exe, db, work)
         if not wait_ready(admin, proc):
-            check("去掉地域库后服务仍能启动", False, proc.stdout.read().decode()[-800:])
+            check("去掉地域库后服务仍能启动", False, tail_log(proc, 800))
+            stop(proc)
             return 1
         check("★ 没有地域库时服务照常启动", True)
         visit(biz, "/geo-nolib", xff="8.8.8.8")

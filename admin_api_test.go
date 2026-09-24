@@ -18,7 +18,75 @@ import (
 // portSeq 给每个测试发一批互不重叠的端口。
 // 不用「监听 :0 再关掉」那招：两次取端口之间有竞态，而且 Windows 上
 // 刚关闭的监听端口会短暂无法重绑。单调递增最省心。
+//
+// 但递增出来的号**不保证在这台机器上真的空着**。开发机上 18000 段通常没人用，
+// 可宿主机上只要有一个服务占用了其中某个号（实测过：一台机器上 18006 被别的
+// 进程占着），发出去的端口就绑不上，现象是「测试挂了、代码却没坏」——
+// 看日志是 `bind: address already in use`，很容易被当成端口管理写错了。
+// 所以发号时顺手探一下，被占的直接跳过。
 var portSeq int32 = 18000
+
+// nextPorts 返回 n 个当前确实绑得上的端口。
+//
+// 只跳过被占的号，不做别的排序 —— 每个号都来自同一个单调递增的计数器，
+// 用例之间依然互不重叠。
+func nextPorts(n int) []int {
+	out := make([]int, 0, n)
+	// 4096 只是个防死循环的上限：端口都被占满时宁可报错，也不要静默空转。
+	for probe := 0; probe < 4096 && len(out) < n; probe++ {
+		p := int(atomic.AddInt32(&portSeq, 1))
+		if portBindable(p) {
+			out = append(out, p)
+		}
+	}
+	if len(out) < n {
+		panic(fmt.Sprintf("发不出 %d 个空闲端口：连续探测 4096 个候选都被占。这台机器上 18000 段是不是被别的服务占了？", n))
+	}
+	return out
+}
+
+// portBindable 报告这个端口现在能不能绑上。
+//
+// 两种地址都探：管理端监听的是 127.0.0.1:p，业务路由监听的是 :p，
+// 而「某个具体地址占用」与「通配地址占用」在各平台上的冲突规则不一致，
+// 只探一种会漏判。
+func portBindable(p int) bool {
+	for _, addr := range []string{fmt.Sprintf("127.0.0.1:%d", p), fmt.Sprintf(":%d", p)} {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return false
+		}
+		_ = ln.Close()
+	}
+	return true
+}
+
+// TestNextPortsSkipsOccupiedPorts 守住「发出去的号一定绑得上」。
+//
+// 这条守卫来自一次真事故：在一台宿主机上跑测试，某个号（18006）被那里常驻的
+// 另一个服务占着，于是用例以 `bind: address already in use` 失败 ——
+// 报错看着像端口管理写错了，其实只是发号没看这台机器上的实际情况。
+func TestNextPortsSkipsOccupiedPorts(t *testing.T) {
+	next := int(atomic.LoadInt32(&portSeq)) + 1
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", next))
+	if err != nil {
+		// 这个号本来就占着（比如上一次运行留下的），换个思路没法验，直接跳过。
+		t.Skipf("无法占住 %d 来做这条测试: %v", next, err)
+	}
+	defer ln.Close()
+
+	got := nextPorts(1)
+	if got[0] == next {
+		t.Fatalf("把已被占用的 %d 发了出去", next)
+	}
+	if got[0] <= next {
+		t.Fatalf("发号应当只前进不后退，实际拿到 %d（被占的是 %d）", got[0], next)
+	}
+	if !portBindable(got[0]) {
+		t.Fatalf("发出去的 %d 自己就绑不上", got[0])
+	}
+}
 
 // testToken 是绝大多数用例里配的 admin_token。
 //
@@ -31,15 +99,6 @@ var portSeq int32 = 18000
 // TestNoCredentialsConfiguredRejectsEverything 等）继续用各自的字面量或
 // 空字符串，不受这里影响。
 const testToken = "s3cret-admin-token"
-
-func nextPorts(n int) []int {
-	start := atomic.AddInt32(&portSeq, int32(n)) - int32(n) + 1
-	out := make([]int, n)
-	for i := range out {
-		out[i] = int(start) + i
-	}
-	return out
-}
 
 type testEnv struct {
 	app  *App
