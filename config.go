@@ -341,7 +341,7 @@ func rejectLegacyACL(raw []byte) error {
 				"    迁移到当前写法：先在顶层 ip_lists 里建一份名单，再让路由引用它 ——\n"+
 				"      \"ip_lists\": [{\"name\": \"办公网\", \"kind\": \"allow\", \"rules\": [\"10.0.0.0/8\"]}],\n"+
 				"      \"routes\": [{\"id\": \"%s\", \"acl\": {\"lists\": [\"办公网\"]}}]\n"+
-				"    详见 README「IP 名单（命名列表 + 引用）」。",
+				"    在控制台「IP 名单」页建好名单，再让路由引用它也一样。",
 				i, id, id)
 		}
 
@@ -367,7 +367,7 @@ func rejectLegacyACL(raw []byte) error {
 				"      \"routes\": [{\"id\": \"%s\", \"acl\": {\"lists\": [\"办公网\", \"爬虫\"]}}]\n"+
 				"    这样做的好处：同一段网段只维护一处，改完对所有引用它的路由一起生效。\n"+
 				"    顶层 global_ip_deny（全局黑名单）写法不变，仍是一份内联规则。\n"+
-				"    详见 README「IP 名单（命名列表 + 引用）」。",
+				"    在控制台「IP 名单」页建好名单，再让路由引用它也一样。",
 				i, id, which, id)
 		}
 	}

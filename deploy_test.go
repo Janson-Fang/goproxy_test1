@@ -315,8 +315,8 @@ func TestInstallRendersWellFormedUnit(t *testing.T) {
 
 // 装「旧版二进制」这条路必须留着，而且不能只靠注释标榜。
 //
-// 脚本是给最新版写的，但 VERSION= 允许装任意历史版本（README 也把固定版本列为
-// 推荐做法，因为 latest 解析依赖网络），而且 Release 刚发出来之前 latest 还停在
+// 脚本是给最新版写的，但 VERSION= 允许装任意历史版本（固定版本也是脚本推荐的
+// 用法，因为 latest 解析依赖网络），而且 Release 刚发出来之前 latest 还停在
 // 上一个 tag 上。v0.8.x 及更早的二进制没有 -config-import，`-c` 指的也是 JSON
 // 文件 —— 硬按库流程走，对它们调 -config-import 会直接报
 // 「flag provided but not defined」：现象是「装不上」，原因却是版本不匹配。

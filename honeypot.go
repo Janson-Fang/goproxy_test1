@@ -29,7 +29,7 @@ connect() 因此成功、判定端口 open。随后我们立刻关掉连接、�
 不给对方任何可以用来做指纹识别的材料。
 
 想让「一整段端口看起来都开着」不必在这里开一堆 listener，交给部署侧的
-端口重定向即可（README 里有 nft/iptables 配方），这里只需要一个真实端口。
+端口重定向即可（用 nft/iptables 把整段端口转到本机一个端口上），这里只需要一个真实端口。
 
 UDP 的规矩只有一条：**绝不回包**。UDP 源地址可以伪造，回包会打到受害者身上，
 我们几个字节的响应就能变成一次反射放大。收下、记账、封禁，然后什么都不发。
@@ -495,7 +495,7 @@ func (h *honeypot) Close() {
 
 // peerIP 从 net.Addr 里取出对端 IP。蜜罐没有 XFF 可看（不是 HTTP），
 // 所以这里拿到的就是**直连对端** —— 若蜜罐端口挂在 CDN/Lucky 后面，
-// 那看到的是上一跳的地址（README 里专门提醒了这一点）。
+// 那看到的是上一跳的地址 —— 封禁会打在上游代理身上，别把它放在另一层反代后面。
 func peerIP(addr net.Addr) (net.IP, string) {
 	switch a := addr.(type) {
 	case *net.TCPAddr:

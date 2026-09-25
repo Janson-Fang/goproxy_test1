@@ -1035,7 +1035,7 @@ def run_acl_section(db_path, bins, restart_proxy):
         check("命令行导入「封掉本机」的配置 -> 成功", r.returncode == 0, (r.stdout + r.stderr)[:200])
 
         # 导入只写库。让它生效要么重启，要么调一次 reload —— 这里走 reload，
-        # 顺带验证「导入之后不重启也能生效」这条（README 里就是这么写的）。
+        # 顺带验证「导入之后不重启也能生效」这条。
         st, h, b = post("/_goproxy/reload", None)
         check("导入后调 reload -> 200", st == 200, "实际 %s :: %s" % (st, b[:150]))
 

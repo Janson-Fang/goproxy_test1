@@ -180,7 +180,7 @@ func prepareConfigStore(configDB string) error {
 				"    配置源已经换成 SQLite，请二选一：\n"+
 				"      1. 保留 -c 指向它，另外执行一次导入：goproxy -config-import %s -c goproxy.db\n"+
 				"      2. 直接把 -c 改成 goproxy.db，启动时会自动导入同目录下的 config.json（只导一次）\n"+
-				"    详见 README 的「从 v0.8.x 升级」",
+				"    迁移步骤见 v0.9.0 的发布说明（Releases 页）。",
 			configDB, configDB)
 	}
 

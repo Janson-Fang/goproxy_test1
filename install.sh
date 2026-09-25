@@ -524,7 +524,7 @@ else
     if ! $SUDO "$BIN_DIR/goproxy" -c "$CONFIG_DB" -config-import "$CONFIG_DIR/config.json"; then
         die "导入失败（原因见上面那条报错）。库没有被改动，修好 $CONFIG_DIR/config.json 后重跑本脚本即可。
      最常见的原因是旧版的 acl 写法：v0.8.0 起路由只能**引用**顶层的命名名单，
-     报错信息里带迁移映射，照它改，或看 README 的「IP 名单」一节。"
+     报错信息里带迁移映射，照它改；或在控制台「IP 名单」页建好名单再让路由引用。"
     fi
     ok "已导入到 $CONFIG_DB"
     info "config.json 只是种子，以后不再被读取 —— 改配置请用控制台，"

@@ -242,8 +242,8 @@ func (a *App) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 上传的可能是原始二进制，也可能是发布用的 tar.gz（就是 README 里让人
-	// 下载的那个包）。按魔数认，别让人先手动解包一遍。
+	// 上传的可能是原始二进制，也可能是发布用的 tar.gz（发布页上给人下载的那个包）。
+	// 按魔数认，别让人先手动解包一遍。
 	if isGzipFile(stagePath) {
 		archive := stagePath + ".tar.gz"
 		if err := os.Rename(stagePath, archive); err != nil {
