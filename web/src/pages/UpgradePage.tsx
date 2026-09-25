@@ -25,9 +25,16 @@ export function UpgradePage({ active }: { active: boolean }) {
   const [busy, setBusy] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [progress, setProgress] = useState<{ loaded: number; total: number } | null>(null)
-  const [confirm, setConfirm] = useState<null | { kind: 'install' | 'rollback'; title: string; message: ReactNode }>(null)
+  const [confirm, setConfirm] = useState<null | { kind: 'install' | 'rollback' | 'force'; title: string; message: ReactNode }>(null)
   /** 安装完成之后等进程回来：记录从哪一版升到哪一版、等到什么时候为止 */
   const [pending, setPending] = useState<null | { from: string; to: string; until: number }>(null)
+  /**
+   * 配置预检没通过时的说明（通常是一份多行的迁移映射）。
+   *
+   * 单独留一个 state 而不是塞进 toast：这份说明是**照着改就能用**的东西，
+   * 多行、有缩进，toast 里看不全，而它恰恰是这一刻最该被读到的东西。
+   */
+  const [configIssue, setConfigIssue] = useState<string | null>(null)
   /** 托管升级：安装 / 回退只是把新版本暂存好了，这里存下要交给 root 的那条命令 */
   const [rootCmd, setRootCmd] = useState<null | { cmd: string; what: string }>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -74,11 +81,18 @@ export function UpgradePage({ active }: { active: boolean }) {
     pending !== null,
   )
 
-  const doInstall = useCallback(async (req: { sha256?: string }) => {
+  const doInstall = useCallback(async (req: { sha256?: string; force?: boolean }) => {
     setConfirm(null)
     setBusy('install')
     try {
       const res = await api.installUpgrade(req)
+      setConfigIssue(null)
+      if (res.warning) {
+        // 带着问题继续的：必须说出来。否则它看起来就是一次普通成功，
+        // 而它的后果可能是服务起不来。
+        setConfigIssue(res.warning)
+        toast('warn', '已按强制要求继续：新版本可能起不来')
+      }
       if (res.needs_root) {
         // 托管：校验与 -version 验证都在服务端做完了，但进程写不进二进制目录，
         // 最后一步要 root 在服务器上执行。所以不走「等服务重启」那套轮询。
@@ -96,7 +110,14 @@ export function UpgradePage({ active }: { active: boolean }) {
       setProgress(null)
       if (fileRef.current) fileRef.current.value = ''
     } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e))
+      // 配置不兼容是唯一一种「错误信息本身需要被完整阅读」的失败：
+      // 服务端把迁移映射放在 message 里，toast 装不下，所以留在页面上。
+      if (e instanceof api.ApiError && e.code === 'config_incompatible') {
+        setConfigIssue(e.message)
+        toast('err', '配置预检未通过，已拒绝安装（改法在下方）')
+      } else {
+        toast('err', e instanceof Error ? e.message : String(e))
+      }
     } finally {
       setBusy('')
     }
@@ -110,7 +131,14 @@ export function UpgradePage({ active }: { active: boolean }) {
       // 上传完服务端会顺手验证一遍（跑一次 -version 并算 sha256），
       // 所以这里拿回来的暂存信息就是「能装的东西」，不需要再问一次。
       const staged = await api.uploadUpgradeBinary(file, (loaded, total) => setProgress({ loaded, total }))
-      toast('ok', `已接收并验证：${staged.version ?? '版本未知'}`)
+      if (staged.config_problem) {
+        // 上传那一刻就说：文件还没生效，改配置或换一个包都来得及。
+        setConfigIssue(staged.config_problem)
+        toast('warn', `已接收，但这个版本读不了当前配置（${staged.version ?? '版本未知'}）`)
+      } else {
+        setConfigIssue(null)
+        toast('ok', `已接收并验证：${staged.version ?? '版本未知'}`)
+      }
       await load()
     } catch (e) {
       toast('err', e instanceof Error ? e.message : String(e))
@@ -315,7 +343,24 @@ export function UpgradePage({ active }: { active: boolean }) {
           <div className="small faint">
             上传后服务端会先算 sha256 并跑一次 <span className="mono">-version</span>：
             跑不起来的文件会当场被拒（错误直接回给你），不会等到安装那一步才失败。
+            随后还会拿它**试读一次当前配置** —— 只读、不改任何东西，用来回答
+            「换上去之后起不起得来」。
           </div>
+
+          {configIssue && (
+            <Note kind="err">
+              <div style={{ marginBottom: 6 }}>
+                配置预检未通过：<b>这个版本读不了当前配置，装上去服务起不来</b>。
+                按下面的说明改好配置再来；确实要硬上就用「仍然安装（强制）」。
+              </div>
+              <pre
+                className="mono small"
+                style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 260, overflow: 'auto' }}
+              >
+                {configIssue}
+              </pre>
+            </Note>
+          )}
 
           {state?.staged.present ? (
             <div className="stack tight">
@@ -366,6 +411,29 @@ export function UpgradePage({ active }: { active: boolean }) {
                 >
                   {busy === 'install' ? '安装中' : '安装这个文件'}
                 </button>
+                {configIssue && (
+                  <button
+                    className="btn danger"
+                    disabled={!supported || busy !== ''}
+                    onClick={() =>
+                      setConfirm({
+                        kind: 'force',
+                        title: '强制安装（跳过配置预检）',
+                        message: (
+                          <>
+                            <div>
+                              新版本读不了当前配置，装上去<b>服务会起不来</b>，
+                              需要你到服务器上手动回退。
+                            </div>
+                            <div style={{ marginTop: 8 }}>只在明确知道后果时用。</div>
+                          </>
+                        ),
+                      })
+                    }
+                  >
+                    仍然安装（强制）
+                  </button>
+                )}
               </div>
             </div>
           ) : (
@@ -432,8 +500,14 @@ export function UpgradePage({ active }: { active: boolean }) {
         <ConfirmDialog
           title={confirm.title}
           message={confirm.message}
-          confirmText={confirm.kind === 'rollback' ? '确认回退' : '确认安装'}
-          danger={confirm.kind === 'rollback'}
+          confirmText={
+            confirm.kind === 'rollback'
+              ? '确认回退'
+              : confirm.kind === 'force'
+                ? '确认强制安装'
+                : '确认安装'
+          }
+          danger={confirm.kind !== 'install'}
           busy={busy !== ''}
           onCancel={() => setConfirm(null)}
           onConfirm={() => {
@@ -441,9 +515,9 @@ export function UpgradePage({ active }: { active: boolean }) {
               void doRollback()
               return
             }
-            // 只有「安装暂存的文件」一种情况：把 sha256 带上，
-            // 让服务端再确认一次这份文件在上传之后没被换过。
-            void doInstall({ sha256: state?.staged.sha256 })
+            // 普通安装：把 sha256 带上，让服务端再确认一次这份文件在上传之后没被换过。
+            // 强制安装：显式带 force —— 服务端据此放行，并在响应里回一个 warning。
+            void doInstall(confirm.kind === 'force' ? { force: true } : { sha256: state?.staged.sha256 })
           }}
         />
       )}

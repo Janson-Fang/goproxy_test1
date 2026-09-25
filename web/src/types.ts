@@ -556,6 +556,16 @@ export interface UpgradeStaged {
   verified: boolean
   /** upload | rollback */
   source?: string
+  /**
+   * 配置预检：上传时拿这个二进制试读了一次当前配置库。
+   *
+   * checked 为 true = 跑过且通过；skipped = 那个二进制不认识 -config-check
+   * （降级到 v0.15.0 之前）；problem 非空 = 它读不了当前配置，装上去服务会起不来。
+   * 三者都是空/假表示「不知道」（比如刚重启过，内存里那次结果没了）。
+   */
+  config_checked?: boolean
+  config_check_skipped?: boolean
+  config_problem?: string
 }
 
 export interface UpgradeBackup {
@@ -612,6 +622,8 @@ export interface UpgradeInstallResult {
   apply_command?: string
   staged_path?: string
   staged_sha256?: string
+  /** 非空表示这次是「带着问题」继续的（目前只有配置预检没过却带了 force） */
+  warning?: string
 }
 
 /* ---------- 蜜罐与自动封禁 ---------- */

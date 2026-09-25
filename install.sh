@@ -267,6 +267,41 @@ fi
 tar -xzf "$TMP/$PKG" -C "$TMP" || die "解压失败"
 [ -f "$TMP/goproxy" ] || die "包里没有 goproxy 二进制"
 
+# ---------- 6.5. 配置预检 ----------
+# 换掉线上二进制之前，先拿**即将装上去的这一个**试读一次现有配置库：
+# 它读不了的话，装上去的结果就是服务起不来（历史上几次破坏性配置变更都是
+# 「拒绝启动 + 打印迁移映射」），而这时候什么都还没动，退出去最省事。
+#
+# 四个刻意的细节：
+#   · 用 $TMP/goproxy（解压出来的那个），不是 $BIN_DIR/goproxy —— 要问的正是新版本；
+#   · `|| CHECK_RC=$?` 这个写法是必需的：脚本开着 set -e，直接 `X=$(失败的cmd)`
+#     会让脚本在读到退出码之前就退出；
+#   · 退出码 1 = 配置真有问题 → die 并把迁移映射原样打出来；退出码 2 是 flag 包
+#     报「不认识这个开关」（装一个早于 v0.15.0 的旧版本时会发生），那与配置无关，
+#     必须跳过而不是拦住 —— 否则一次正常的降级会被自己的检查挡死；
+#   · 其它退出码一律只 warn 不拦：这条检查是**额外**的一道确认，它自己出问题
+#     不该让安装停下来（宁可装完再发现，也不能因为工具坏了装不上）。
+if [ -x "$TMP/goproxy" ]; then
+    CHECK_RC=0
+    CHECK_OUT=$("$TMP/goproxy" -c "$CONFIG_DB" -config-check 2>&1) || CHECK_RC=$?
+    if [ "$CHECK_RC" = "0" ]; then
+        info "配置预检通过：${CHECK_OUT#配置预检通过：}"
+    elif [ "$CHECK_RC" = "1" ]; then
+        die "配置预检未通过 —— 这个版本读不了当前配置，装上去服务会起不来。
+$(printf '%s' "$CHECK_OUT" | sed 's/^/    /')
+
+    什么都没动：二进制还没替换。按上面的说明改好配置再重跑本脚本。"
+    else
+        # 用 case 而不是 grep：脚本开着 pipefail，管道会更早把脚本带走。
+        case "$CHECK_OUT" in
+            *"flag provided but not defined"*)
+                info "跳过配置预检（$VERSION 早于 v0.15.0，还没有 -config-check）" ;;
+            *)
+                warn "配置预检没能跑完（退出码 $CHECK_RC），已跳过：$(printf '%s' "$CHECK_OUT" | head -3)" ;;
+        esac
+    fi
+fi
+
 # ---------- 7. 装二进制（支持原地升级） ----------
 $SUDO install -d "$BIN_DIR"
 

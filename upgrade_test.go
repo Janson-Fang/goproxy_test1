@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -473,11 +475,60 @@ func TestVerifyBinaryAcceptsRealGoproxy(t *testing.T) {
 }
 
 func TestNewUpgradeManagerWiresRealBehaviours(t *testing.T) {
-	// 注入点必须有默认值，否则生产路径上 verify/restart 会是 nil 调用
+	// 注入点必须有默认值，否则生产路径上 verify/restart/preflight 会是 nil 调用
 	um := newUpgradeManagerFor(filepath.Join(t.TempDir(), "goproxy"), filepath.Join(t.TempDir(), "goproxy.db"))
-	if um.verify == nil || um.restart == nil || um.restartDelay != upgradeRestartDelay {
-		t.Fatalf("默认注入点没接上：verify=%v restart=%v delay=%v",
-			um.verify != nil, um.restart != nil, um.restartDelay)
+	if um.verify == nil || um.restart == nil || um.preflight == nil || um.restartDelay != upgradeRestartDelay {
+		t.Fatalf("默认注入点没接上：verify=%v restart=%v preflight=%v delay=%v",
+			um.verify != nil, um.restart != nil, um.preflight != nil, um.restartDelay)
+	}
+}
+
+// TestRenameWithRetryHandlesTransientLock 守住「Windows 上刚写完的文件会被短暂持有」。
+//
+// 这条重试是端到端跑出来的：同一次替换在几秒内第一次报
+// `being used by another process`、第二次成功 —— 说明它不是「Windows 不允许
+// 改名运行中的 exe」（实测允许），而是瞬时共享冲突。加重试是因为它出现在升级
+// 路径上：失败一次的表现是「升级失败」加一句看不懂的英文错误，而操作者能做的
+// 往往就是再点一次。
+func TestRenameWithRetryHandlesTransientLock(t *testing.T) {
+	dir := t.TempDir()
+	// 先钉住分类函数：该重试的认成瞬时，不该重试的立刻返回。
+	transient := []error{
+		syscall.Errno(32), // ERROR_SHARING_VIOLATION
+		syscall.Errno(33), // ERROR_LOCK_VIOLATION
+		syscall.Errno(11), // EAGAIN
+		syscall.Errno(16), // EBUSY
+		errors.New("rename x y: The process cannot access the file because it is being used by another process."),
+	}
+	for _, e := range transient {
+		if !isTransientLock(e) {
+			t.Errorf("%v 应当被认成瞬时锁（值得重试）", e)
+		}
+	}
+	permanent := []error{
+		nil,
+		os.ErrNotExist,
+		errors.New("permission denied"),
+		errors.New("rename x y: The system cannot find the path specified."),
+	}
+	for _, e := range permanent {
+		if isTransientLock(e) {
+			t.Errorf("%v 不该被认成瞬时锁（重试也没用）", e)
+		}
+	}
+
+	// 正常的改名要能成功，并且**不**依赖重试。
+	src := filepath.Join(dir, "a")
+	dst := filepath.Join(dir, "b")
+	writeFileStr(t, src, "BINARY")
+	if err := renameWithRetry(src, dst); err != nil {
+		t.Fatalf("正常改名不该失败：%v", err)
+	}
+	assertContent(t, dst, "BINARY")
+
+	// 源不存在（永久错误）要立刻返回，而不是重试到超时。
+	if err := renameWithRetry(filepath.Join(dir, "缺失"), dst); err == nil {
+		t.Error("源不存在时应当报错")
 	}
 }
 
@@ -485,7 +536,7 @@ func TestNewUpgradeManagerWiresRealBehaviours(t *testing.T) {
 // 测试辅助
 // ---------------------------------------------------------------------------
 
-// testManager 造一个指向临时目录的 manager，并把「真会动格」的两件事换成替身。
+// testManager 造一个指向临时目录的 manager，并把「真会动格」的三件事换成替身。
 func testManager(t *testing.T) (*upgradeManager, string) {
 	t.Helper()
 	exe := filepath.Join(t.TempDir(), "goproxy")
@@ -496,7 +547,23 @@ func testManager(t *testing.T) (*upgradeManager, string) {
 	}
 	um.restart = func(upgradeEnv) error { return nil }
 	um.restartDelay = 0
+	// 配置预检也要替身：这些用例暂存的是 "OLD-BINARY" 这种文本文件，
+	// 真跑一次只会得到「exec 失败」，于是每条升级用例都会变成「配置预检未通过」。
+	// 预检本身的真实行为由 configcheck_test.go 负责。
+	um.preflight = passingPreflight
 	return um, exe
+}
+
+// passingPreflight 是配置预检的测试替身：总是通过。
+func passingPreflight(context.Context, string, string) configPreflight {
+	return configPreflight{Note: "测试替身：跳过真实预检"}
+}
+
+// failingPreflight 让预检失败，用来验证「不通过时会拦住」。
+func failingPreflight(reason string) func(context.Context, string, string) configPreflight {
+	return func(context.Context, string, string) configPreflight {
+		return configPreflight{Problem: errors.New(reason)}
+	}
 }
 
 func buildTarGz(t *testing.T, files map[string][]byte) []byte {
@@ -741,6 +808,10 @@ func TestUpgradeDelegatesToRootOnReadOnlyExeDir(t *testing.T) {
 		return parseBuildVersion("v9.9.9"), "deadbee", nil
 	}
 	um.restartDelay = 0
+	// 配置预检的替身：这里暂存的是 "NEW-BINARY" 这个文本文件，真跑它只会得到
+	// 「exec 失败」，会把这条用例染成「配置预检未通过」。预检本身的行为
+	// 由 configcheck_test.go 负责。
+	um.preflight = passingPreflight
 	um.restart = func(upgradeEnv) error {
 		t.Error("托管模式下不该由服务自己替换进程")
 		return nil
@@ -776,6 +847,11 @@ func TestUpgradeDelegatesToRootOnReadOnlyExeDir(t *testing.T) {
 	}
 	if staged.Path != wantStage {
 		t.Errorf("暂存路径 = %q，期望 %q", staged.Path, wantStage)
+	}
+	// 上传的响应里要带上配置预检的结果 —— 界面靠它在上传那一刻就给出警告，
+	// 而不是等人点了「安装」才知道。
+	if !staged.ConfigChecked || staged.ConfigProblem != "" {
+		t.Errorf("上传响应里应当带上「预检已通过」，实际 %+v", staged)
 	}
 
 	// 2) 安装：回 200（已暂存，不是失败）+ needs_root + 命令，且绝对不能动 exe

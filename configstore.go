@@ -262,6 +262,111 @@ func openConfigStore(path string) (*configStore, error) {
 	return s, nil
 }
 
+// openConfigStoreReadOnly 打开配置数据库，但**不写配置数据**。
+//
+// 存在的理由是 `-config-check`（升级前拿新二进制试读当前配置库），
+// 而「试」绝不该动库。与 openConfigStore 的差别全是为这件事：
+//
+//   - **不设 journal_mode(WAL)**：那是一条写 PRAGMA，会把非 WAL 的库转过去；
+//   - **不跑 migrate()**：它会 CREATE TABLE IF NOT EXISTS，将来还会补前向迁移 ——
+//     真迁移了，还在跑的那个旧二进制就会面对一个它不认识的库，比不检查更糟；
+//   - **`mode=ro`**：SQLite 层面的只读连接，不可能写进去一个字节。
+//
+// ## 为什么优先 mode=ro，而不是 query_only
+//
+// 两者都拦得住 SQL 写，但**收尾行为**不一样，这点是实测出来的：
+//
+//	query_only  → 若自己是最后一个连接，关闭时会把 WAL 检查点进主库，
+//	              并删掉 -wal / -shm：主库被重写、目录里少了两个文件。
+//	              内容没变（检查点只是搬家），但它确实改动了文件。
+//	mode=ro     → .db 与 -wal 一个字节不动。
+//
+// 唯一仍会变的是 **-shm**：那是 SQLite 的 WAL 共享内存索引，**任何**连接
+// （含只读连接）都会碰它，它也不承载任何配置数据。实测过：mode=ro 下
+// -shm 的字节会变，而 .db / -wal 不变。所以「检查不改动配置数据」这句
+// 是成立的，「目录里一个文件都不碰」则是做不到也不该要求的。
+//
+// 代价是 schema 版本得由调用方自己判（见 schemaVersionRO 与 checkConfigUsable）。
+//
+// 注意它**不创建文件**：调用方要先确认库存在。sqlite 的 open 带 CREATE 标志，
+// 对着不存在的路径 Ping 会留下一个 0 字节文件 —— 那是「检查」不该有的副作用。
+func openConfigStoreReadOnly(path string) (*configStore, error) {
+	// 先用真正的只读连接。**失败时退到 query_only**：只读连接要求 -shm 已经存在
+	// 且可读（WAL 索引靠它协调），而「只剩 -wal、没有 -shm」虽然少见但确实会发生
+	// （有人只复制了 .db 和 -wal 去恢复）。退一步的代价只是可能触发一次检查点，
+	// 而不退的代价是**升级被自己的预检挡住**，那要严重得多。
+	dsnRO := "file:" + filepath.ToSlash(path) +
+		"?mode=ro" +
+		"&_pragma=query_only(1)" +
+		"&_pragma=busy_timeout(5000)"
+	if st, err := openStoreWithDSN(dsnRO, path); err == nil {
+		return st, nil
+	} else if !errors.Is(err, errStoreOpenFailed) {
+		return nil, err
+	}
+
+	dsnFallback := "file:" + filepath.ToSlash(path) +
+		"?_pragma=query_only(1)" +
+		"&_pragma=busy_timeout(5000)"
+	st, err := openStoreWithDSN(dsnFallback, path)
+	if err != nil {
+		return nil, fmt.Errorf("以只读方式打开配置库失败（-shm 可能缺失，退回 query_only 也没成功）：%w", err)
+	}
+	slog.Warn("配置预检：只读连接不可用，已退回 query_only（本次可能触发一次 WAL 检查点，不改配置内容）",
+		"db", path)
+	return st, nil
+}
+
+// errStoreOpenFailed 只表示「这个 DSN 连不上」，用于上面那条回退分支的判断 ——
+// 需要把它和「路径本身有问题」这类错误分开。
+var errStoreOpenFailed = errors.New("打开失败")
+
+func openStoreWithDSN(dsn, path string) (*configStore, error) {
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errStoreOpenFailed, err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("%w: %v", errStoreOpenFailed, err)
+	}
+	return &configStore{db: db, path: path}, nil
+}
+
+// schemaVersionRO 只读地读 schema 版本。返回空串表示读不到（表不存在或没这一行）。
+func (s *configStore) schemaVersionRO() (string, error) {
+	var hasTable int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).
+		Scan(&hasTable); err != nil {
+		return "", fmt.Errorf("读取库结构失败: %w", err)
+	}
+	if hasTable == 0 {
+		return "", nil
+	}
+	var v string
+	switch err := s.db.QueryRow(
+		`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&v); {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("读取 schema 版本失败: %w", err)
+	}
+	return v, nil
+}
+
+// errSchemaMismatch 是 schema 版本对不上时的报错。
+//
+// 抽成函数是为了让 migrate（真的启动）与 checkConfigUsable（试读）**报出同一句话** ——
+// 预检的价值全在于「它说的就是启动时会说的」，两处各写一份文案必然漂移。
+func errSchemaMismatch(cur string) error {
+	return fmt.Errorf(
+		"配置数据库的 schema 版本是 %s，本二进制支持的是 %d：库比程序新，请升级 goproxy 后再启动",
+		cur, configSchemaVersion)
+}
+
 func (s *configStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
@@ -298,9 +403,7 @@ func (s *configStore) migrate() error {
 	// 目前只有 v1，所以走到这里只可能是「库比二进制新」。
 	// 让它明确失败，而不是带着一张看不懂的表继续跑：
 	// 用旧二进制打开新库，最坏的结果是保存时把新字段整列抹掉。
-	return fmt.Errorf(
-		"配置数据库的 schema 版本是 %s，本二进制支持的是 %d：库比程序新，请升级 goproxy 后再启动",
-		cur, configSchemaVersion)
+	return errSchemaMismatch(cur)
 }
 
 // withTx 跑一个事务。所有数据库操作都经过它，保证「要么全成、要么全不成」。
@@ -907,27 +1010,46 @@ func (s *configStore) isEmpty() (bool, error) {
 
 // importJSON 用一份 JSON 覆盖当前配置（首次导入与命令行导入都走它）。
 func (s *configStore) importJSON(raw []byte) (rev string, err error) {
+	// baseDir 必须在 validate 之前设好：证书的相对路径就是相对它解析的，
+	// 留空的话会退化成「相对进程工作目录」，同一个配置在不同启动方式下
+	// 校验结果不同 —— 命令行导入时工作目录是用户随手所在的目录，必然对不上。
+	if err := validateConfigJSON(raw, filepath.Dir(s.path)); err != nil {
+		return "", err
+	}
+	// 校验通过后要真的写，所以这里再解一次拿到 *Config。多解一次的开销可以忽略
+	// （配置只有几十条），换来的是「校验只有一个实现」——
+	// 预检与真导入共用 validateConfigJSON，两处不可能漂移。
 	cfg := &Config{}
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return "", fmt.Errorf("解析配置 JSON 失败: %w", err)
 	}
-	if err := rejectLegacyACL(raw); err != nil {
-		return "", err
-	}
-	// baseDir 必须在 validate 之前设好：证书的相对路径就是相对它解析的，
-	// 留空的话会退化成「相对进程工作目录」，同一个配置在不同启动方式下
-	// 校验结果不同 —— 命令行导入时工作目录是用户随手所在的目录，必然对不上。
 	cfg.baseDir = filepath.Dir(s.path)
 	// 只固化路由级默认值（ID / path_prefix），**不固化**顶层默认值 ——
 	// applyTopDefaults 会把留空的 admin_addr 变成默认地址，一旦写进库就再也
 	// 回不到「留空 = 用默认」这个语义了，下次改配置还会顺带把管理端口打开。
-	// 校验按运行时语义来做，所以用 validateWithDefaults（在副本上补默认值）。
 	cfg.applyRouteDefaults()
-	if err := cfg.validateWithDefaults(); err != nil {
-		return "", err
-	}
 	_, rev, err = s.write(cfg)
 	return rev, err
+}
+
+// validateConfigJSON 解析并校验一份 JSON 配置，**不写任何东西**。
+//
+// 它是 importJSON 的校验部分，单独抽出来是为了让 `-config-check` 能对旁边的
+// config.json（首次启动会导入的那份种子）给出与真导入**同一句**判词。
+// 抽出来的另一层意义是防漂移：如果预检自己再写一遍「解析 → 拦旧写法 → 补默认值 →
+// 校验」，两处迟早只改一处，而预检的全部价值就在于它说的与真启动一致。
+func validateConfigJSON(raw []byte, baseDir string) error {
+	cfg := &Config{}
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		return fmt.Errorf("解析配置 JSON 失败: %w", err)
+	}
+	if err := rejectLegacyACL(raw); err != nil {
+		return err
+	}
+	cfg.baseDir = baseDir
+	// 校验按运行时语义来做，所以用 validateWithDefaults（在副本上补默认值）。
+	cfg.applyRouteDefaults()
+	return cfg.validateWithDefaults()
 }
 
 // exportJSON 导出当前配置为 JSON 字节（给控制台的备份按钮和命令行用）。
@@ -1003,6 +1125,20 @@ func isSQLiteFile(path string) bool {
 	head := make([]byte, 16)
 	n, _ := io.ReadFull(f, head)
 	return n >= 16 && strings.HasPrefix(string(head), "SQLite format 3")
+}
+
+// errConfigDBLooksLikeJSON 是「-c 还指在旧的 config.json 上」的判词。
+//
+// 抽成函数是为了让启动（prepareConfigStore）与升级前预检（checkConfigUsable）
+// 报**同一句话**：同一个错误两种说法，只会让人以为是两个不同的问题。
+func errConfigDBLooksLikeJSON(configDB string) error {
+	return fmt.Errorf(
+		"%s 不是 SQLite 数据库（看起来还是旧版的 JSON 配置文件）。\n"+
+			"    配置源已经换成 SQLite，请二选一：\n"+
+			"      1. 保留 -c 指向它，另外执行一次导入：goproxy -config-import %s -c goproxy.db\n"+
+			"      2. 直接把 -c 改成 goproxy.db，启动时会自动导入同目录下的 config.json（只导一次）\n"+
+			"    迁移步骤见 v0.9.0 的发布说明（Releases 页）。",
+		configDB, configDB)
 }
 
 // ---------- 进程级连接复用 ----------

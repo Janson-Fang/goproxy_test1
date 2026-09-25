@@ -175,13 +175,7 @@ func prepareConfigStore(configDB string) error {
 	// 不拦的话会安静地在旁边建一个新的空库，而用户的配置还在原文件里没人读 ——
 	// 现象是「升级完配置全没了」，但文件明明还在。
 	if fi, err := os.Stat(configDB); err == nil && !fi.IsDir() && !isSQLiteFile(configDB) {
-		return fmt.Errorf(
-			"%s 不是 SQLite 数据库（看起来还是旧版的 JSON 配置文件）。\n"+
-				"    配置源已经换成 SQLite，请二选一：\n"+
-				"      1. 保留 -c 指向它，另外执行一次导入：goproxy -config-import %s -c goproxy.db\n"+
-				"      2. 直接把 -c 改成 goproxy.db，启动时会自动导入同目录下的 config.json（只导一次）\n"+
-				"    迁移步骤见 v0.9.0 的发布说明（Releases 页）。",
-			configDB, configDB)
+		return errConfigDBLooksLikeJSON(configDB)
 	}
 
 	st, err := storeFor(configDB)
@@ -1215,6 +1209,11 @@ func main() {
 		"以 root 应用控制台「升级」页暂存好的新版本（服务账号写不进二进制目录时用它）")
 	rollbackUpgrade := flag.Bool("upgrade-rollback", false,
 		"以 root 回退到 <exe>.old（升级模块留下的上一版）")
+	upgradeForce := flag.Bool("upgrade-force", false,
+		"配合 -upgrade-apply：即使配置预检不通过也强行应用（会让服务起不来，只在明确知道后果时用）")
+	configCheck := flag.Bool("config-check", false,
+		"只读地检查配置库能不能被本二进制加载，然后退出。不改动任何数据；"+
+			"升级前用它预检「换上去之后起不起得来」")
 	listBans := flag.Bool("bans", false,
 		"列出当前的自动封禁并退出（服务在不在跑都能用）")
 	unban := flag.String("unban", "",
@@ -1279,6 +1278,21 @@ func main() {
 		return
 	}
 
+	// 配置预检：只读地判断「这份配置库能不能被本二进制加载」，然后退出。
+	//
+	// 它存在的场景是升级：换文件之前先问一句「换上去之后起得来吗」。
+	// 判据与启动时读配置那一段完全相同（见 configcheck.go），所以它的失败原因
+	// 就是启动时会打印的那一句（含迁移映射）。
+	//
+	// 放在这里、和导入导出同一批：都不起服务，且都必须能对「-c 指错了」给出人话。
+	if *configCheck {
+		if err := runConfigCheck(*configDB); err != nil {
+			slog.Error("配置预检未通过", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// 托管升级的第二半：以 root 应用 / 回退。
 	//
 	// install.sh 装出来的实例里服务以 goproxy 跑、/usr/local/bin 属 root，进程自己
@@ -1289,7 +1303,7 @@ func main() {
 	//
 	// 必须在 NewApp 之前处理：它只需要 -c 来推导暂存目录，不该顺手把配置库建出来。
 	if *applyUpgrade || *rollbackUpgrade {
-		if err := runUpgradeApply(*configDB, *rollbackUpgrade); err != nil {
+		if err := runUpgradeApply(*configDB, *rollbackUpgrade, *upgradeForce); err != nil {
 			slog.Error("应用升级失败", "err", err)
 			os.Exit(1)
 		}

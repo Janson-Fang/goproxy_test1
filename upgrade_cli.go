@@ -4,6 +4,7 @@ package main
 // 从 upgrade.go 拆出，纯机械移动，逻辑未动。
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,7 +27,7 @@ import (
 // 同一份 <exe>.old），所以「界面点的」和「命令行做的」结果一致。
 // ---------------------------------------------------------------------------
 
-func runUpgradeApply(configDB string, rollback bool) error {
+func runUpgradeApply(configDB string, rollback, force bool) error {
 	exe := executablePath()
 	if exe == "" {
 		return errors.New("拿不到当前可执行文件路径，无法应用")
@@ -47,7 +48,11 @@ func runUpgradeApply(configDB string, rollback bool) error {
 		what = "备份的上一版"
 	}
 	if src == "" {
-		return fmt.Errorf("没有可应用的%s：暂存文件不存在（先到控制台的「升级」页下载或上传）", what)
+		return fmt.Errorf("没有可应用的%s：暂存文件不存在（先到控制台的「升级」页下载或上传）\n"+
+			"    找过这两个位置：\n%s\n"+
+			"    如果有文件却在别处，多半是 -c 与 systemd 单元里 ExecStart 的路径不一致 ——\n"+
+			"    暂存目录是跟着 -c 算的（<配置库目录>/upgrade/）。",
+			what, candidateList(um))
 	}
 	if fi, err := os.Stat(src); err != nil || fi.IsDir() {
 		return fmt.Errorf("读%s失败：%v", what, err)
@@ -66,6 +71,28 @@ func runUpgradeApply(configDB string, rollback bool) error {
 	if err != nil {
 		return fmt.Errorf("待应用的%s通不过验证，已放弃：%w", what, err)
 	}
+
+	// 配置预检：**只对升级，不对回退**。
+	//
+	// 回退是应急出口，而「旧二进制读不了新配置」恰恰是它最常见的场景 ——
+	// 拦住它等于把出口焊死（真正该做的是升级前留一份配置库快照，见评估文档）。
+	// 升级则相反：这一步能挡掉「换上去、服务起不来、只能人工回退」那条路，
+	// 而代价只是一次只读试读。
+	if !rollback {
+		pf := preflightConfig(context.Background(), src, configDB)
+		if pf.Problem != nil {
+			if !force {
+				// 原因通常是多行的迁移映射，直接给人读；返回短错误只为退出码与日志。
+				fmt.Fprintf(os.Stderr, "\n配置预检未通过，已放弃应用 %s：\n\n%v\n\n"+
+					"    改法：按上面的迁移映射改好配置，再重跑这条命令。\n"+
+					"    确认要带着不兼容的配置硬上（服务会起不来）：加 -upgrade-force\n\n", bv.Raw, pf.Problem)
+				return errConfigCheckFailed
+			}
+			slog.Warn("升级：配置预检未通过，按 -upgrade-force 强行继续", "err", pf.Problem)
+			fmt.Fprintf(os.Stderr, "警告：配置预检未通过，按 -upgrade-force 强行应用（服务可能起不来）：\n%v\n\n", pf.Problem)
+		}
+	}
+
 	if err := swapBinary(exe, src, um.backupPath(), um.parkedPath()); err != nil {
 		if rollback {
 			_ = os.Remove(src)
@@ -75,6 +102,22 @@ func runUpgradeApply(configDB string, rollback bool) error {
 	slog.Info("升级：已应用", "what", what, "exe", exe, "version", bv.Raw, "commit", commit,
 		"sha256", sha, "backup", um.backupPath())
 	return restartServiceAfterApply()
+}
+
+// candidateList 把「找过哪些位置」列成人话。
+//
+// 不列出来的话，`-c` 路径写错时报的是「暂存文件不存在」，人会去控制台反复重传 ——
+// 而真正的原因（两个进程算出的暂存目录不同）完全没有出现在错误里。
+func candidateList(um *upgradeManager) string {
+	var sb strings.Builder
+	for _, p := range um.stagedCandidates() {
+		mark := "  "
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			mark = "✔ "
+		}
+		fmt.Fprintf(&sb, "      %s%s\n", mark, p)
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // restartServiceAfterApply 让服务加载新版本。

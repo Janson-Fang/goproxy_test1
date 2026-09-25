@@ -492,7 +492,11 @@ export async function getUpgradeState(): Promise<UpgradeState> {
  * 直到版本变化或服务恢复。写不进去二进制目录时不会替换进程，而是回一个
  * needs_root=true + apply_command，等人在服务器上以 root 收尾。
  */
-export async function installUpgrade(req: { sha256?: string }): Promise<UpgradeInstallResult> {
+export async function installUpgrade(req: {
+  sha256?: string
+  /** 明知配置预检没过也照装。默认不传 —— 那会让服务起不来 */
+  force?: boolean
+}): Promise<UpgradeInstallResult> {
   const { data } = await raw<UpgradeInstallResult>('POST', '/_goproxy/upgrade/install', { body: req })
   return data
 }

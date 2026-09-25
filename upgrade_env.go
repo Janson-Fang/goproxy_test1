@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -276,10 +277,10 @@ func swapBinary(exe, newPath, backupPath, parked string) error {
 		return fmt.Errorf("备份当前二进制到 %s 失败：%w", backupPath, err)
 	}
 
-	if err := os.Rename(exe, parked); err != nil {
+	if err := renameWithRetry(exe, parked); err != nil {
 		return fmt.Errorf("移开当前二进制失败：%w", err)
 	}
-	if err := os.Rename(newPath, exe); err != nil {
+	if err := renameWithRetry(newPath, exe); err != nil {
 		if rerr := os.Rename(parked, exe); rerr != nil {
 			return fmt.Errorf("写入新二进制失败（%v），且回滚也失败（%v）：%s 现在不存在，请手工把 %s 改回来",
 				err, rerr, exe, parked)
@@ -292,6 +293,59 @@ func swapBinary(exe, newPath, backupPath, parked string) error {
 		slog.Debug("升级：旧二进制的临时文件未能删除，下次启动会清理", "path", parked, "err", err)
 	}
 	return nil
+}
+
+// renameWithRetry 改名，失败时短暂重试几次。
+//
+// 为什么需要它：Windows 上刚被写入或被扫描的文件会被**短暂**持有
+// （杀毒实时防护、搜索索引、以及「刚被执行过的映像」），此时 rename 报
+// `The process cannot access the file because it is being used by another process`。
+// 这是端到端跑出来的：同一次替换在几秒内第一次失败、第二次成功 ——
+// 也就是说它**不是**「Windows 不允许改名运行中的 exe」（实测允许），
+// 而是一个瞬时的共享冲突。
+//
+// 加这个重试的理由是它出现在升级路径上：失败一次的表现是「升级失败」
+// 加一句看不懂的英文错误，而操作者能做的往往就是「再点一次」。
+// 重试本来就是这件正确的事，只是不该由人来点。
+//
+// 只重试共享冲突这一类错误，别的错误（路径不存在、权限）立刻返回 ——
+// 那些重试一百次也不会变好。
+func renameWithRetry(src, dst string) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = os.Rename(src, dst); err == nil {
+			return nil
+		}
+		if !isTransientLock(err) {
+			return err
+		}
+		time.Sleep(time.Duration(120*(i+1)) * time.Millisecond)
+	}
+	return err
+}
+
+// isTransientLock 判断这个错误是不是「文件被短暂占用」。
+//
+// 认 Windows 的错误码（32 = ERROR_SHARING_VIOLATION，33 = ERROR_LOCK_VIOLATION）
+// 以及 Unix 侧的 EBUSY。字符串匹配只在 Windows 上兜底：syscall.Errno 能直接比，
+// 但这里刻意不引入平台分支文件 —— 一个字符串包含判断足够表达意图，也不会
+// 因为平台差异把该重试的失败漏掉。
+func isTransientLock(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch int(errno) {
+		case 32, 33, 11, 16: // Windows 共享冲突/锁冲突；EAGAIN；EBUSY
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "being used by another process") ||
+		strings.Contains(msg, "sharing violation") ||
+		strings.Contains(msg, "resource busy")
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {

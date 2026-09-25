@@ -42,6 +42,16 @@ type upgradeStagedView struct {
 	MTime    string `json:"mtime,omitempty"`
 	Verified bool   `json:"verified"`
 	Source   string `json:"source,omitempty"`
+
+	// 配置预检的三个结果字段（见 configcheck.go）：
+	//   ConfigChecked  跑过且通过
+	//   ConfigSkipped  那个二进制不认识 -config-check（降级到 v0.15.0 之前）
+	//   ConfigProblem  非空 = 它读不了当前配置，界面该当红色警告看待
+	// 三者都为零值表示「不知道」（比如刚重启过，内存里那次结果没了）——
+	// 界面显示「未预检」，而不是假装它通过了。
+	ConfigChecked bool   `json:"config_checked"`
+	ConfigSkipped bool   `json:"config_check_skipped,omitempty"`
+	ConfigProblem string `json:"config_problem,omitempty"`
 }
 
 type upgradeBackupView struct {
@@ -93,6 +103,10 @@ type upgradeInstallResult struct {
 	ApplyCommand string `json:"apply_command,omitempty"`
 	StagedPath   string `json:"staged_path,omitempty"`
 	StagedSHA256 string `json:"staged_sha256,omitempty"`
+	// Warning 非空表示这次是**带着问题**继续的（目前只有一种：配置预检没过，
+	// 但请求里带了 force）。界面必须把它显示出来 —— 这种升级的结果可能是
+	// 服务起不来，不能让它看起来像一次普通成功。
+	Warning string `json:"warning,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -266,8 +280,25 @@ func (a *App) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+
+	// 配置预检：上传这一层**只报告、不拒绝**（上传本身不改变任何东西，
+	// 要拦就得拦在「真的换上去」那一步）。放在这里说的价值最大：此刻文件还没生效，
+	// 改配置或换一个包都来得及，而等到点「安装」才知道就白传了一次。
+	//
+	// 发布一份**副本**再填字段：st 已经通过 setStaged 发布出去了，就地改它会与
+	// 并发读（GET /_goproxy/upgrade）共享同一块内存 —— 那是数据竞争，-race 抓得到。
+	pf := um.preflight(r.Context(), st.Path, a.configDB)
+	published := *st
+	published.ConfigChecked = !pf.Skipped && pf.Problem == nil
+	published.ConfigSkipped = pf.Skipped
+	if pf.Problem != nil {
+		published.ConfigProblem = pf.Problem.Error()
+	}
+	um.setStaged(&published)
+
 	slog.Info("升级：已接收上传的二进制", "actor", actor, "file", filepath.Base(name),
-		"size", st.Size, "sha256", st.SHA256, "version", st.Version)
+		"size", st.Size, "sha256", st.SHA256, "version", st.Version,
+		"config_problem", pf.Problem != nil, "config_skipped", pf.Skipped)
 	writeJSON(w, http.StatusOK, um.stagedView())
 }
 
@@ -292,6 +323,12 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 		// SHA256 可选：填了就要求暂存文件和它对得上（防的是「上传之后、
 		// 安装之前」这段窗口里文件被换掉）。
 		SHA256 string `json:"sha256"`
+		// Force 表示「明知配置预检没过也照装」。
+		//
+		// 默认**不跳**：新二进制读不了当前配置时装上去的结果是服务起不来，
+		// 那种「成功」比一次失败难收拾得多（要有人上机器回退）。
+		// 留着这个开关是因为预检本身也可能误判，而误判时不该没有出路。
+		Force bool `json:"force"`
 	}
 	if err := readOptionalJSON(r, &req); err != nil {
 		writeErr(w, err)
@@ -318,6 +355,27 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 配置预检：真正换文件之前再问一次。
+	//
+	// 上传时已经问过，但两件事之间配置可能被改过，而这一步才是「换上去」的那一下。
+	// 回退走的是另一个 handler，天然不会被这里拦住 —— 回退必须永远是出口。
+	pf := um.preflight(r.Context(), st.Path, a.configDB)
+	if pf.Problem != nil && !req.Force {
+		slog.Warn("升级：配置预检未通过，已拒绝安装", "actor", actor,
+			"from", from, "to", st.Version, "err", pf.Problem)
+		writeErr(w, &apiError{http.StatusConflict, "config_incompatible",
+			"新版本读不了当前配置，已拒绝安装（装上去服务会起不来）：\n\n" +
+				pf.Problem.Error() +
+				"\n\n按上面的迁移映射改好配置再装。确实要硬上就在请求里带 force=true。"})
+		return
+	}
+	var warning string
+	if pf.Problem != nil {
+		warning = "配置预检未通过，按 force 继续（服务可能起不来）：\n" + pf.Problem.Error()
+		slog.Warn("升级：配置预检未通过，按 force 继续", "actor", actor,
+			"from", from, "to", st.Version, "err", pf.Problem)
+	}
+
 	// 托管：校验与 -version 验证都已经做完了，但进程写不进去二进制目录，
 	// 最后那一步（写文件 + 重启服务）得由 root 来。这不是失败，所以回 200，
 	// 把该执行的命令一并给出去；界面据此显示「等待 root 应用」。
@@ -330,6 +388,7 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 			Service: env.Service, Source: st.Source, Verified: true,
 			NeedsRoot: true, ApplyCommand: um.applyCommand(false),
 			StagedPath: st.Path, StagedSHA256: st.SHA256,
+			Warning: warning,
 		})
 		return
 	}
@@ -344,6 +403,7 @@ func (a *App) handleUpgradeInstall(w http.ResponseWriter, r *http.Request) {
 		OK: true, From: from, To: st.Version, SHA256: st.SHA256,
 		Backup: filepath.Base(um.backupPath()), Restart: string(env.Strategy),
 		Service: env.Service, Source: st.Source, Verified: true,
+		Warning: warning,
 	})
 
 	// 最后一步：把当前进程换成新二进制。放在响应之后，因为 syscall.Exec

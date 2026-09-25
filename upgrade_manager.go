@@ -4,6 +4,7 @@ package main
 // 从 upgrade.go 拆出，纯机械移动，逻辑未动。
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,15 @@ type stagedBinary struct {
 	Commit  string
 	MTime   time.Time
 	Source  string // upload | rollback
+
+	// ConfigChecked / ConfigSkipped / ConfigProblem 是**上传时**那次配置预检的结果。
+	//
+	// 只用于展示：真正决定「装不装」的是安装那一步重新跑的一次 —— 上传之后配置
+	// 还可能被改过，而预检必须问的是「此刻的配置」。但提前把结果摆出来价值最大：
+	// 那时文件还没生效，改配置或换包都来得及。
+	ConfigChecked bool
+	ConfigSkipped bool
+	ConfigProblem string
 }
 
 type upgradeManager struct {
@@ -35,13 +45,16 @@ type upgradeManager struct {
 	// root 用 -upgrade-apply 应用时也会算出同一个位置。
 	configDB string
 
-	// verify / restart / restartDelay 是留给单测的注入点。
-	// 这三件事在测试进程里必须有替身：verify 会真的去执行「被验证的文件」，
-	// restart 会把当前进程 exec 掉，后果分别是「测试依赖一个真实二进制」
-	// 和「测试跑一半自己没了」。生产路径用默认值（见 newUpgradeManagerFor），
+	// verify / restart / preflight / restartDelay 是留给单测的注入点。
+	// 这几件事在测试进程里必须有替身：verify 会真的去执行「被验证的文件」，
+	// restart 会把当前进程 exec 掉，preflight 同样要执行那个文件并读一次配置库 ——
+	// 后果分别是「测试依赖一个真实二进制」「测试跑一半自己没了」
+	// 和「每条升级用例都被染成配置预检失败（因为暂存的是个假文件）」。
+	// 生产路径用默认值（见 newUpgradeManagerFor），
 	// 那里有一致性测试兜着，不会被悄悄换掉。
 	verify       func(path string) (buildVersion, string, error)
 	restart      func(env upgradeEnv) error
+	preflight    func(ctx context.Context, bin, configDB string) configPreflight
 	restartDelay time.Duration
 
 	mu     sync.Mutex
@@ -70,6 +83,7 @@ func newUpgradeManagerFor(exe, configDB string) *upgradeManager {
 		configDB:     configDB,
 		verify:       verifyBinary,
 		restart:      restartProcess,
+		preflight:    preflightConfig,
 		restartDelay: upgradeRestartDelay,
 	}
 }
@@ -146,11 +160,18 @@ func (um *upgradeManager) stagedView() upgradeStagedView {
 			MTime:    formatLogTime(st.MTime),
 			Verified: true,
 			Source:   st.Source,
+
+			ConfigChecked: st.ConfigChecked,
+			ConfigSkipped: st.ConfigSkipped,
+			ConfigProblem: st.ConfigProblem,
 		}
 	}
 	// 进程里没有记录（多半是刚重启过）但磁盘上还留着一份：只报存在性和大小。
 	// sha256 / 自述版本不必为了显示再算一遍，真装的时候一定会重新验证，
 	// 到时候才算才有意义。
+	//
+	// 配置预检同理：这一份是重启之前留下的，那次结果已经不在内存里了。
+	// 三个字段留零值 = 界面显示「未预检」，而不是假装它通过了。
 	if path := um.findStaged(); path != "" {
 		if fi, err := os.Stat(path); err == nil {
 			return upgradeStagedView{
