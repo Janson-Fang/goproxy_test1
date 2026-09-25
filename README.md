@@ -123,6 +123,20 @@ systemctl show -p ExecMainStartTimestamp goproxy                                
 > （不静默忽略、不自动转换）——不会带着旧配置跑出别的意思。想先留个底：
 > `goproxy -c <配置库> -config-export backup.json`。
 
+### 预发布版（测试版）
+
+tag 名里带 `-` 的都是预发布（如 `v0.14.0-rc.1`）。它们**不会**成为 `latest`，
+所以不带 `VERSION=` 的安装永远装到正式版。想装某个预发布版就显式指定：
+
+```bash
+curl -fsSL .../install.sh | sudo VERSION=v0.14.0-rc.1 bash
+```
+
+控制台「升级」页里，预发布版的版本号后面会带一个**「非发布版本」**徽标 ——
+预发布号不参与大小比较（`0.14.0-rc.1` 与 `0.14.0` 谁新要用 semver 的预发布规则，
+宁可显示「比不了」也不猜）。从 main 直接编出来的二进制版本形如
+`v0.13.0-2-g354b36e`（tag 之后 2 个提交），那种**能**参与比较，靠这个后缀认它。
+
 ### Docker
 
 ```bash
