@@ -58,6 +58,12 @@ type statsResponse struct {
 	Circuit cbCounts      `json:"circuit"`
 	Series  []seriesPoint `json:"series"`
 	Logs    logStats      `json:"logs"`
+
+	// BansActive 是当前生效的自动封禁条数。
+	//
+	// 放在状态接口里而不是只给封禁页，是为了让「正在被扫」这件事在总览页就看得见 ——
+	// 一个地址已经被判定为扫描来源、正在被封着，这件事不该需要谁先想到去点开另一页。
+	BansActive int `json:"bans_active"`
 }
 
 func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +86,7 @@ func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
 			Dropped:     dropped,
 			LatestSeq:   a.logs.Seq(),
 		},
+		BansActive: a.bans.stats().Active,
 	}
 
 	// 配置的统计读不到就留空，不要因此让整个状态接口失败 ——

@@ -8,6 +8,7 @@ import { duration, num } from './format'
 import { Dashboard } from './pages/Dashboard'
 import { RoutesPage } from './pages/RoutesPage'
 import { IPListPage } from './pages/IPListPage'
+import { BansPage } from './pages/BansPage'
 import { CertsPage } from './pages/CertsPage'
 import { LogsPage } from './pages/LogsPage'
 import { SettingsPage } from './pages/SettingsPage'
@@ -196,6 +197,12 @@ export default function App() {
         <button className="tab" aria-selected={tab === 'acl'} onClick={() => navigate('acl')}>
           IP 名单
         </button>
+        {/* 紧挨「IP 名单」：静态名单是「我声明谁能进」，蜜罐与封禁是「我探测到谁在扫」。
+            同一件事的两个半，拆开摆会让人来回切页签查。 */}
+        <button className="tab" aria-selected={tab === 'bans'} onClick={() => navigate('bans')}>
+          蜜罐与封禁
+          {stats?.bans_active ? <span className="count">{stats.bans_active}</span> : null}
+        </button>
         <button className="tab" aria-selected={tab === 'certs'} onClick={() => navigate('certs')}>
           证书
         </button>
@@ -239,6 +246,9 @@ export default function App() {
         </div>
         <div style={{ display: tab === 'acl' ? 'block' : 'none' }}>
           <IPListPage active={tab === 'acl'} onChanged={() => void refresh()} />
+        </div>
+        <div style={{ display: tab === 'bans' ? 'block' : 'none' }}>
+          <BansPage active={tab === 'bans'} />
         </div>
         <div style={{ display: tab === 'certs' ? 'block' : 'none' }}>
           <CertsPage />

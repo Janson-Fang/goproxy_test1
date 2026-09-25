@@ -18,9 +18,13 @@
 
 import type {
   ACLDecision,
+  BanEntry,
+  BansState,
   CertsResponse,
   ConfigPatch,
   ConfigView,
+  HoneypotConfig,
+  HoneypotSaveResult,
   LogEntry,
   LogsResponse,
   MutationResult,
@@ -551,4 +555,50 @@ export function uploadUpgradeBinary(
     }
     xhr.send(form)
   })
+}
+/* ---------- 蜜罐与自动封禁 ---------- */
+
+/**
+ * 封禁页的数据源：一次拿全。
+ *
+ * 一次给全而不是分成四个接口（配置 / 统计 / 端口状态 / 命中列表），是因为
+ * 这个页面**必须自洽**：配置说"enforce"、端口状态说"没在监听"、列表却空着，
+ * 三个信息分三次拿就可能互相矛盾，而它们恰好是运维判断"到底有没有在防护"
+ * 的全部依据。
+ */
+export async function getBans(): Promise<BansState> {
+  const res = await raw<BansState>('GET', '/_goproxy/bans')
+  return res.data
+}
+
+/** 人工封禁。不走豁免、不参与突发熔断 —— 这是人明确做出的决定。 */
+export async function createBan(req: {
+  ip: string
+  reason?: string
+  secs?: number
+}): Promise<BanEntry> {
+  const res = await raw<BanEntry>('POST', '/_goproxy/bans', { body: req })
+  return res.data
+}
+
+/** 解封。ip 传 "all" 清空全部。 */
+export async function unban(ip: string): Promise<{ ok: boolean; was_active?: boolean; removed?: number }> {
+  const res = await raw<{ ok: boolean; was_active?: boolean; removed?: number }>(
+    'POST',
+    '/_goproxy/bans/unban',
+    { body: { ip } },
+  )
+  return res.data
+}
+
+/**
+ * 保存蜜罐配置。
+ *
+ * 刻意不带 If-Match：这份配置不在 Config 里、不参与 revision 校验。
+ * 服务端对「配置已存但某个端口没起来」的处理是**不回滚**，只把原因放在
+ * problems 里 —— 回滚会造成"库里是 A、行为是 B"，比端口没起来更难查。
+ */
+export async function saveHoneypotConfig(cfg: HoneypotConfig): Promise<HoneypotSaveResult> {
+  const res = await raw<HoneypotSaveResult>('PUT', '/_goproxy/honeypot', { body: cfg })
+  return res.data
 }

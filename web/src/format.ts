@@ -1,6 +1,6 @@
 /** 格式化小工具。集中放一起，免得每个页面各写一套，数字风格不统一。 */
 
-import type { IPRule, RawIPRule } from './types'
+import type { HoneypotPort, IPRule, RawIPRule } from './types'
 
 const nf = new Intl.NumberFormat('zh-CN')
 
@@ -290,4 +290,76 @@ export function parsePairs(raw: string): Record<string, string> {
     if (k && v) out[k] = v
   }
   return out
+}
+
+
+/* ---------- 蜜罐端口的文本形态 ---------- */
+
+/**
+ * 端口在界面上的文本约定，和 IP 名单同一套写法（运维不用学第二种）：
+ *
+ *     # 以 # 开头的整行是注释
+ *     23            备注可以跟在后面
+ *     3389/tcp
+ *     5900/udp      UDP 也一样，只是绝不回包
+ *     2323,13389    ← 一行逗号分隔，等价于两行（此时不给备注）
+ *
+ * 返回 { ports, bad }：bad 是解析不出来的原行，**原样留着给界面报错**。
+ * 不在这里静默丢掉 —— 用户少打一个数字就少一个诱饵端口，而这种"少一个"
+ * 在界面上看不出来（列表里那一行只是不见了）。
+ */
+export function parseHoneypotPorts(raw: string): { ports: HoneypotPort[]; bad: string[] } {
+  const ports: HoneypotPort[] = []
+  const bad: string[] = []
+  const seen = new Set<string>()
+
+  const push = (portStr: string, proto: string, note: string) => {
+    if (!/^\d+$/.test(portStr)) {
+      bad.push(portStr + (note ? ' ' + note : ''))
+      return
+    }
+    const n = Number(portStr)
+    if (n < 1 || n > 65535) {
+      bad.push(portStr + '（端口号要 1-65535）')
+      return
+    }
+    const p = proto.toLowerCase() === 'udp' ? 'udp' : 'tcp'
+    const key = `${p}/${n}`
+    if (seen.has(key)) return
+    seen.add(key)
+    ports.push(note ? { port: n, proto: p, note } : { port: n, proto: p })
+  }
+
+  for (const line of raw.split('\n')) {
+    const t = line.trim()
+    if (!t || t.startsWith('#')) continue
+
+    const sp = t.search(/\s/)
+    const head = sp < 0 ? t : t.slice(0, sp)
+    const tail = sp < 0 ? '' : t.slice(sp).trim()
+
+    if (head.includes(',') || head.includes('，')) {
+      for (const piece of head.split(/[,，]/)) {
+        const c = piece.trim()
+        if (!c) continue
+        const [p, proto] = c.split('/')
+        push(p.trim(), (proto ?? 'tcp').trim(), '')
+      }
+      continue
+    }
+    const [p, proto] = head.split('/')
+    push(p.trim(), (proto ?? 'tcp').trim(), tail)
+  }
+  return { ports, bad }
+}
+
+/** parseHoneypotPorts 的反向。tcp 不写出来 —— 它是默认值，写满 /tcp 只是噪音。 */
+export function honeypotPortsToText(ports: HoneypotPort[] | null | undefined): string {
+  return (ports ?? [])
+    .filter((p) => p && p.port)
+    .map((p) => {
+      const spec = (p.proto ?? 'tcp').toLowerCase() === 'udp' ? `${p.port}/udp` : `${p.port}`
+      return p.note ? `${spec} ${p.note}` : spec
+    })
+    .join('\n')
 }

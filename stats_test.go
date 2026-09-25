@@ -669,3 +669,47 @@ func abs(f float64) float64 {
 	}
 	return f
 }
+
+// TestStatsReportsActiveBans 守住 /stats 里的 bans_active。
+//
+// 前端「蜜罐与封禁」页签上的角标读的就是它。这条字段断了**不会报错**、也不会让
+// 别的断言变红，只会让「现在有封禁」这件事在其它页面上悄悄消失 —— 正是最容易漏掉
+// 的那种回归，所以单独钉一条，而且加和减都要验（只加不减的话，角标会一直挂着一个
+// 早就不存在的封禁）。
+func TestStatsReportsActiveBans(t *testing.T) {
+	e, _ := newStatsEnv(t)
+
+	bansActive := func(when string) int {
+		t.Helper()
+		rr := e.do(t, "GET", "/_goproxy/stats", "")
+		if rr.Code != 200 {
+			t.Fatalf("%s 读 stats 应 200，实际 %d: %s", when, rr.Code, rr.Body.String())
+		}
+		var s statsResponse
+		if err := json.Unmarshal(rr.Body.Bytes(), &s); err != nil {
+			t.Fatalf("%s 解析响应失败: %v", when, err)
+		}
+		return s.BansActive
+	}
+
+	if n := bansActive("初始"); n != 0 {
+		t.Fatalf("一开始不该有生效封禁，实际 %d", n)
+	}
+
+	// 人工封禁：立刻生效，也不看豁免（那是人明确做出的决定）
+	rr := e.do(t, "POST", "/_goproxy/bans", `{"ip":"93.184.216.34","reason":"测试","secs":600}`)
+	if rr.Code != 200 {
+		t.Fatalf("封禁应 200，实际 %d: %s", rr.Code, rr.Body.String())
+	}
+	if n := bansActive("封禁后"); n != 1 {
+		t.Errorf("封了 1 个地址后 bans_active 应为 1，实际 %d", n)
+	}
+
+	rr = e.do(t, "POST", "/_goproxy/bans/unban", `{"ip":"93.184.216.34"}`)
+	if rr.Code != 200 {
+		t.Fatalf("解封应 200，实际 %d: %s", rr.Code, rr.Body.String())
+	}
+	if n := bansActive("解封后"); n != 0 {
+		t.Errorf("解封后 bans_active 应回到 0，实际 %d", n)
+	}
+}

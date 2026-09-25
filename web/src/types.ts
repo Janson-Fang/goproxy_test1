@@ -435,6 +435,11 @@ export interface Stats {
   circuit: CbCounts
   series: SeriesPoint[] | null
   logs: LogBufferStats
+  /**
+   * 当前生效的自动封禁条数。可选：老版本二进制不会返回它，
+   * 那种情况下页签角标不显示，其余功能不受影响。
+   */
+  bans_active?: number
 }
 
 // ---------- 日志 ----------
@@ -607,4 +612,105 @@ export interface UpgradeInstallResult {
   apply_command?: string
   staged_path?: string
   staged_sha256?: string
+}
+
+/* ---------- 蜜罐与自动封禁 ---------- */
+
+/** 一个要伪装的端口。proto 省略时按 tcp。 */
+export interface HoneypotPort {
+  port: number
+  proto?: string
+  note?: string
+}
+
+/**
+ * 蜜罐配置。
+ *
+ * 它**不属于 Config**（不进 revision、不进 config_history、不出现在
+ * -config-export 里）：自动封禁是运行时状态，混进整份配置会让「每封一个 IP
+ * 都让正在编辑的人撞 409」。所以保存它不需要 If-Match，也就不会有 409。
+ */
+export interface HoneypotConfig {
+  enabled: boolean
+  /** observe（只记录）| enforce（命中即封禁） */
+  mode: string
+  /** 阶梯的基准时长（秒）：第 1 次用它，之后 ×6 → ×24 → 封顶 7 天 */
+  ban_secs: number
+  /** 额外豁免的 CIDR —— 内网/可信代理/白名单/控制台来源已在代码里硬豁免 */
+  exempt?: string[] | null
+  ports?: HoneypotPort[] | null
+}
+
+/** 单个蜜罐端口的运行状态。 */
+export interface TrapStat {
+  port: number
+  proto: string
+  note?: string
+  /** 端口是否真的在监听。false 时看 error */
+  listening: boolean
+  hits: number
+  /** 去重后的来源 IP 数（用来看「一个地址反复试」还是「一大片地址各试一次」） */
+  distinct_ips: number
+  first_at?: string
+  last_at?: string
+  /** 监听失败的原因（端口被占、权限不足…）—— 配置保存成功但端口没起来时在这里 */
+  error?: string
+}
+
+/** 一次命中。Head 是对方前 64 字节，多数扫描器连上就关所以是空的。 */
+export interface TrapProbe {
+  time: string
+  ip: string
+  port: number
+  proto: string
+  head?: string
+}
+
+export interface BanStats {
+  /** 当前生效的封禁条数 */
+  active: number
+  /** 还留在记忆窗口内的条数（含已过期、用于阶梯升级） */
+  known: number
+  /** 累计被拦下的请求数 */
+  blocked: number
+  /** 累计因命中豁免而没被自动封禁的次数 */
+  exempted: number
+  /** 非空表示自动封禁正处于突发熔断中（全网扫描时暂停写入） */
+  paused_till?: string
+  base_duration: string
+}
+
+export interface BanEntry {
+  ip: string
+  /** honeypot 时是命中的端口，如 tcp/3389；人工封禁时是人填的原因 */
+  reason: string
+  /** honeypot | manual */
+  source: string
+  /** 阶梯层级（第几次被封） */
+  level: number
+  /** 命中次数（生效期内重复命中只累计，不升级也不续期） */
+  hits: number
+  created_at: string
+  expires_at: string
+  last_at: string
+  /** 最多 5 条命中样本，内容来自攻击者，展示时按纯文本处理 */
+  samples?: string[] | null
+}
+
+export interface BansState {
+  config: HoneypotConfig
+  stats: BanStats
+  entries?: BanEntry[] | null
+  traps?: TrapStat[] | null
+  recent?: TrapProbe[] | null
+  /** 阶梯的人话说明，如「第 1 次 1 小时」——由后端按 ban_secs 算，前端不重复实现 */
+  ladder?: string[] | null
+}
+
+export interface HoneypotSaveResult {
+  ok: boolean
+  config: HoneypotConfig
+  /** 有端口没能生效时的原因（配置已保存，只是那几个端口没起来） */
+  problems?: string
+  traps?: TrapStat[] | null
 }

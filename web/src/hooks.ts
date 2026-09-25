@@ -46,7 +46,9 @@ export function usePolling(fn: () => void | Promise<void>, intervalMs: number, e
 
 // 顺序即左侧页签顺序。acl = 「IP 名单」页，紧挨 routes：
 // 名单决定的是「谁能进来」，和路由是同一条链路上的事。
-export const TAB_KEYS = ['dashboard', 'routes', 'acl', 'certs', 'logs', 'settings', 'upgrade'] as const
+// bans 紧跟着 acl：两者都是「谁能进来」这件事的两个半 —— 名单是人手工维护的
+// 静态规则，封禁是探测到扫描之后自动落下来的临时处置，拆开看反而要来回切页签。
+export const TAB_KEYS = ['dashboard', 'routes', 'acl', 'bans', 'certs', 'logs', 'settings', 'upgrade'] as const
 export type TabKey = (typeof TAB_KEYS)[number]
 
 function readHash(): TabKey {
